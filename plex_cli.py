@@ -76,7 +76,7 @@ def rating(item: dict) -> str:
     r = item.get("rating") or item.get("audienceRating")
     return f"{r:.1f}" if r else "—"
 
-SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type"}
+SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type", "--title"}
 
 def parse_search_args(arg: str) -> tuple:
     """Parse search args into (query, filters). Supports --flag value pairs."""
@@ -198,6 +198,15 @@ class PlexClient:
             # /search requires a query string; fall back to /all for simple field filters
             data = self.get(f"/library/sections/{section_id}/all", **params)
         return data.get("MediaContainer", {}).get("Metadata", [])
+
+    def title_filter(self, section_id: str, substring: str) -> list:
+        """Case-insensitive substring match against title — done client-side
+        because Plex's server-side title param doesn't support partial matching."""
+        q = substring.lower()
+        return [
+            item for item in self.library_contents(section_id)
+            if q in (item.get("title") or "").lower()
+        ]
 
     def sessions(self) -> list:
         data = self.get("/status/sessions")
@@ -393,7 +402,7 @@ HELP_TEXT = """
   [yellow]status[/yellow]                    Server info and version
   [yellow]libraries[/yellow]                 List all media libraries
   [yellow]browse[/yellow] [dim]<id>[/dim]             Browse a library by ID
-  [yellow]search[/yellow] [dim][query] [--actor name] [--director name] [--genre name] [--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]
+  [yellow]search[/yellow] [dim][query] [--title substring] [--actor name] [--director name] [--genre name] [--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]
   [yellow]info[/yellow] [dim]<key>[/dim]              Show detailed info for an item
   [yellow]sessions[/yellow]                  Active playback sessions
   [yellow]recent[/yellow] [dim][count][/dim]          Recently added content
@@ -497,8 +506,10 @@ class PlexShell(cmd.Cmd):
         if not arg.strip():
             console.print(
                 "[yellow]Usage:[/yellow] search [dim][query][/dim] "
-                "[dim][--actor name] [--director name] [--genre name] "
-                "[--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]"
+                "[dim][--title substring] [--actor name] [--director name] [--genre name] "
+                "[--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]\n"
+                "[dim]  query        smart search (indexed, misses tokens like '1080p')[/dim]\n"
+                "[dim]  --title      literal substring match against the title field[/dim]"
             )
             return
 
@@ -512,15 +523,24 @@ class PlexShell(cmd.Cmd):
             label_parts.append(f"--type {type_filter}")
         label = "Search: " + " ".join(label_parts)
 
+        title_substring = filters.pop("title", None)
+
         tag_filters = {"actor", "director", "genre"}
-        if not query and filters.keys() & tag_filters:
+        if not query and not title_substring and filters.keys() & tag_filters:
             console.print(
-                f"[yellow]--actor, --director, and --genre require a title query to work "
-                f"(e.g. search breaking --actor 'Bryan Cranston')[/yellow]"
+                "[yellow]--actor, --director, and --genre require a title query to work "
+                "(e.g. search breaking --actor 'Bryan Cranston')[/yellow]"
             )
             return
 
-        if not filters and not section_id:
+        if title_substring:
+            # Client-side substring match — Plex's server-side title param doesn't do partial matching
+            libs_to_search = [{"key": section_id}] if section_id else self.client.libraries()
+            with console.status(f"Scanning for title containing [cyan]{title_substring}[/cyan]..."):
+                results = []
+                for lib in libs_to_search:
+                    results.extend(self.client.title_filter(lib.get("key", ""), title_substring))
+        elif not filters and not section_id:
             # Simple global title search
             if not query:
                 console.print("[yellow]Provide a query or at least one filter flag.[/yellow]")
