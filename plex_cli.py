@@ -697,17 +697,26 @@ class PlexShell(cmd.Cmd):
 
             t = Table(title=f"Duplicate Titles in '{lib_title}'", box=box.ROUNDED, show_lines=True)
             t.add_column("Key", style="dim", width=7)
-            t.add_column("Title", style="bold white", min_width=28)
+            t.add_column("Title", style="bold white", min_width=24)
             t.add_column("Year", width=6, justify="right")
-            t.add_column("Added", width=17, style="dim")
+            t.add_column("Size", width=10, justify="right")
+            t.add_column("File", style="dim")
 
             for items in sorted(dupes.values(), key=lambda v: (v[0].get("title", "").lower(), v[0].get("year") or 0)):
                 for item in items:
+                    parts = [
+                        p
+                        for m in item.get("Media", [])
+                        for p in m.get("Part", [])
+                    ]
+                    file_path = parts[0].get("file", "—") if parts else "—"
+                    file_size = parts[0].get("size") if parts else None
                     t.add_row(
                         item.get("ratingKey", ""),
                         item.get("title", ""),
                         year(item),
-                        format_ts(item.get("addedAt")),
+                        format_size(file_size),
+                        file_path,
                     )
                 t.add_section()
 
