@@ -6,6 +6,7 @@ import cmd
 import csv
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -125,6 +126,35 @@ def months_ago(ts: int | None) -> str:
         return f"{months}mo ago"
     return f"{months // 12}yr {months % 12}mo ago"
 
+_TECH_TOKENS = re.compile(
+    r"^(1080[pi]?|720[pi]?|480[pi]?|2160[pi]?|4k|uhd|hdr10?|"
+    r"blu[-.]?ray|bdrip|brrip|web[-.]?dl|webrip|web|hdtv|dvdrip|dvdscr|hdrip|"
+    r"x26[45]|h\.?26[45]|hevc|avc|xvid|divx|"
+    r"aac|dts|ac3|mp3|truehd|atmos|flac|"
+    r"extended|theatrical|directors\.cut|unrated|remastered|proper|"
+    r"rarbg|yts|yify|eztv|"
+    r"\d{3,4}p)$",
+    re.IGNORECASE,
+)
+
+def clean_title(title: str) -> str | None:
+    """Return a cleaned title for dot-separated filename-style titles, or None if unchanged."""
+    # Must look like a filename: at least 2 dots and no spaces
+    if title.count(".") < 2 or " " in title:
+        return None
+    parts = title.split(".")
+    clean: list[str] = []
+    for part in parts:
+        if re.match(r"^(19|20)\d{2}$", part):   # stop at year
+            break
+        if _TECH_TOKENS.match(part):              # stop at quality/codec token
+            break
+        clean.append(part)
+    cleaned = " ".join(clean).strip()
+    if not cleaned or cleaned == title:
+        return None
+    return cleaned
+
 def get_media_rows(item: dict, library: str = "") -> list:
     """Flatten Media/Part elements into analysis-friendly dicts."""
     rows = []
@@ -207,6 +237,25 @@ class PlexClient:
             item for item in self.library_contents(section_id)
             if q in (item.get("title") or "").lower()
         ]
+
+    def put(self, path: str, **params) -> bool:
+        url = f"{BASE_URL}{path}"
+        try:
+            r = self.session.put(url, params=params, timeout=15)
+            r.raise_for_status()
+            return True
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+            return False
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+            return False
+
+    def update_title(self, rating_key: str, new_title: str) -> bool:
+        return self.put(
+            f"/library/metadata/{rating_key}",
+            **{"title.value": new_title, "title.locked": 1},
+        )
 
     def sessions(self) -> list:
         data = self.get("/status/sessions")
@@ -433,6 +482,8 @@ HELP_TEXT = """
 [bold cyan]Collection tools:[/bold cyan]
   [yellow]export[/yellow] [dim]<library_id> [file][/dim]  Export library to CSV or JSON
   [yellow]stale[/yellow] [dim][months][/dim]          Shows with no updates in N months
+  [yellow]fixtitles[/yellow] [dim][library_id][/dim]   Find and fix dot-separated filename-style titles
+  [yellow]settitle[/yellow] [dim]<key> <title>[/dim]   Manually set the title for one item
 
 [bold cyan]Monitoring:[/bold cyan]
   [yellow]watch[/yellow] [dim][seconds][/dim]          Live-refresh sessions (Ctrl+C to stop)
@@ -1114,6 +1165,81 @@ class PlexShell(cmd.Cmd):
                     writer.writerow(row)
 
         console.print(f"[green]Exported {len(items)} items to[/green] [bold]{filename}[/bold]")
+
+    def do_fixtitles(self, arg: str):
+        """fixtitles [library_id]  — find and fix dot-separated filename-style titles"""
+        if arg.strip():
+            libs = [l for l in self.client.libraries() if l.get("key") == arg.strip()]
+        else:
+            libs = [l for l in self.client.libraries() if l.get("type") == "movie"]
+
+        if not libs:
+            console.print("[yellow]No matching libraries found. Specify a library ID or ensure you have a movie library.[/yellow]")
+            return
+
+        proposals: list[tuple[str, str, str]] = []  # (ratingKey, old_title, new_title)
+        with console.status("Scanning for filename-style titles..."):
+            for lib in libs:
+                for item in self.client.library_contents(lib.get("key", "")):
+                    old = item.get("title", "")
+                    new = clean_title(old)
+                    if new:
+                        proposals.append((item.get("ratingKey", ""), old, new))
+
+        if not proposals:
+            console.print("[green]No filename-style titles found.[/green]")
+            return
+
+        t = Table(title=f"{len(proposals)} titles to fix", box=box.ROUNDED, show_lines=True)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Current Title", style="yellow", min_width=30)
+        t.add_column("Proposed Title", style="bold green", min_width=30)
+        for i, (key, old, new) in enumerate(proposals, 1):
+            t.add_row(str(i), key, old, new)
+        console.print(t)
+
+        answer = Prompt.ask(
+            "\nApply all? [bold green]y[/bold green] = yes, "
+            "[bold yellow]e[/bold yellow] = edit before applying, "
+            "[bold red]n[/bold red] = cancel",
+            choices=["y", "e", "n"],
+            default="n",
+        )
+
+        if answer == "n":
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+        if answer == "e":
+            console.print("[dim]Enter a new title for each item, or press Enter to accept, or type 's' to skip.[/dim]")
+            edited: list[tuple[str, str]] = []
+            for key, old, new in proposals:
+                user_input = Prompt.ask(f"  [yellow]{old}[/yellow] →", default=new)
+                if user_input.lower() != "s":
+                    edited.append((key, user_input))
+            proposals_to_apply = edited
+        else:
+            proposals_to_apply = [(k, n) for k, _, n in proposals]
+
+        ok = fail = 0
+        for key, new_title in proposals_to_apply:
+            if self.client.update_title(key, new_title):
+                ok += 1
+            else:
+                fail += 1
+
+        console.print(f"[green]{ok} updated[/green]" + (f", [red]{fail} failed[/red]" if fail else "") + ".")
+
+    def do_settitle(self, arg: str):
+        """settitle <key> <new title>  — manually set the title for one item"""
+        parts = arg.strip().split(None, 1)
+        if len(parts) < 2:
+            console.print("[yellow]Usage: settitle <key> <new title>[/yellow]")
+            return
+        key, new_title = parts
+        if self.client.update_title(key, new_title.strip()):
+            console.print(f"[green]Updated[/green] {key} → [bold]{new_title.strip()}[/bold]")
 
     def do_stale(self, arg: str):
         """stale [months]  — TV shows not updated in N months (default 6)"""
