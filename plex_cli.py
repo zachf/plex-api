@@ -484,6 +484,7 @@ HELP_TEXT = """
 
 [bold cyan]Storage analysis:[/bold cyan]
   [yellow]storage[/yellow]                   Disk usage breakdown by library
+  [yellow]bycodec[/yellow] [dim]<codec>[/dim]           List all titles using a given video or audio codec
   [yellow]codecs[/yellow]                    Video/audio codec distribution
   [yellow]transcode[/yellow]                 Items likely to require transcoding
 
@@ -1108,6 +1109,45 @@ class PlexShell(cmd.Cmd):
                     row["videoCodec"].upper(),
                 )
             console.print(t2)
+
+    def do_bycodec(self, arg: str):
+        """bycodec <codec>  — list all titles using a given video or audio codec"""
+        if not arg.strip():
+            console.print("[yellow]Usage: bycodec <codec>  (e.g. bycodec hevc, bycodec dts)[/yellow]")
+            return
+        target = arg.strip().lower()
+        with console.status(f"Scanning for codec [cyan]{target}[/cyan]..."):
+            rows = self.client.all_media_rows()
+
+        matches = [
+            r for r in rows
+            if target in r["videoCodec"].lower() or target in r["audioCodec"].lower()
+        ]
+
+        if not matches:
+            console.print(f"[yellow]No items found with codec '{target}'.[/yellow]")
+            return
+
+        t = Table(title=f"Items with codec '{target}' ({len(matches)} found)", box=box.ROUNDED, show_lines=False)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Video", width=8)
+        t.add_column("Audio", width=8)
+        t.add_column("Resolution", width=10, justify="right")
+        t.add_column("Size", width=10, justify="right")
+
+        for r in sorted(matches, key=lambda x: x["title"].lower()):
+            t.add_row(
+                r["ratingKey"],
+                r["title"],
+                r["library"],
+                r["videoCodec"].upper() or "—",
+                r["audioCodec"].upper() or "—",
+                resolution_label(r["videoResolution"]),
+                format_size(r["size"]),
+            )
+        console.print(t)
 
     def do_codecs(self, _):
         """Video and audio codec distribution across all media."""
