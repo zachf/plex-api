@@ -454,54 +454,58 @@ def print_item_detail(item: dict):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-HELP_TEXT = """
-[bold cyan]Basic commands:[/bold cyan]
-  [yellow]status[/yellow]                    Server info and version
-  [yellow]libraries[/yellow]                 List all media libraries
-  [yellow]browse[/yellow] [dim]<id>[/dim]             Browse a library by ID
-  [yellow]search[/yellow] [dim][query] [--title substring] [--actor name] [--director name] [--genre name] [--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]
-  [yellow]info[/yellow] [dim]<key>[/dim]              Show detailed info for an item
-  [yellow]sessions[/yellow]                  Active playback sessions
-  [yellow]recent[/yellow] [dim][count][/dim]          Recently added content
-  [yellow]ondeck[/yellow]                    Continue watching (on deck)
-  [yellow]children[/yellow] [dim]<key>[/dim]          List seasons/episodes for a show
-  [yellow]token[/yellow] [dim]<token>[/dim]           Set or update your Plex token
-  [yellow]url[/yellow] [dim]<key>[/dim]               Print stream URL for an item
-
-[bold cyan]Library health:[/bold cyan]
-  [yellow]dupes[/yellow]                     Find items Plex flagged as duplicate files
-  [yellow]dupetitles[/yellow]               Find items sharing the same title (case-insensitive)
-  [yellow]missing[/yellow]                   Items with incomplete metadata
-  [yellow]quality[/yellow]                   Resolution breakdown per library
-  [yellow]orphans[/yellow]                   Items with no associated media files
-
-[bold cyan]Watch statistics:[/bold cyan]
-  [yellow]stats[/yellow]                     Library totals and watch history summary
-  [yellow]history[/yellow] [dim][user] [count][/dim]  Recent watch history
-  [yellow]unwatched[/yellow] [dim][library_id][/dim]  Content never played
-  [yellow]toprated[/yellow] [dim][library_id][/dim]   Highest-rated items
-  [yellow]recently_played[/yellow] [dim][count][/dim] Most recently watched
-
-[bold cyan]Storage analysis:[/bold cyan]
-  [yellow]largest[/yellow] [dim][count][/dim]          Titles with the biggest file sizes (default 25)
-  [yellow]smallest[/yellow] [dim][count][/dim]         Titles with the smallest file sizes (default 25)
-  [yellow]storage[/yellow]                   Disk usage breakdown by library
-  [yellow]bycodec[/yellow] [dim]<codec>[/dim]           List all titles using a given video or audio codec
-  [yellow]codecs[/yellow]                    Video/audio codec distribution
-  [yellow]transcode[/yellow]                 Items likely to require transcoding
-
-[bold cyan]Collection tools:[/bold cyan]
-  [yellow]export[/yellow] [dim]<library_id> [file][/dim]  Export library to CSV or JSON
-  [yellow]stale[/yellow] [dim][months][/dim]          Shows with no updates in N months
-  [yellow]fixtitles[/yellow] [dim][library_id][/dim]   Find and fix dot-separated filename-style titles
-  [yellow]settitle[/yellow] [dim]<key> <title>[/dim]   Manually set the title for one item
-
-[bold cyan]Monitoring:[/bold cyan]
-  [yellow]watch[/yellow] [dim][seconds][/dim]          Live-refresh sessions (Ctrl+C to stop)
-  [yellow]alert[/yellow] [dim][seconds][/dim]          Alert when a transcode session starts
-
-  [yellow]help[/yellow]  [yellow]quit[/yellow] / [yellow]exit[/yellow]
-"""
+_HELP_SECTIONS = [
+    ("Basic", [
+        ("status",          "",                                  "Server info and version"),
+        ("libraries",       "",                                  "List all media libraries"),
+        ("browse",          "<id>",                              "Browse a library by ID"),
+        ("search",          "[query] [--title s] [--actor n] [--director n] [--genre n] [--studio n] [--year Y] [--library id] [--type t]",
+                                                                 "Search content"),
+        ("info",            "<key>",                             "Detailed info for an item"),
+        ("sessions",        "",                                  "Active playback sessions"),
+        ("recent",          "[count]",                           "Recently added content"),
+        ("ondeck",          "",                                  "Continue watching"),
+        ("children",        "<key>",                             "Seasons / episodes for a show"),
+        ("url",             "<key>",                             "Print stream URL for an item"),
+        ("token",           "<token>",                           "Set or update your Plex token"),
+    ]),
+    ("Library health", [
+        ("dupes",           "",                                  "Items Plex flagged as duplicate files"),
+        ("dupetitles",      "",                                  "Items sharing the same title and year"),
+        ("missing",         "",                                  "Items with incomplete metadata"),
+        ("quality",         "",                                  "Resolution breakdown per library"),
+        ("orphans",         "",                                  "Items with no associated media files"),
+    ]),
+    ("Watch statistics", [
+        ("stats",           "",                                  "Library totals and watch history summary"),
+        ("history",         "[user] [count]",                    "Recent watch history"),
+        ("unwatched",       "[library_id]",                      "Content never played"),
+        ("toprated",        "[library_id]",                      "Highest-rated items"),
+        ("recently_played", "[count]",                           "Most recently watched"),
+    ]),
+    ("Storage", [
+        ("largest",         "[count]",                           "Titles with the biggest file sizes"),
+        ("smallest",        "[count]",                           "Titles with the smallest file sizes"),
+        ("storage",         "",                                  "Disk usage breakdown by library"),
+        ("bycodec",         "<codec>",                           "Titles using a given video or audio codec"),
+        ("codecs",          "",                                  "Video / audio codec distribution"),
+        ("transcode",       "",                                  "Items likely to require transcoding"),
+    ]),
+    ("Collection tools", [
+        ("export",          "<library_id> [file]",               "Export library to CSV or JSON"),
+        ("fixtitles",       "[library_id]",                      "Find and fix filename-style titles"),
+        ("settitle",        "<key> <title>",                     "Manually set the title for one item"),
+        ("stale",           "[months]",                          "Shows with no updates in N months"),
+    ]),
+    ("Monitoring", [
+        ("watch",           "[seconds]",                         "Live-refresh sessions (Ctrl+C to stop)"),
+        ("alert",           "[seconds]",                         "Alert when a transcode session starts"),
+    ]),
+    ("Shell", [
+        ("help",            "",                                  "Show this help"),
+        ("quit / exit",     "",                                  "Exit"),
+    ]),
+]
 
 class PlexShell(cmd.Cmd):
     intro = ""
@@ -519,7 +523,16 @@ class PlexShell(cmd.Cmd):
         console.print(f"[red]Unknown command:[/red] {line}  (type [yellow]help[/yellow])")
 
     def do_help(self, _):
-        console.print(HELP_TEXT)
+        t = Table(box=None, show_header=False, padding=(0, 2), expand=False)
+        t.add_column(style="yellow", no_wrap=True, min_width=16)
+        t.add_column(style="dim", min_width=14)
+        t.add_column(min_width=20)
+        for section, commands in _HELP_SECTIONS:
+            t.add_row(f"[bold cyan]{section}[/bold cyan]", "", "")
+            for cmd, args, desc in commands:
+                t.add_row(cmd, args, desc)
+            t.add_row("", "", "")
+        console.print(t)
 
     def do_quit(self, _):
         console.print("[dim]Goodbye.[/dim]")
