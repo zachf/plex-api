@@ -364,6 +364,21 @@ class PlexClient:
     def analyze_library(self, section_id: str) -> bool:
         return self.put(f"/library/sections/{section_id}/analyze")
 
+    def get_text(self, path: str, **params) -> str | None:
+        """Fetch a plain-text endpoint, bypassing the JSON Accept header."""
+        url = f"{BASE_URL}{path}"
+        headers = {"Accept": "text/plain, */*"}
+        try:
+            r = self.session.get(url, params=params, headers=headers, timeout=15)
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+            return None
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+            return None
+
     def sessions(self) -> list:
         data = self.get("/status/sessions")
         return data.get("MediaContainer", {}).get("Metadata", [])
@@ -584,8 +599,10 @@ _HELP_SECTIONS = [
         ("recently_played", "[count]",                           "Most recently watched"),
     ]),
     ("Storage", [
-        ("largest",         "[count]",                           "Titles with the biggest file sizes"),
-        ("smallest",        "[count]",                           "Titles with the smallest file sizes"),
+        ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
+        ("smallest",        "[count] [--library name]",           "Titles with the smallest file sizes"),
+        ("long",            "[count] [--library name]",           "Titles with the longest runtime"),
+        ("short",           "[count] [--library name]",           "Titles with the shortest runtime"),
         ("storage",         "",                                  "Disk usage breakdown by library"),
         ("bycodec",         "<codec>",                           "Titles using a given video or audio codec"),
         ("codecs",          "",                                  "Video / audio codec distribution"),
@@ -600,6 +617,7 @@ _HELP_SECTIONS = [
     ("Monitoring", [
         ("watch",           "[seconds]",                         "Live-refresh sessions (Ctrl+C to stop)"),
         ("alert",           "[seconds]",                         "Alert when a transcode session starts"),
+        ("logs",            "[lines] [--level debug|info|warn|error]", "Show recent server log entries"),
     ]),
     ("Playback control", [
         ("clients",         "",                                  "List available Plex clients"),
@@ -1243,6 +1261,51 @@ class PlexShell(cmd.Cmd):
         count, library = self._parse_size_args(arg)
         self._size_table(count, largest=False, library_filter=library)
 
+    def _duration_table(self, count: int, longest: bool, library_filter: str = ""):
+        label = "Longest" if longest else "Shortest"
+        with console.status(f"Fetching {label.lower()} titles..."):
+            data = self.client.all_items_by_library()
+
+        rows = []
+        for lib_title, d in data.items():
+            if library_filter and library_filter.lower() not in lib_title.lower():
+                continue
+            for item in d["items"]:
+                dur = item.get("duration")
+                if dur:
+                    rows.append((lib_title, item, dur))
+
+        if not rows:
+            console.print(f"[yellow]No results{f' for library {library_filter!r}' if library_filter else ''}.[/yellow]")
+            return
+
+        rows.sort(key=lambda x: x[2], reverse=longest)
+        rows = rows[:count]
+
+        title = f"{label} {count} Titles"
+        if library_filter:
+            title += f" — {library_filter}"
+        t = Table(title=title, box=box.ROUNDED, show_lines=False)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Duration", width=10, justify="right", style="bold yellow")
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Type", style="yellow", width=8)
+        for i, (lib_title, item, dur) in enumerate(rows, 1):
+            t.add_row(str(i), format_duration(dur), item.get("title", ""), lib_title, year(item), item.get("type", ""))
+        console.print(t)
+
+    def do_long(self, arg: str):
+        """long [count] [--library name]  — titles with the longest runtime (default 25)"""
+        count, library = self._parse_size_args(arg)
+        self._duration_table(count, longest=True, library_filter=library)
+
+    def do_short(self, arg: str):
+        """short [count] [--library name]  — titles with the shortest runtime (default 25)"""
+        count, library = self._parse_size_args(arg)
+        self._duration_table(count, longest=False, library_filter=library)
+
     def do_storage(self, _):
         """Disk usage breakdown by library."""
         with console.status("Calculating storage..."):
@@ -1653,6 +1716,51 @@ class PlexShell(cmd.Cmd):
             console.print(f"  [dim]{i}.[/dim] {s.get('User', {}).get('title','?')} on {s.get('Player', {}).get('title','?')}")
         choice = Prompt.ask("Select session", choices=list(choices.keys()))
         return choices.get(choice)
+
+    def do_logs(self, arg: str):
+        """logs [lines] [--level debug|info|warn|error]  — show recent Plex server log entries"""
+        _, flags = parse_search_args(arg)
+        lines = next((int(t) for t in arg.split() if t.isdigit()), 50)
+        level_map = {"debug": 0, "info": 2, "warn": 3, "warning": 3, "error": 4}
+        level_name = flags.get("level", "info").lower()
+        min_level = level_map.get(level_name, 2)
+
+        with console.status("Fetching server logs..."):
+            text = self.client.get_text("/log", minLevel=min_level, source="Plex Media Server")
+
+        if text is None:
+            return
+
+        # Handle JSON-wrapped log response
+        if text.lstrip().startswith("{"):
+            try:
+                data = json.loads(text)
+                entries = data.get("MediaContainer", {}).get("Log", [])
+                log_lines = [
+                    f"{format_ts(e.get('time'))}  [{e.get('level','?'):5}]  {e.get('msg','')}"
+                    for e in entries
+                ][-lines:]
+            except json.JSONDecodeError:
+                log_lines = []
+        else:
+            log_lines = [l for l in text.splitlines() if l.strip()][-lines:]
+
+        if not log_lines:
+            console.print("[yellow]No log entries returned.[/yellow]")
+            console.print(f"[dim]Raw response ({len(text)} chars): {text[:200]}[/dim]")
+            return
+
+        level_styles = {"DEBUG": "dim", "INFO": "white", "WARN": "yellow",
+                        "WARNING": "yellow", "ERROR": "red", "FATAL": "bold red"}
+
+        console.print(f"[bold cyan]Server Log[/bold cyan] [dim](last {len(log_lines)} lines, level≥{level_name})[/dim]")
+        for line in log_lines:
+            style = "white"
+            for key, sty in level_styles.items():
+                if key in line.upper():
+                    style = sty
+                    break
+            console.print(f"[{style}]{line}[/{style}]")
 
     def do_clients(self, _):
         """List available Plex clients."""
