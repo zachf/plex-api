@@ -3,7 +3,8 @@
     "allow": [
       "Bash(pip show:*)",
       "Bash(py -3.10 -c \"import requests, rich; print\\('OK'\\)\")",
-      "Bash(py -3.10 -m py_compile plex_cli.py)"
+      "Bash(py -3.10 -m py_compile plex_cli.py)",
+      "Bash(py -3.14 -m py_compile /c/Users/Zach/Projects/plex-api/plex_cli.py)"
     ]
   }
 }

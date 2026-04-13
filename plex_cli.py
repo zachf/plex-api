@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Run with: py -3.10 plex_cli.py  (or any Python with requests+rich installed)
+# Run with: py -3.14 plex_cli.py
 """Interactive Plex Media Server CLI — opus2.local:32400"""
 
 import cmd
@@ -12,7 +12,6 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import requests
 from rich import box
@@ -48,7 +47,7 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
-def format_duration(ms: Optional[int]) -> str:
+def format_duration(ms: int | None) -> str:
     if ms is None:
         return "—"
     s = ms // 1000
@@ -56,7 +55,7 @@ def format_duration(ms: Optional[int]) -> str:
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-def format_size(bytes_: Optional[int]) -> str:
+def format_size(bytes_: int | None) -> str:
     if bytes_ is None:
         return "—"
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -65,7 +64,7 @@ def format_size(bytes_: Optional[int]) -> str:
         bytes_ /= 1024
     return f"{bytes_:.1f} PB"
 
-def format_ts(ts: Optional[int]) -> str:
+def format_ts(ts: int | None) -> str:
     if not ts:
         return "—"
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
@@ -101,7 +100,7 @@ def parse_search_args(arg: str) -> tuple:
             i += 1
     return " ".join(query_parts), filters
 
-def resolution_label(res: Optional[str]) -> str:
+def resolution_label(res: str | None) -> str:
     if not res:
         return "Unknown"
     res = str(res).lower()
@@ -115,7 +114,7 @@ def resolution_label(res: Optional[str]) -> str:
         return "SD"
     return res.upper()
 
-def months_ago(ts: Optional[int]) -> str:
+def months_ago(ts: int | None) -> str:
     if not ts:
         return "—"
     delta = datetime.now() - datetime.fromtimestamp(ts)
@@ -225,7 +224,7 @@ class PlexClient:
         data = self.get(f"/library/sections/{section_id}/duplicates")
         return data.get("MediaContainer", {}).get("Metadata", [])
 
-    def history(self, count: int = 50, account_id: Optional[int] = None) -> list:
+    def history(self, count: int = 50, account_id: int | None = None) -> list:
         params: dict = {"sort": "viewedAt:desc", "X-Plex-Container-Size": count}
         if account_id:
             params["accountID"] = account_id
@@ -723,12 +722,13 @@ class PlexShell(cmd.Cmd):
         t.add_column("Title", style="bold white", min_width=28)
         t.add_column("Type", style="yellow", width=10)
 
+        CONTAINER_TYPES = {"show", "season", "artist", "album", "collection"}
         count = 0
         for lib_title, d in data.items():
             for item in d["items"]:
-                has_media = any(
-                    m.get("Part") for m in item.get("Media", [])
-                )
+                if item.get("type") in CONTAINER_TYPES:
+                    continue
+                has_media = any(m.get("Part") for m in item.get("Media", []))
                 if not has_media:
                     t.add_row(lib_title, item.get("ratingKey", ""), item.get("title", ""), item.get("type", ""))
                     count += 1
