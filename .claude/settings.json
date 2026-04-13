@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(py -3.10 -c \"import requests, rich; print\\('OK'\\)\")"
+    ]
+  }
+}
