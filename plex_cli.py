@@ -469,7 +469,8 @@ HELP_TEXT = """
   [yellow]url[/yellow] [dim]<key>[/dim]               Print stream URL for an item
 
 [bold cyan]Library health:[/bold cyan]
-  [yellow]dupes[/yellow]                     Find duplicate titles across libraries
+  [yellow]dupes[/yellow]                     Find items Plex flagged as duplicate files
+  [yellow]dupetitles[/yellow]               Find items sharing the same title (case-insensitive)
   [yellow]missing[/yellow]                   Items with incomplete metadata
   [yellow]quality[/yellow]                   Resolution breakdown per library
   [yellow]orphans[/yellow]                   Items with no associated media files
@@ -674,6 +675,46 @@ class PlexShell(cmd.Cmd):
         console.print("[green]Token saved.[/green]")
 
     # ── Library health ────────────────────────────────────────────────────────
+
+    def do_dupetitles(self, _):
+        """Find items sharing the same title within each library (case-insensitive)."""
+        with console.status("Scanning all libraries..."):
+            data = self.client.all_items_by_library()
+
+        found_any = False
+        for lib_title, d in data.items():
+            groups: dict[tuple, list] = defaultdict(list)
+            for item in d["items"]:
+                title_key = (item.get("title") or "").lower().strip()
+                year_key = item.get("year")
+                if title_key:
+                    groups[(title_key, year_key)].append(item)
+
+            dupes = {k: v for k, v in groups.items() if len(v) > 1}
+            if not dupes:
+                continue
+            found_any = True
+
+            t = Table(title=f"Duplicate Titles in '{lib_title}'", box=box.ROUNDED, show_lines=True)
+            t.add_column("Key", style="dim", width=7)
+            t.add_column("Title", style="bold white", min_width=28)
+            t.add_column("Year", width=6, justify="right")
+            t.add_column("Added", width=17, style="dim")
+
+            for items in sorted(dupes.values(), key=lambda v: (v[0].get("title", "").lower(), v[0].get("year") or 0)):
+                for item in items:
+                    t.add_row(
+                        item.get("ratingKey", ""),
+                        item.get("title", ""),
+                        year(item),
+                        format_ts(item.get("addedAt")),
+                    )
+                t.add_section()
+
+            console.print(t)
+
+        if not found_any:
+            console.print("[green]No duplicate titles found.[/green]")
 
     def do_dupes(self, _):
         """Find duplicate titles in each library."""
