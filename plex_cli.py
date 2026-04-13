@@ -483,6 +483,8 @@ HELP_TEXT = """
   [yellow]recently_played[/yellow] [dim][count][/dim] Most recently watched
 
 [bold cyan]Storage analysis:[/bold cyan]
+  [yellow]largest[/yellow] [dim][count][/dim]          Titles with the biggest file sizes (default 25)
+  [yellow]smallest[/yellow] [dim][count][/dim]         Titles with the smallest file sizes (default 25)
   [yellow]storage[/yellow]                   Disk usage breakdown by library
   [yellow]bycodec[/yellow] [dim]<codec>[/dim]           List all titles using a given video or audio codec
   [yellow]codecs[/yellow]                    Video/audio codec distribution
@@ -1059,6 +1061,44 @@ class PlexShell(cmd.Cmd):
         console.print(t)
 
     # ── Storage analysis ──────────────────────────────────────────────────────
+
+    def _size_table(self, count: int, largest: bool):
+        label = "Largest" if largest else "Smallest"
+        with console.status(f"Fetching {label.lower()} files..."):
+            rows = [r for r in self.client.all_media_rows() if r.get("size")]
+
+        rows.sort(key=lambda r: r["size"], reverse=largest)
+        rows = rows[:count]
+
+        t = Table(title=f"{label} {count} Files", box=box.ROUNDED, show_lines=False)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Size", width=10, justify="right", style="bold yellow")
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Video", width=8)
+        t.add_column("Audio", width=8)
+        t.add_column("Resolution", width=10, justify="right")
+        for i, r in enumerate(rows, 1):
+            t.add_row(
+                str(i),
+                format_size(r["size"]),
+                r["title"],
+                r["library"],
+                r["videoCodec"].upper() or "—",
+                r["audioCodec"].upper() or "—",
+                resolution_label(r["videoResolution"]),
+            )
+        console.print(t)
+
+    def do_largest(self, arg: str):
+        """largest [count]  — titles with the biggest file sizes (default 25)"""
+        count = int(arg.strip()) if arg.strip().isdigit() else 25
+        self._size_table(count, largest=True)
+
+    def do_smallest(self, arg: str):
+        """smallest [count]  — titles with the smallest file sizes (default 25)"""
+        count = int(arg.strip()) if arg.strip().isdigit() else 25
+        self._size_table(count, largest=False)
 
     def do_storage(self, _):
         """Disk usage breakdown by library."""
