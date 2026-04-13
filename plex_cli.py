@@ -142,6 +142,13 @@ def clean_title(title: str) -> str | None:
     # Must look like a filename: at least 2 dots and no spaces
     if title.count(".") < 2 or " " in title:
         return None
+    # Trailing period = abbreviation style (e.g. "E.T.", "M.A.S.H.")
+    if title.endswith("."):
+        return None
+    # All-short segments = initials, not a filename (e.g. "E.T.the.movie" edge case)
+    segments = [p for p in title.split(".") if p]
+    if all(len(p) <= 2 for p in segments):
+        return None
     parts = title.split(".")
     clean: list[str] = []
     for part in parts:
