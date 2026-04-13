@@ -287,7 +287,8 @@ def print_media_table(items: list, title: str = "Results"):
     if not items:
         console.print("[yellow]No results.[/yellow]")
         return
-    t = Table(title=title, box=box.ROUNDED, show_lines=False)
+    noun = "result" if len(items) == 1 else "results"
+    t = Table(title=title, caption=f"{len(items)} {noun}", caption_justify="right", box=box.ROUNDED, show_lines=False)
     t.add_column("Key", style="dim", width=7)
     t.add_column("Title", style="bold white", min_width=30)
     t.add_column("Type", style="yellow", width=10)
