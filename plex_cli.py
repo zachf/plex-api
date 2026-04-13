@@ -264,6 +264,106 @@ class PlexClient:
             **{"title.value": new_title, "title.locked": 1},
         )
 
+    def delete(self, path: str, **params) -> bool:
+        url = f"{BASE_URL}{path}"
+        try:
+            r = self.session.delete(url, params=params, timeout=15)
+            r.raise_for_status()
+            return True
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+            return False
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+            return False
+
+    def clients(self) -> list:
+        """Return available clients from /clients merged with players in active sessions."""
+        discovered = {
+            c["machineIdentifier"]: c
+            for c in self.get("/clients").get("MediaContainer", {}).get("Server", [])
+            if c.get("machineIdentifier")
+        }
+        for s in self.sessions():
+            p = s.get("Player", {})
+            mid = p.get("machineIdentifier", "")
+            if mid and mid not in discovered:
+                discovered[mid] = {
+                    "machineIdentifier": mid,
+                    "name": p.get("title", ""),
+                    "product": p.get("product", ""),
+                    "address": p.get("address", ""),
+                    "port": p.get("port", ""),
+                    "deviceClass": p.get("deviceClass", ""),
+                    "state": p.get("state", ""),
+                }
+        return list(discovered.values())
+
+    def player_command(self, command: str, machine_id: str = "",
+                        client_address: str = "", client_port: int = 0, **params) -> bool:
+        self._cmd_id = getattr(self, "_cmd_id", 0) + 1
+        params["commandID"] = self._cmd_id
+
+        attempts = []
+        # Direct to client (most reliable for desktop/mobile clients)
+        if client_address and client_port:
+            attempts.append((f"http://{client_address}:{client_port}/player/playback/{command}", {}))
+        # Server proxy (required for Plex Web and clients without open ports)
+        if machine_id:
+            attempts.append((f"{BASE_URL}/player/playback/{command}",
+                             {"X-Plex-Target-Client-Identifier": machine_id}))
+
+        last_err = ""
+        for url, extra_headers in attempts:
+            try:
+                r = self.session.get(url, params=params, headers=extra_headers, timeout=10)
+                r.raise_for_status()
+                return True
+            except requests.exceptions.ConnectionError:
+                last_err = f"connection refused at {url}"
+            except requests.exceptions.HTTPError as e:
+                last_err = f"HTTP {e.response.status_code} from {url}"
+
+        console.print(f"[red]Player command failed:[/red] {last_err}")
+        return False
+
+    def play_media(self, machine_id: str, rating_key: str,
+                   client_address: str = "", client_port: int = 0) -> bool:
+        info = self.server_info()
+        server_mid = info.get("machineIdentifier", "")
+        host = BASE_URL.split("://")[-1]
+        srv_address = host.split(":")[0]
+        srv_port = int(host.split(":")[-1]) if ":" in host else 32400
+        return self.player_command(
+            "playMedia", machine_id, client_address, client_port,
+            key=f"/library/metadata/{rating_key}",
+            offset=0,
+            machineIdentifier=server_mid,
+            address=srv_address,
+            port=srv_port,
+            protocol="http",
+            containerKey=f"/library/metadata/{rating_key}",
+            token=self.token,
+        )
+
+    def pause_playback(self, machine_id: str, client_address: str = "", client_port: int = 0) -> bool:
+        return self.player_command("pause", machine_id, client_address, client_port, type="video")
+
+    def resume_playback(self, machine_id: str, client_address: str = "", client_port: int = 0) -> bool:
+        return self.player_command("play", machine_id, client_address, client_port, type="video")
+
+    def stop_playback(self, machine_id: str, client_address: str = "", client_port: int = 0) -> bool:
+        return self.player_command("stop", machine_id, client_address, client_port, type="video")
+
+    def stop_transcode(self, session_key: str) -> bool:
+        return self.delete(f"/transcode/sessions/{session_key}")
+
+    def analyze_item(self, rating_key: str) -> bool:
+        return self.put(f"/library/metadata/{rating_key}/analyze")
+
+    def analyze_library(self, section_id: str) -> bool:
+        return self.put(f"/library/sections/{section_id}/analyze")
+
     def sessions(self) -> list:
         data = self.get("/status/sessions")
         return data.get("MediaContainer", {}).get("Metadata", [])
@@ -500,6 +600,18 @@ _HELP_SECTIONS = [
     ("Monitoring", [
         ("watch",           "[seconds]",                         "Live-refresh sessions (Ctrl+C to stop)"),
         ("alert",           "[seconds]",                         "Alert when a transcode session starts"),
+    ]),
+    ("Playback control", [
+        ("clients",         "",                                  "List available Plex clients"),
+        ("play",            "<key> [--client name]",             "Start playback on a client"),
+        ("pause",           "[session]",                         "Pause a session"),
+        ("resume",          "[session]",                         "Resume a paused session"),
+        ("stop",            "[session]",                         "Stop a session"),
+    ]),
+    ("Analysis & reports", [
+        ("analyze",         "<key> | --library <id>",            "Trigger deep media analysis"),
+        ("report",          "[--html filename.html]",            "Comprehensive library report"),
+        ("changelog",       "[days]",                            "Everything added/updated in last N days"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -1075,15 +1187,25 @@ class PlexShell(cmd.Cmd):
 
     # ── Storage analysis ──────────────────────────────────────────────────────
 
-    def _size_table(self, count: int, largest: bool):
+    def _size_table(self, count: int, largest: bool, library_filter: str = ""):
         label = "Largest" if largest else "Smallest"
         with console.status(f"Fetching {label.lower()} files..."):
             rows = [r for r in self.client.all_media_rows() if r.get("size")]
 
+        if library_filter:
+            q = library_filter.lower()
+            rows = [r for r in rows if q in r["library"].lower()]
+            if not rows:
+                console.print(f"[yellow]No results for library '{library_filter}'.[/yellow]")
+                return
+
         rows.sort(key=lambda r: r["size"], reverse=largest)
         rows = rows[:count]
 
-        t = Table(title=f"{label} {count} Files", box=box.ROUNDED, show_lines=False)
+        title = f"{label} {count} Files"
+        if library_filter:
+            title += f" — {library_filter}"
+        t = Table(title=title, box=box.ROUNDED, show_lines=False)
         t.add_column("#", style="dim", width=4)
         t.add_column("Size", width=10, justify="right", style="bold yellow")
         t.add_column("Title", style="bold white", min_width=28)
@@ -1103,15 +1225,23 @@ class PlexShell(cmd.Cmd):
             )
         console.print(t)
 
+    def _parse_size_args(self, arg: str) -> tuple[int, str]:
+        """Parse '[count] [--library name]' from size command args."""
+        _, flags = parse_search_args(arg)
+        library = flags.get("library", "")
+        # Count is the first token that's a plain integer
+        count = next((int(t) for t in arg.split() if t.isdigit()), 25)
+        return count, library
+
     def do_largest(self, arg: str):
-        """largest [count]  — titles with the biggest file sizes (default 25)"""
-        count = int(arg.strip()) if arg.strip().isdigit() else 25
-        self._size_table(count, largest=True)
+        """largest [count] [--library name]  — titles with the biggest file sizes (default 25)"""
+        count, library = self._parse_size_args(arg)
+        self._size_table(count, largest=True, library_filter=library)
 
     def do_smallest(self, arg: str):
-        """smallest [count]  — titles with the smallest file sizes (default 25)"""
-        count = int(arg.strip()) if arg.strip().isdigit() else 25
-        self._size_table(count, largest=False)
+        """smallest [count] [--library name]  — titles with the smallest file sizes (default 25)"""
+        count, library = self._parse_size_args(arg)
+        self._size_table(count, largest=False, library_filter=library)
 
     def do_storage(self, _):
         """Disk usage breakdown by library."""
@@ -1493,6 +1623,325 @@ class PlexShell(cmd.Cmd):
                 time.sleep(interval)
         except KeyboardInterrupt:
             console.print("\n[dim]Alert stopped.[/dim]")
+
+    # ── Playback control ──────────────────────────────────────────────────────
+
+    def _pick_session(self, arg: str) -> dict | None:
+        """Return a single active session matching arg, or prompt if ambiguous."""
+        sessions = self.client.sessions()
+        if not sessions:
+            console.print("[yellow]No active sessions.[/yellow]")
+            return None
+        if arg.strip():
+            q = arg.strip().lower()
+            matches = [
+                s for s in sessions
+                if q in s.get("sessionKey", "").lower()
+                or q in s.get("Player", {}).get("title", "").lower()
+                or q in (s.get("User", {}).get("title") or "").lower()
+            ]
+        else:
+            matches = sessions
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            console.print(f"[yellow]No session matching '{arg}'.[/yellow]")
+            return None
+        console.print(build_sessions_table(matches))
+        choices = {str(i): s for i, s in enumerate(matches, 1)}
+        for i, s in choices.items():
+            console.print(f"  [dim]{i}.[/dim] {s.get('User', {}).get('title','?')} on {s.get('Player', {}).get('title','?')}")
+        choice = Prompt.ask("Select session", choices=list(choices.keys()))
+        return choices.get(choice)
+
+    def do_clients(self, _):
+        """List available Plex clients."""
+        clients = self.client.clients()
+        if not clients:
+            console.print("[yellow]No clients found. Clients must be active/online to appear.[/yellow]")
+            return
+        t = Table(title="Plex Clients", box=box.ROUNDED)
+        t.add_column("Name", style="bold cyan")
+        t.add_column("Product", style="yellow")
+        t.add_column("Address", style="dim")
+        t.add_column("Device Class", style="dim")
+        t.add_column("State", width=10)
+        t.add_column("Machine ID", style="dim")
+        for c in clients:
+            state = c.get("state", "")
+            state_color = {"playing": "green", "paused": "yellow"}.get(state, "dim")
+            t.add_row(
+                c.get("name", ""),
+                c.get("product", ""),
+                f"{c.get('address','')}:{c.get('port','')}",
+                c.get("deviceClass", ""),
+                f"[{state_color}]{state}[/{state_color}]" if state else "—",
+                c.get("machineIdentifier", ""),
+            )
+        console.print(t)
+
+    def do_play(self, arg: str):
+        """play <key> [--client <name_or_id>]"""
+        if not arg.strip():
+            console.print("[yellow]Usage: play <key> [--client <name_or_id>][/yellow]")
+            return
+        _, flags = parse_search_args(arg)
+        key = arg.strip().split()[0]
+        client_filter = flags.get("client", "")
+
+        clients = self.client.clients()
+        if not clients:
+            console.print("[yellow]No active clients found.[/yellow]")
+            return
+
+        if client_filter:
+            q = client_filter.lower()
+            matches = [c for c in clients if q in c.get("name", "").lower() or q in c.get("machineIdentifier", "").lower()]
+        else:
+            matches = clients
+
+        if len(matches) == 1:
+            target = matches[0]
+        elif not matches:
+            console.print(f"[yellow]No client matching '{client_filter}'.[/yellow]")
+            return
+        else:
+            t = Table(title="Choose a client", box=box.ROUNDED)
+            t.add_column("#", style="dim", width=4)
+            t.add_column("Name", style="bold cyan")
+            t.add_column("Product", style="yellow")
+            for i, c in enumerate(matches, 1):
+                t.add_row(str(i), c.get("name", ""), c.get("product", ""))
+            console.print(t)
+            choices = {str(i): c for i, c in enumerate(matches, 1)}
+            choice = Prompt.ask("Select client", choices=list(choices.keys()))
+            target = choices[choice]
+
+        machine_id = target.get("machineIdentifier", "")
+        with console.status(f"Starting playback on [cyan]{target.get('name')}[/cyan]..."):
+            ok = self.client.play_media(machine_id, key)
+        if ok:
+            console.print(f"[green]Playing[/green] {key} on [cyan]{target.get('name')}[/cyan]")
+
+    def _player_args(self, s: dict) -> tuple:
+        p = s.get("Player", {})
+        return (
+            p.get("machineIdentifier", ""),
+            p.get("address", ""),
+            int(p.get("port") or 0),
+        )
+
+    def do_pause(self, arg: str):
+        """pause [session_filter]  — pause a session by player/user name or session key"""
+        s = self._pick_session(arg)
+        if not s:
+            return
+        if self.client.pause_playback(*self._player_args(s)):
+            console.print(f"[yellow]Paused[/yellow] {s.get('Player', {}).get('title','')}")
+
+    def do_resume(self, arg: str):
+        """resume [session_filter]  — resume a paused session"""
+        s = self._pick_session(arg)
+        if not s:
+            return
+        if self.client.resume_playback(*self._player_args(s)):
+            console.print(f"[green]Resumed[/green] {s.get('Player', {}).get('title','')}")
+
+    def do_stop(self, arg: str):
+        """stop [session_filter]  — stop a session"""
+        s = self._pick_session(arg)
+        if not s:
+            return
+        self.client.stop_playback(*self._player_args(s))
+        ts = s.get("TranscodeSession", {})
+        if ts:
+            self.client.stop_transcode(ts.get("key", ""))
+        console.print(f"[red]Stopped[/red] {s.get('Player', {}).get('title','')}")
+
+    # ── Analyze ───────────────────────────────────────────────────────────────
+
+    def do_analyze(self, arg: str):
+        """analyze <key> | analyze --library <id>  — trigger deep media analysis"""
+        if not arg.strip():
+            console.print("[yellow]Usage: analyze <key>  or  analyze --library <id>[/yellow]")
+            return
+        _, flags = parse_search_args(arg)
+        lib_id = flags.get("library")
+        if lib_id:
+            with console.status(f"Queuing analysis for library [cyan]{lib_id}[/cyan]..."):
+                ok = self.client.analyze_library(lib_id)
+            if ok:
+                console.print(f"[green]Analysis queued[/green] for library {lib_id} (runs in background)")
+        else:
+            key = arg.strip().split()[0]
+            with console.status(f"Queuing analysis for [cyan]{key}[/cyan]..."):
+                ok = self.client.analyze_item(key)
+            if ok:
+                console.print(f"[green]Analysis queued[/green] for item {key} (runs in background)")
+
+    # ── Report ────────────────────────────────────────────────────────────────
+
+    def do_report(self, arg: str):
+        """report [--html filename.html]  — comprehensive library report"""
+        html_file = None
+        if "--html" in arg:
+            parts = arg.split("--html", 1)
+            html_file = parts[1].strip() or f"plex_report_{datetime.now().strftime('%Y%m%d')}.html"
+
+        target = Console(record=True, width=120) if html_file else console
+
+        with console.status("Compiling report..."):
+            info       = self.client.server_info()
+            libs_data  = self.client.all_items_by_library()
+            media_rows = self.client.all_media_rows()
+            sessions   = self.client.sessions()
+            on_deck    = self.client.on_deck()
+            hist       = self.client.history(count=200)
+            cutoff     = int(time.time()) - 7 * 86400
+            recent     = [
+                (lib, item)
+                for lib, d in libs_data.items()
+                for item in d["items"]
+                if (item.get("addedAt") or 0) >= cutoff
+            ]
+
+        # ── Server header ──
+        target.print(Panel(
+            f"[bold cyan]Server:[/bold cyan]   {info.get('friendlyName','')}  "
+            f"[dim]v{info.get('version','')}[/dim]\n"
+            f"[bold cyan]Platform:[/bold cyan] {info.get('platform','')} {info.get('platformVersion','')}\n"
+            f"[bold cyan]Generated:[/bold cyan] {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            title="[bold white]Plex Report[/bold white]", border_style="cyan",
+        ))
+
+        # ── Library summary ──
+        lib_t = Table(title="Library Summary", box=box.ROUNDED)
+        lib_t.add_column("Library", style="cyan")
+        lib_t.add_column("Type", style="yellow", width=8)
+        lib_t.add_column("Items", justify="right", width=7)
+        lib_t.add_column("Duration", justify="right", width=14)
+        lib_t.add_column("Size", justify="right", width=12)
+        lib_t.add_column("Unwatched", justify="right", width=10)
+        grand = {"items": 0, "ms": 0, "bytes": 0, "unwatched": 0}
+        for lib_title, d in libs_data.items():
+            items = d["items"]
+            ms    = sum(i.get("duration", 0) or 0 for i in items)
+            byt   = sum(p.get("size", 0) or 0 for i in items for m in i.get("Media",[]) for p in m.get("Part",[]))
+            uw    = sum(1 for i in items if not i.get("viewCount"))
+            grand["items"] += len(items); grand["ms"] += ms; grand["bytes"] += byt; grand["unwatched"] += uw
+            lib_t.add_row(lib_title, d["info"].get("type",""), str(len(items)), format_duration(ms), format_size(byt), str(uw))
+        lib_t.add_section()
+        lib_t.add_row("[bold]TOTAL[/bold]","",f"[bold]{grand['items']}[/bold]",
+                      format_duration(grand["ms"]), format_size(grand["bytes"]), str(grand["unwatched"]))
+        target.print(lib_t)
+
+        # ── Quality breakdown ──
+        res_counts: Counter = Counter(resolution_label(r["videoResolution"]) for r in media_rows)
+        video_counts: Counter = Counter(r["videoCodec"].upper() or "?" for r in media_rows)
+        audio_counts: Counter = Counter(r["audioCodec"].upper() or "?" for r in media_rows)
+        codec_t = Table(title="Codec & Quality Summary", box=box.ROUNDED)
+        codec_t.add_column("Category", style="cyan")
+        codec_t.add_column("Value", style="bold white")
+        codec_t.add_column("Count", justify="right")
+        for label, cnt in res_counts.most_common():
+            codec_t.add_row("Resolution", label, str(cnt))
+        codec_t.add_section()
+        for codec, cnt in video_counts.most_common(5):
+            codec_t.add_row("Video", codec, str(cnt))
+        codec_t.add_section()
+        for codec, cnt in audio_counts.most_common(5):
+            codec_t.add_row("Audio", codec, str(cnt))
+        target.print(codec_t)
+
+        # ── Added in last 7 days ──
+        if recent:
+            rec_t = Table(title="Added in Last 7 Days", box=box.ROUNDED)
+            rec_t.add_column("Added", style="dim", width=17)
+            rec_t.add_column("Library", style="cyan", width=16)
+            rec_t.add_column("Title", style="bold white", min_width=28)
+            for lib_title, item in sorted(recent, key=lambda x: x[1].get("addedAt",0), reverse=True)[:50]:
+                rec_t.add_row(format_ts(item.get("addedAt")), lib_title, item.get("title",""))
+            target.print(rec_t)
+
+        # ── On deck ──
+        if on_deck:
+            deck_t = Table(title="On Deck", box=box.ROUNDED)
+            deck_t.add_column("Title", style="bold white", min_width=28)
+            deck_t.add_column("Progress", justify="right", width=10)
+            for item in on_deck[:10]:
+                offset   = item.get("viewOffset", 0)
+                duration = item.get("duration", 0) or 1
+                pct      = int(offset / duration * 100)
+                parent   = item.get("grandparentTitle","")
+                title    = item.get("title","")
+                deck_t.add_row(f"{parent} — {title}" if parent else title, f"{pct}%")
+            target.print(deck_t)
+
+        # ── Active sessions ──
+        if sessions:
+            target.print(build_sessions_table(sessions))
+
+        # ── Watch history summary ──
+        if hist:
+            user_counts: Counter = Counter(h.get("User",{}).get("title","?") for h in hist)
+            hist_t = Table(title=f"Watch History (last {len(hist)} plays)", box=box.ROUNDED)
+            hist_t.add_column("User", style="cyan")
+            hist_t.add_column("Plays", justify="right")
+            for user, cnt in user_counts.most_common():
+                hist_t.add_row(user, str(cnt))
+            target.print(hist_t)
+
+        if html_file:
+            Path(html_file).write_text(target.export_html(inline_styles=True), encoding="utf-8")
+            console.print(f"[green]Report saved to[/green] [bold]{html_file}[/bold]")
+
+    # ── Changelog ────────────────────────────────────────────────────────────
+
+    def do_changelog(self, arg: str):
+        """changelog [days]  — everything added or updated in the last N days (default 7)"""
+        days = int(arg.strip()) if arg.strip().isdigit() else 7
+        cutoff = int(time.time()) - days * 86400
+
+        with console.status(f"Fetching changes from last {days} days..."):
+            libs_data = self.client.all_items_by_library()
+
+        added:   list[tuple[str, dict]] = []
+        updated: list[tuple[str, dict]] = []
+
+        for lib_title, d in libs_data.items():
+            for item in d["items"]:
+                added_at   = item.get("addedAt") or 0
+                updated_at = item.get("updatedAt") or 0
+                if added_at >= cutoff:
+                    added.append((lib_title, item))
+                elif updated_at >= cutoff:
+                    updated.append((lib_title, item))
+
+        added.sort(key=lambda x: x[1].get("addedAt", 0), reverse=True)
+        updated.sort(key=lambda x: x[1].get("updatedAt", 0), reverse=True)
+
+        if not added and not updated:
+            console.print(f"[yellow]No changes in the last {days} days.[/yellow]")
+            return
+
+        if added:
+            t = Table(title=f"Added (last {days} days — {len(added)} items)", box=box.ROUNDED)
+            t.add_column("When", style="dim", width=17)
+            t.add_column("Library", style="cyan", width=16)
+            t.add_column("Title", style="bold white", min_width=28)
+            t.add_column("Type", style="yellow", width=10)
+            for lib_title, item in added:
+                t.add_row(format_ts(item.get("addedAt")), lib_title, item.get("title",""), item.get("type",""))
+            console.print(t)
+
+        if updated:
+            t = Table(title=f"Updated (last {days} days — {len(updated)} items)", box=box.ROUNDED)
+            t.add_column("When", style="dim", width=17)
+            t.add_column("Library", style="cyan", width=16)
+            t.add_column("Title", style="bold white", min_width=28)
+            for lib_title, item in updated:
+                t.add_row(format_ts(item.get("updatedAt")), lib_title, item.get("title",""))
+            console.print(t)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
