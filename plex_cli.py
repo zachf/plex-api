@@ -6,6 +6,7 @@ import cmd
 import csv
 import json
 import os
+import shlex
 import sys
 import time
 from collections import Counter, defaultdict
@@ -75,6 +76,30 @@ def year(item: dict) -> str:
 def rating(item: dict) -> str:
     r = item.get("rating") or item.get("audienceRating")
     return f"{r:.1f}" if r else "—"
+
+SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type"}
+
+def parse_search_args(arg: str) -> tuple:
+    """Parse search args into (query, filters). Supports --flag value pairs."""
+    try:
+        tokens = shlex.split(arg)
+    except ValueError:
+        tokens = arg.split()
+    filters: dict = {}
+    query_parts: list = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in SEARCH_FLAGS:
+            if i + 1 < len(tokens):
+                filters[t.lstrip("-")] = tokens[i + 1]
+                i += 2
+            else:
+                i += 1
+        else:
+            query_parts.append(t)
+            i += 1
+    return " ".join(query_parts), filters
 
 def resolution_label(res: Optional[str]) -> str:
     if not res:
@@ -163,6 +188,16 @@ class PlexClient:
 
     def search(self, query: str) -> list:
         data = self.get("/search", query=query)
+        return data.get("MediaContainer", {}).get("Metadata", [])
+
+    def section_search(self, section_id: str, query: str = "", **filters) -> list:
+        params = {k: v for k, v in filters.items() if v}
+        if query:
+            params["query"] = query
+            data = self.get(f"/library/sections/{section_id}/search", **params)
+        else:
+            # /search requires a query string; fall back to /all for simple field filters
+            data = self.get(f"/library/sections/{section_id}/all", **params)
         return data.get("MediaContainer", {}).get("Metadata", [])
 
     def sessions(self) -> list:
@@ -359,7 +394,7 @@ HELP_TEXT = """
   [yellow]status[/yellow]                    Server info and version
   [yellow]libraries[/yellow]                 List all media libraries
   [yellow]browse[/yellow] [dim]<id>[/dim]             Browse a library by ID
-  [yellow]search[/yellow] [dim]<query>[/dim]          Search all content
+  [yellow]search[/yellow] [dim][query] [--actor name] [--director name] [--genre name] [--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]
   [yellow]info[/yellow] [dim]<key>[/dim]              Show detailed info for an item
   [yellow]sessions[/yellow]                  Active playback sessions
   [yellow]recent[/yellow] [dim][count][/dim]          Recently added content
@@ -459,13 +494,54 @@ class PlexShell(cmd.Cmd):
         print_media_table(items, f"Library {arg.strip()}")
 
     def do_search(self, arg: str):
-        """search <query>"""
+        """search [query] [--actor name] [--director name] [--genre name] [--studio name] [--year YYYY] [--library id] [--type movie|show|episode]"""
         if not arg.strip():
-            console.print("[yellow]Usage: search <query>[/yellow]")
+            console.print(
+                "[yellow]Usage:[/yellow] search [dim][query][/dim] "
+                "[dim][--actor name] [--director name] [--genre name] "
+                "[--studio name] [--year YYYY] [--library id] [--type movie|show|episode][/dim]"
+            )
             return
-        with console.status(f"Searching for [cyan]{arg}[/cyan]..."):
-            results = self.client.search(arg.strip())
-        print_media_table(results, f'Search: "{arg}"')
+
+        query, filters = parse_search_args(arg.strip())
+        section_id = filters.pop("library", None)
+        type_filter = filters.pop("type", None)
+
+        label_parts = [f'"{query}"'] if query else []
+        label_parts += [f"--{k} {v}" for k, v in filters.items()]
+        if type_filter:
+            label_parts.append(f"--type {type_filter}")
+        label = "Search: " + " ".join(label_parts)
+
+        tag_filters = {"actor", "director", "genre"}
+        if not query and filters.keys() & tag_filters:
+            console.print(
+                f"[yellow]--actor, --director, and --genre require a title query to work "
+                f"(e.g. search breaking --actor 'Bryan Cranston')[/yellow]"
+            )
+            return
+
+        if not filters and not section_id:
+            # Simple global title search
+            if not query:
+                console.print("[yellow]Provide a query or at least one filter flag.[/yellow]")
+                return
+            with console.status(f"Searching [cyan]{query}[/cyan]..."):
+                results = self.client.search(query)
+        elif section_id:
+            with console.status(f"Searching library {section_id}..."):
+                results = self.client.section_search(section_id, query, **filters)
+        else:
+            # Filter search across all libraries
+            with console.status("Searching all libraries..."):
+                results = []
+                for lib in self.client.libraries():
+                    results.extend(self.client.section_search(lib.get("key", ""), query, **filters))
+
+        if type_filter:
+            results = [r for r in results if r.get("type", "").lower() == type_filter.lower()]
+
+        print_media_table(results, label)
 
     def do_info(self, arg: str):
         """info <key>"""
