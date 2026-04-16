@@ -489,6 +489,16 @@ class PlexClient:
     def playlist_remove_item(self, playlist_id: str, playlist_item_id: str) -> bool:
         return self.delete(f"/playlists/{playlist_id}/items/{playlist_item_id}")
 
+    # ── Item extras ────────────────────────────────────────────────────────────
+
+    def extras(self, rating_key: str) -> list:
+        data = self.get(f"/library/metadata/{rating_key}/extras")
+        return data.get("MediaContainer", {}).get("Metadata", [])
+
+    def related(self, rating_key: str) -> list:
+        data = self.get(f"/library/metadata/{rating_key}/related")
+        return data.get("MediaContainer", {}).get("Metadata", [])
+
     # ── Collections ────────────────────────────────────────────────────────────
 
     def get_collections(self, section_id: str | None = None) -> list:
@@ -663,6 +673,7 @@ _HELP_SECTIONS = [
         ("unwatched",       "[library_id]",                      "Content never played"),
         ("toprated",        "[library_id]",                      "Highest-rated items"),
         ("recently_played", "[count]",                           "Most recently watched"),
+        ("popularity",      "[library_id]",                      "Most-watched titles ranked by play count"),
     ]),
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
@@ -714,6 +725,12 @@ _HELP_SECTIONS = [
         ("hdr",             "[library_id]",                      "List HDR and Dolby Vision content"),
         ("audioformat",     "<format>",                          "Items with a specific audio format"),
         ("multiversion",    "[library_id]",                      "Items with more than one media version"),
+        ("genres",          "[library_id]",                      "Genre distribution across libraries"),
+        ("studios",         "[library_id]",                      "Studio distribution across libraries"),
+    ]),
+    ("Item extras", [
+        ("extras",          "<key>",                             "Trailers, featurettes, and interviews"),
+        ("related",         "<key>",                             "Related / recommended content"),
     ]),
     ("Users & sharing", [
         ("users",           "",                                  "List all server accounts"),
@@ -2743,6 +2760,143 @@ class PlexShell(cmd.Cmd):
                 title_str = f"{h['grandparentTitle']} — {h.get('parentTitle','')} — {title_str}"
             t3.add_row(format_ts(h.get("viewedAt")), h.get("type", ""), title_str)
         console.print(t3)
+
+    # ── Breakdown views ───────────────────────────────────────────────────────
+
+    def do_popularity(self, arg: str):
+        """popularity [library_id] — most-watched titles ranked by play count"""
+        section_id = arg.strip() or None
+        with console.status("Fetching watch history..."):
+            hist = self.client.history(count=5000)
+        if section_id:
+            hist = [h for h in hist if str(h.get("librarySectionID", "")) == section_id]
+        if not hist:
+            console.print("[yellow]No history available (may require Plex Pass).[/yellow]")
+            return
+
+        counts: Counter = Counter()
+        type_map: dict[str, str] = {}
+        for h in hist:
+            key = h.get("grandparentTitle") or h.get("title") or "?"
+            counts[key] += 1
+            if key not in type_map:
+                type_map[key] = "show" if h.get("grandparentTitle") else h.get("type", "")
+
+        top = counts.most_common(50)
+        t = Table(
+            title="Most Watched Titles",
+            caption=f"Based on {len(hist)} history entries",
+            caption_justify="right",
+            box=box.ROUNDED,
+        )
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Title", style="bold white", min_width=30)
+        t.add_column("Type", style="yellow", width=10)
+        t.add_column("Plays", justify="right", width=8, style="bold green")
+        for i, (title_str, cnt) in enumerate(top, 1):
+            t.add_row(str(i), title_str, type_map.get(title_str, ""), str(cnt))
+        console.print(t)
+
+    def do_genres(self, arg: str):
+        """genres [library_id] — genre distribution across libraries"""
+        section_id = arg.strip() or None
+        with console.status("Scanning genres..."):
+            if section_id:
+                items = self.client.library_contents(section_id)
+            else:
+                libs_data = self.client.all_items_by_library()
+                items = [item for d in libs_data.values() for item in d["items"]]
+
+        genre_counts: Counter = Counter()
+        for item in items:
+            for g in item.get("Genre", []):
+                genre_counts[g["tag"]] += 1
+
+        if not genre_counts:
+            console.print("[yellow]No genre data found.[/yellow]")
+            return
+
+        total = sum(genre_counts.values())
+        t = Table(title="Genre Distribution", box=box.ROUNDED)
+        t.add_column("Genre", style="bold cyan")
+        t.add_column("Count", justify="right", width=8)
+        t.add_column("Share", justify="right", width=8)
+        for genre, cnt in genre_counts.most_common():
+            t.add_row(genre, str(cnt), f"{cnt / total * 100:.1f}%")
+        console.print(t)
+
+    def do_studios(self, arg: str):
+        """studios [library_id] — studio distribution across libraries"""
+        section_id = arg.strip() or None
+        with console.status("Scanning studios..."):
+            if section_id:
+                items = self.client.library_contents(section_id)
+            else:
+                libs_data = self.client.all_items_by_library()
+                items = [item for d in libs_data.values() for item in d["items"]]
+
+        studio_counts: Counter = Counter()
+        for item in items:
+            studio = (item.get("studio") or "").strip()
+            if studio:
+                studio_counts[studio] += 1
+
+        if not studio_counts:
+            console.print("[yellow]No studio data found.[/yellow]")
+            return
+
+        total = sum(studio_counts.values())
+        top = studio_counts.most_common(30)
+        t = Table(title="Studio Distribution", box=box.ROUNDED)
+        t.add_column("Studio", style="bold cyan")
+        t.add_column("Count", justify="right", width=8)
+        t.add_column("Share", justify="right", width=8)
+        for studio, cnt in top:
+            t.add_row(studio, str(cnt), f"{cnt / total * 100:.1f}%")
+        console.print(t)
+        if len(studio_counts) > 30:
+            console.print(f"[dim]Showing top 30 of {len(studio_counts)} studios.[/dim]")
+
+    # ── Item extras ───────────────────────────────────────────────────────────
+
+    def do_extras(self, arg: str):
+        """extras <key> — list trailers, featurettes, and interviews for an item"""
+        if not arg.strip():
+            console.print("[yellow]Usage: extras <key>[/yellow]")
+            return
+        with console.status("Fetching extras..."):
+            items = self.client.extras(arg.strip())
+        if not items:
+            console.print("[yellow]No extras found for this item.[/yellow]")
+            return
+        t = Table(
+            title=f"Extras — item {arg.strip()}",
+            caption=f"{len(items)} item{'s' if len(items) != 1 else ''}",
+            caption_justify="right",
+            box=box.ROUNDED,
+        )
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=30)
+        t.add_column("Subtype", style="yellow", width=18)
+        t.add_column("Duration", width=9, justify="right")
+        for item in items:
+            subtype = item.get("subtype") or item.get("extraType") or item.get("type", "—")
+            t.add_row(
+                item.get("ratingKey", ""),
+                item.get("title", ""),
+                subtype,
+                format_duration(item.get("duration")),
+            )
+        console.print(t)
+
+    def do_related(self, arg: str):
+        """related <key> — show related / recommended content"""
+        if not arg.strip():
+            console.print("[yellow]Usage: related <key>[/yellow]")
+            return
+        with console.status("Fetching related content..."):
+            items = self.client.related(arg.strip())
+        print_media_table(items, f"Related to {arg.strip()}")
 
     # ── Playlists & Collections ───────────────────────────────────────────────
 
