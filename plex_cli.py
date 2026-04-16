@@ -273,6 +273,10 @@ class PlexClient:
     def library_contents(self, section_id: str, sort: str = "titleSort") -> list:
         return self._mc(f"/library/sections/{section_id}/all", sort=sort)
 
+    def library_episodes(self, section_id: str) -> list:
+        """Fetch all episodes in a TV library (type=4 returns leaf items with Media/Part)."""
+        return self._mc(f"/library/sections/{section_id}/all", type=4)
+
     def search(self, query: str) -> list:
         return self._mc("/search", query=query)
 
@@ -568,6 +572,8 @@ _HELP_SECTIONS = [
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
         ("smallest",        "[count] [--library name]",           "Titles with the smallest file sizes"),
+        ("tvlargest",       "[count] [--library name]",           "TV shows with the most total disk usage"),
+        ("tvsmallest",      "[count] [--library name]",           "TV shows with the least total disk usage"),
         ("long",            "[count] [--library name]",           "Titles with the longest runtime"),
         ("short",           "[count] [--library name]",           "Titles with the shortest runtime"),
         ("storage",         "",                                  "Disk usage breakdown by library"),
@@ -1210,12 +1216,74 @@ class PlexShell(cmd.Cmd):
             t.add_row(str(i), format_size(r["size"]), r["title"], r["library"],
                       r["videoCodec"].upper() or "—", r["audioCodec"].upper() or "—",
                       resolution_label(r["videoResolution"]))
+        total = sum(r["size"] for r in rows)
+        t.add_section()
+        t.add_row("", f"[bold]{format_size(total)}[/bold]", f"[dim]Total ({len(rows)} files)[/dim]", "", "", "", "")
         console.print(t)
 
     def do_largest(self, arg: str):
         count, lib = self._parse_size_args(arg); self._size_table(count, True, lib)
     def do_smallest(self, arg: str):
         count, lib = self._parse_size_args(arg); self._size_table(count, False, lib)
+
+    def _show_size_table(self, count: int, largest: bool, library_filter: str = ""):
+        label = "Largest" if largest else "Smallest"
+        with console.status("Fetching TV libraries..."):
+            tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
+        if library_filter:
+            tv_libs = [l for l in tv_libs if library_filter.lower() in l.get("title", "").lower()]
+        if not tv_libs:
+            suffix = f" matching '{library_filter}'" if library_filter else ""
+            console.print(f"[yellow]No TV libraries found{suffix}.[/yellow]")
+            return
+
+        show_data: dict = {}
+        with console.status("Summing episode sizes..."):
+            for lib in tv_libs:
+                for ep in self.client.library_episodes(lib.get("key", "")):
+                    show = ep.get("grandparentTitle") or ep.get("title", "Unknown")
+                    key = ep.get("grandparentRatingKey", "")
+                    rec = show_data.setdefault(show, {
+                        "title": show, "ratingKey": key,
+                        "library": lib.get("title", ""), "size": 0, "episodes": 0,
+                    })
+                    rec["size"] += sum(
+                        p.get("size", 0) or 0
+                        for m in ep.get("Media", []) for p in m.get("Part", [])
+                    )
+                    rec["episodes"] += 1
+
+        if not show_data:
+            console.print("[yellow]No episode data found.[/yellow]")
+            return
+
+        rows = sorted(show_data.values(), key=lambda x: x["size"], reverse=largest)[:count]
+        title = f"{label} {count} TV Shows by Disk Usage" + (f" — {library_filter}" if library_filter else "")
+        t = Table(title=title, box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Total Size", width=12, justify="right", style="bold yellow")
+        t.add_column("Show", style="bold white", min_width=30)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Episodes", width=9, justify="right")
+        t.add_column("Avg/Ep", width=10, justify="right")
+        for i, row in enumerate(rows, 1):
+            avg = row["size"] // row["episodes"] if row["episodes"] else 0
+            t.add_row(str(i), format_size(row["size"]), row["title"],
+                      row["library"], str(row["episodes"]), format_size(avg))
+        total = sum(r["size"] for r in rows)
+        t.add_section()
+        t.add_row("", f"[bold]{format_size(total)}[/bold]", f"[dim]Total ({len(rows)} shows)[/dim]", "", "", "")
+        console.print(t)
+
+    def do_tvlargest(self, arg: str):
+        """tvlargest [count] [--library name] — TV shows with the most total disk usage (default 25)"""
+        count, lib = self._parse_size_args(arg)
+        self._show_size_table(count, True, lib)
+
+    def do_tvsmallest(self, arg: str):
+        """tvsmallest [count] [--library name] — TV shows with the least total disk usage (default 25)"""
+        count, lib = self._parse_size_args(arg)
+        self._show_size_table(count, False, lib)
 
     def _duration_table(self, count: int, longest: bool, library_filter: str = ""):
         label = "Longest" if longest else "Shortest"
@@ -2199,7 +2267,8 @@ class PlexShell(cmd.Cmd):
     complete_studios = complete_collections = complete_popularity = _c_lib_arg
     complete_fixtitles = complete_stale = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
-    complete_largest = complete_smallest = complete_long = complete_short = complete_analyze = _c_lib_flag
+    complete_largest = complete_smallest = complete_long = complete_short = _c_lib_flag
+    complete_tvlargest = complete_tvsmallest = complete_analyze = _c_lib_flag
 
     def complete_export(self, text, line, begidx, endidx):
         return self._c_libs(text) if len(line[:begidx].split()) == 1 else []
