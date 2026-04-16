@@ -77,7 +77,7 @@ def rating(item: dict) -> str:
     r = item.get("rating") or item.get("audienceRating")
     return f"{r:.1f}" if r else "—"
 
-SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type", "--title"}
+SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type", "--title", "--tolerance", "--level", "--client", "--html"}
 
 def parse_search_args(arg: str) -> tuple:
     """Parse search args into (query, filters). Supports --flag value pairs."""
@@ -262,6 +262,12 @@ class PlexClient:
         return self.put(
             f"/library/metadata/{rating_key}",
             **{"title.value": new_title, "title.locked": 1},
+        )
+
+    def set_rating(self, rating_key: str, rating: float) -> bool:
+        return self.put(
+            f"/library/metadata/{rating_key}",
+            **{"userRating.value": rating, "userRating.locked": 1},
         )
 
     def delete(self, path: str, **params) -> bool:
@@ -587,6 +593,7 @@ _HELP_SECTIONS = [
     ("Library health", [
         ("dupes",           "",                                  "Items Plex flagged as duplicate files"),
         ("dupetitles",      "",                                  "Items sharing the same title and year"),
+        ("duplicates_smart","[--tolerance seconds]",             "Likely dupes matched by duration (±30s default)"),
         ("missing",         "",                                  "Items with incomplete metadata"),
         ("quality",         "",                                  "Resolution breakdown per library"),
         ("orphans",         "",                                  "Items with no associated media files"),
@@ -617,7 +624,11 @@ _HELP_SECTIONS = [
     ("Monitoring", [
         ("watch",           "[seconds]",                         "Live-refresh sessions (Ctrl+C to stop)"),
         ("alert",           "[seconds]",                         "Alert when a transcode session starts"),
+        ("activities",      "",                                  "Show currently running background tasks"),
         ("logs",            "[lines] [--level debug|info|warn|error]", "Show recent server log entries"),
+    ]),
+    ("Users", [
+        ("sharing",         "",                                  "Libraries each managed user can access"),
     ]),
     ("Playback control", [
         ("clients",         "",                                  "List available Plex clients"),
@@ -630,6 +641,24 @@ _HELP_SECTIONS = [
         ("analyze",         "<key> | --library <id>",            "Trigger deep media analysis"),
         ("report",          "[--html filename.html]",            "Comprehensive library report"),
         ("changelog",       "[days]",                            "Everything added/updated in last N days"),
+    ]),
+    ("Ratings & Tags", [
+        ("setrating",       "<key> <0-10>",                      "Set user rating on an item"),
+        ("bygenre",         "<genre> [library_id]",              "Browse items by genre"),
+        ("byactor",         "<name> [library_id]",               "Browse items by actor"),
+        ("bydirector",      "<name> [library_id]",               "Browse items by director"),
+        ("byyear",          "<year> [library_id]",               "Browse items by release year"),
+    ]),
+    ("Deeper analysis", [
+        ("bitrate",         "[library_id]",                      "Bitrate distribution with outlier flagging"),
+        ("subtitles",       "[library_id]",                      "Items missing subtitle tracks"),
+        ("hdr",             "[library_id]",                      "List HDR and Dolby Vision content"),
+        ("audioformat",     "<format>",                          "Items with a specific audio format"),
+        ("multiversion",    "[library_id]",                      "Items with more than one media version"),
+    ]),
+    ("Users & sharing", [
+        ("users",           "",                                  "List all server accounts"),
+        ("userstats",       "[username]",                        "Watch stats per user, or detail for one user"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -985,6 +1014,67 @@ class PlexShell(cmd.Cmd):
             f"[bold]{grand_total}[/bold]",
         )
         console.print(t)
+
+    def do_duplicates_smart(self, arg: str):
+        """duplicates_smart [--tolerance seconds]  — find likely dupes by matching duration (default ±30s)"""
+        _, flags = parse_search_args(arg)
+        tolerance_ms = int(flags.get("tolerance", 30)) * 1000
+
+        with console.status("Scanning all media..."):
+            rows = [r for r in self.client.all_media_rows() if r.get("duration")]
+
+        if not rows:
+            console.print("[yellow]No media found.[/yellow]")
+            return
+
+        rows.sort(key=lambda r: r["duration"])
+
+        # Sliding-window group: collect runs of items within tolerance of the group's first item
+        groups: list[list[dict]] = []
+        current: list[dict] = [rows[0]]
+        for row in rows[1:]:
+            if row["duration"] - current[0]["duration"] <= tolerance_ms:
+                current.append(row)
+            else:
+                if len(current) > 1:
+                    groups.append(current)
+                current = [row]
+        if len(current) > 1:
+            groups.append(current)
+
+        # Drop groups where every entry is the same ratingKey (already caught by dupes)
+        groups = [
+            g for g in groups
+            if len({r["ratingKey"] for r in g}) > 1
+        ]
+
+        if not groups:
+            console.print("[green]No smart duplicates found.[/green]")
+            return
+
+        total = sum(len(g) for g in groups)
+        console.print(f"[yellow]{len(groups)} potential duplicate groups ({total} items)[/yellow]\n")
+
+        for group in groups:
+            t = Table(box=box.ROUNDED, show_lines=True)
+            t.add_column("Key", style="dim", width=7)
+            t.add_column("Title", style="bold white", min_width=24)
+            t.add_column("Library", style="cyan", width=14)
+            t.add_column("Duration", width=10, justify="right")
+            t.add_column("Size", width=10, justify="right")
+            t.add_column("Video", width=8)
+            t.add_column("File", style="dim")
+            for r in group:
+                t.add_row(
+                    r["ratingKey"],
+                    r["title"],
+                    r["library"],
+                    format_duration(r["duration"]),
+                    format_size(r["size"]),
+                    r["videoCodec"].upper() or "?",
+                    r["file"],
+                )
+            console.print(t)
 
     def do_orphans(self, _):
         """Find items with no associated media files."""
@@ -1762,6 +1852,64 @@ class PlexShell(cmd.Cmd):
                     break
             console.print(f"[{style}]{line}[/{style}]")
 
+    def do_activities(self, _):
+        """Show currently running background server tasks."""
+        data = self.client.get("/activities")
+        activities = data.get("MediaContainer", {}).get("Activity", [])
+        if not activities:
+            console.print("[yellow]No activities running.[/yellow]")
+            return
+        t = Table(title="Server Activities", box=box.ROUNDED)
+        t.add_column("Type", style="yellow", min_width=20)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Subtitle", style="dim", min_width=24)
+        t.add_column("Progress", width=22)
+        t.add_column("Cancel", width=8)
+        for a in activities:
+            pct = int(a.get("progress", 0))
+            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            t.add_row(
+                a.get("type", ""),
+                a.get("title", ""),
+                a.get("subtitle", ""),
+                f"[cyan]{bar}[/cyan] {pct}%",
+                "yes" if a.get("cancellable") else "—",
+            )
+        console.print(t)
+
+    def do_sharing(self, _):
+        """Show which libraries each home/managed user can access."""
+        data = self.client.get("/api/v2/home/users")
+        users = data.get("MediaContainer", {}).get("User", [])
+        if not users:
+            console.print("[yellow]No managed users found (or this server requires plex.tv authentication for this endpoint).[/yellow]")
+            return
+
+        all_libs = {lib.get("key"): lib.get("title", lib.get("key")) for lib in self.client.libraries()}
+
+        t = Table(title="User Library Access", box=box.ROUNDED, show_lines=True)
+        t.add_column("User", style="bold cyan", min_width=18)
+        t.add_column("Email", style="dim", min_width=22)
+        t.add_column("Libraries", min_width=30)
+
+        for user in users:
+            uid = user.get("id") or user.get("uuid", "")
+            share_data = self.client.get(f"/api/v2/home/users/{uid}/sharing")
+            shared_libs = share_data.get("MediaContainer", {}).get("Section", [])
+            if shared_libs:
+                lib_names = ", ".join(
+                    all_libs.get(str(s.get("id", "")), s.get("title", str(s.get("id", ""))))
+                    for s in shared_libs
+                )
+            else:
+                lib_names = "[dim]all[/dim]" if user.get("allLibraries") else "[dim]none[/dim]"
+            t.add_row(
+                user.get("title", user.get("username", "?")),
+                user.get("email", "—"),
+                lib_names,
+            )
+        console.print(t)
+
     def do_clients(self, _):
         """List available Plex clients."""
         clients = self.client.clients()
@@ -2050,6 +2198,483 @@ class PlexShell(cmd.Cmd):
             for lib_title, item in updated:
                 t.add_row(format_ts(item.get("updatedAt")), lib_title, item.get("title",""))
             console.print(t)
+
+    # ── Ratings & Tags ────────────────────────────────────────────────────────
+
+    def do_setrating(self, arg: str):
+        """setrating <key> <0-10>  — set user rating on an item"""
+        parts = arg.strip().split(None, 1)
+        if len(parts) != 2:
+            console.print("[yellow]Usage: setrating <key> <0-10>[/yellow]")
+            return
+        key, rating_str = parts
+        try:
+            rating_val = float(rating_str)
+            if not 0 <= rating_val <= 10:
+                raise ValueError
+        except ValueError:
+            console.print("[yellow]Rating must be a number between 0 and 10.[/yellow]")
+            return
+        if self.client.set_rating(key, rating_val):
+            console.print(f"[green]Rating set to {rating_val:.1f} for item {key}.[/green]")
+
+    def do_bygenre(self, arg: str):
+        """bygenre <genre> [library_id]  — browse items by genre"""
+        parts = arg.strip().split(None, 1)
+        if not parts:
+            console.print("[yellow]Usage: bygenre <genre> [library_id][/yellow]")
+            return
+        genre = parts[0]
+        section_id = parts[1].strip() if len(parts) > 1 else None
+        libs = [{"key": section_id, "title": section_id}] if section_id else self.client.libraries()
+        with console.status(f"Browsing genre [cyan]{genre}[/cyan]..."):
+            results = []
+            for lib in libs:
+                results.extend(self.client.section_search(lib.get("key", ""), genre=genre))
+        print_media_table(results, f"Genre: {genre}")
+
+    def do_byactor(self, arg: str):
+        """byactor <name> [library_id]  — browse items by actor"""
+        try:
+            parts = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            parts = arg.strip().split()
+        if not parts:
+            console.print("[yellow]Usage: byactor <name> [library_id][/yellow]")
+            return
+        if len(parts) > 1 and parts[-1].isdigit():
+            actor = " ".join(parts[:-1])
+            section_id = parts[-1]
+        else:
+            actor = " ".join(parts)
+            section_id = None
+        libs = [{"key": section_id, "title": section_id}] if section_id else self.client.libraries()
+        with console.status(f"Browsing by actor [cyan]{actor}[/cyan]..."):
+            results = []
+            for lib in libs:
+                results.extend(self.client.section_search(lib.get("key", ""), actor=actor))
+        print_media_table(results, f"Actor: {actor}")
+
+    def do_bydirector(self, arg: str):
+        """bydirector <name> [library_id]  — browse items by director"""
+        try:
+            parts = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            parts = arg.strip().split()
+        if not parts:
+            console.print("[yellow]Usage: bydirector <name> [library_id][/yellow]")
+            return
+        if len(parts) > 1 and parts[-1].isdigit():
+            director = " ".join(parts[:-1])
+            section_id = parts[-1]
+        else:
+            director = " ".join(parts)
+            section_id = None
+        libs = [{"key": section_id, "title": section_id}] if section_id else self.client.libraries()
+        with console.status(f"Browsing by director [cyan]{director}[/cyan]..."):
+            results = []
+            for lib in libs:
+                results.extend(self.client.section_search(lib.get("key", ""), director=director))
+        print_media_table(results, f"Director: {director}")
+
+    def do_byyear(self, arg: str):
+        """byyear <year> [library_id]  — browse items by release year"""
+        parts = arg.strip().split()
+        if not parts or not parts[0].isdigit():
+            console.print("[yellow]Usage: byyear <year> [library_id][/yellow]")
+            return
+        year_val = parts[0]
+        section_id = parts[1] if len(parts) > 1 else None
+        libs = [{"key": section_id, "title": section_id}] if section_id else self.client.libraries()
+        with console.status(f"Browsing year [cyan]{year_val}[/cyan]..."):
+            results = []
+            for lib in libs:
+                results.extend(self.client.section_search(lib.get("key", ""), year=year_val))
+        print_media_table(results, f"Year: {year_val}")
+
+    # ── Deeper Analysis ───────────────────────────────────────────────────────
+
+    def do_bitrate(self, arg: str):
+        """bitrate [library_id]  — bitrate distribution with outlier flagging"""
+        section_id = arg.strip() or None
+        with console.status("Analysing bitrates..."):
+            if section_id:
+                items = self.client.library_contents(section_id)
+                rows = []
+                for item in items:
+                    rows.extend(get_media_rows(item, section_id))
+            else:
+                rows = self.client.all_media_rows()
+
+        rows_with_br = [r for r in rows if r.get("bitrate")]
+        if not rows_with_br:
+            console.print("[yellow]No bitrate data available.[/yellow]")
+            return
+
+        bitrates = [r["bitrate"] for r in rows_with_br]
+        avg_br = sum(bitrates) / len(bitrates)
+
+        buckets = [
+            ("< 2 Mbps",    0,     2000),
+            ("2–5 Mbps",    2000,  5000),
+            ("5–10 Mbps",   5000,  10000),
+            ("10–20 Mbps",  10000, 20000),
+            ("20–40 Mbps",  20000, 40000),
+            ("> 40 Mbps",   40000, float("inf")),
+        ]
+        t = Table(title="Bitrate Distribution", box=box.ROUNDED)
+        t.add_column("Range", style="cyan", width=14)
+        t.add_column("Count", justify="right", width=8)
+        t.add_column("Share", justify="right", width=8)
+        for label, lo, hi in buckets:
+            cnt = sum(1 for b in bitrates if lo <= b < hi)
+            pct = cnt / len(bitrates) * 100
+            t.add_row(label, str(cnt), f"{pct:.1f}%")
+        console.print(t)
+        console.print(
+            f"[dim]Average: {avg_br/1000:.1f} Mbps  "
+            f"Min: {min(bitrates)/1000:.1f} Mbps  "
+            f"Max: {max(bitrates)/1000:.1f} Mbps[/dim]"
+        )
+
+        outliers_hi = [r for r in rows_with_br if r["bitrate"] > avg_br * 3 and avg_br > 0]
+        outliers_lo = [r for r in rows_with_br if r["bitrate"] < 500]
+
+        for outliers, label, reverse in [
+            (outliers_hi, f"High Bitrate Outliers (>3× avg)", True),
+            (outliers_lo, "Low Bitrate Outliers (<500 kbps)", False),
+        ]:
+            if not outliers:
+                continue
+            top = sorted(outliers, key=lambda x: x["bitrate"], reverse=reverse)[:10]
+            t2 = Table(title=f"{label} — top {len(top)}", box=box.ROUNDED)
+            t2.add_column("Bitrate", justify="right", width=12)
+            t2.add_column("Title", style="bold white", min_width=28)
+            t2.add_column("Library", style="cyan", width=16)
+            for r in top:
+                t2.add_row(f"{r['bitrate']/1000:.1f} Mbps", r["title"], r["library"])
+            console.print(t2)
+
+    def do_subtitles(self, arg: str):
+        """subtitles [library_id]  — items missing subtitle tracks"""
+        section_id = arg.strip() or None
+        with console.status("Checking for subtitle tracks..."):
+            libs = (
+                [{"key": section_id, "title": section_id}]
+                if section_id
+                else self.client.libraries()
+            )
+            missing = []
+            for lib in libs:
+                lid = lib.get("key", "")
+                lib_title = lib.get("title", lid)
+                for item in self.client.library_contents(lid):
+                    has_sub = any(
+                        stream.get("streamType") == 3
+                        for media in item.get("Media", [])
+                        for part in media.get("Part", [])
+                        for stream in part.get("Stream", [])
+                    )
+                    if not has_sub:
+                        missing.append((lib_title, item))
+
+        if not missing:
+            console.print("[green]All items have subtitle tracks.[/green]")
+            return
+
+        t = Table(title=f"Items Missing Subtitles ({len(missing)})", box=box.ROUNDED)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Type", style="yellow", width=10)
+        for lib_title, item in sorted(missing, key=lambda x: x[1].get("title", "").lower()):
+            t.add_row(
+                lib_title,
+                item.get("ratingKey", ""),
+                item.get("title", ""),
+                year(item),
+                item.get("type", ""),
+            )
+        console.print(t)
+
+    def do_hdr(self, arg: str):
+        """hdr [library_id]  — list HDR and Dolby Vision content"""
+        section_id = arg.strip() or None
+        with console.status("Scanning for HDR content..."):
+            libs = (
+                [{"key": section_id, "title": section_id}]
+                if section_id
+                else self.client.libraries()
+            )
+            hdr_items = []
+            for lib in libs:
+                lid = lib.get("key", "")
+                lib_title = lib.get("title", lid)
+                for item in self.client.library_contents(lid):
+                    for media in item.get("Media", []):
+                        hdr_type = None
+                        for part in media.get("Part", []):
+                            for stream in part.get("Stream", []):
+                                if stream.get("streamType") != 1:
+                                    continue
+                                color_trc = (stream.get("colorTrc") or "").lower()
+                                dovi = stream.get("DOVIPresent") or stream.get("doviPresent")
+                                if dovi:
+                                    hdr_type = "Dolby Vision"
+                                elif "smpte2084" in color_trc or color_trc == "pq":
+                                    hdr_type = "HDR10"
+                                elif "arib-std-b67" in color_trc or color_trc == "hlg":
+                                    hdr_type = "HLG"
+                        if not hdr_type:
+                            profile = (media.get("videoProfile") or "").lower()
+                            if "main 10" in profile or "high 10" in profile:
+                                hdr_type = "HDR (10-bit)"
+                        if hdr_type:
+                            hdr_items.append((lib_title, hdr_type, media, item))
+                            break
+
+        if not hdr_items:
+            console.print("[yellow]No HDR content detected.[/yellow]")
+            return
+
+        t = Table(title=f"HDR Content ({len(hdr_items)} items)", box=box.ROUNDED)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("HDR Type", style="yellow", width=14)
+        t.add_column("Resolution", width=10, justify="right")
+        for lib_title, hdr_type, media, item in sorted(
+            hdr_items, key=lambda x: x[3].get("title", "").lower()
+        ):
+            t.add_row(
+                lib_title,
+                item.get("ratingKey", ""),
+                item.get("title", ""),
+                year(item),
+                hdr_type,
+                resolution_label(media.get("videoResolution")),
+            )
+        console.print(t)
+
+    def do_audioformat(self, arg: str):
+        """audioformat <format>  — items with a specific audio format (e.g. truehd, dts, atmos, flac)"""
+        if not arg.strip():
+            console.print(
+                "[yellow]Usage: audioformat <format>  "
+                "(e.g. truehd, dts, atmos, flac, aac, eac3)[/yellow]"
+            )
+            return
+        fmt = arg.strip().lower()
+        with console.status(f"Scanning for audio format [cyan]{fmt}[/cyan]..."):
+            rows = self.client.all_media_rows()
+
+        matches = [r for r in rows if fmt in r["audioCodec"].lower()]
+        if not matches:
+            console.print(f"[yellow]No items found with audio format '{fmt}'.[/yellow]")
+            return
+
+        t = Table(title=f"Audio Format: {fmt.upper()} ({len(matches)} items)", box=box.ROUNDED)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Audio", width=10)
+        t.add_column("Ch", width=5, justify="right")
+        t.add_column("Video", width=8)
+        t.add_column("Resolution", width=10, justify="right")
+        for r in sorted(matches, key=lambda x: x["title"].lower()):
+            t.add_row(
+                r["ratingKey"],
+                r["title"],
+                r["library"],
+                r["audioCodec"].upper(),
+                str(r.get("audioChannels") or "?"),
+                r["videoCodec"].upper() or "—",
+                resolution_label(r["videoResolution"]),
+            )
+        console.print(t)
+
+    def do_multiversion(self, arg: str):
+        """multiversion [library_id]  — items with more than one media version"""
+        section_id = arg.strip() or None
+        with console.status("Scanning for multi-version items..."):
+            libs = (
+                [{"key": section_id, "title": section_id}]
+                if section_id
+                else self.client.libraries()
+            )
+            multi = []
+            for lib in libs:
+                lid = lib.get("key", "")
+                lib_title = lib.get("title", lid)
+                for item in self.client.library_contents(lid):
+                    media_list = item.get("Media", [])
+                    if len(media_list) > 1:
+                        multi.append((lib_title, item, media_list))
+
+        if not multi:
+            console.print("[yellow]No multi-version items found.[/yellow]")
+            return
+
+        t = Table(title=f"Multi-Version Items ({len(multi)})", box=box.ROUNDED, show_lines=True)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=26)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Ver", width=4, justify="right")
+        t.add_column("Resolutions", style="dim")
+        for lib_title, item, media_list in sorted(
+            multi, key=lambda x: x[1].get("title", "").lower()
+        ):
+            resolutions = ", ".join(
+                resolution_label(m.get("videoResolution")) for m in media_list
+            )
+            t.add_row(
+                lib_title,
+                item.get("ratingKey", ""),
+                item.get("title", ""),
+                year(item),
+                str(len(media_list)),
+                resolutions,
+            )
+        console.print(t)
+
+    # ── Users & Sharing ───────────────────────────────────────────────────────
+
+    def do_users(self, _):
+        """List all server accounts."""
+        with console.status("Fetching accounts..."):
+            accounts = self.client.accounts()
+        if not accounts:
+            console.print("[yellow]No accounts found (may require Plex Pass or admin token).[/yellow]")
+            return
+
+        t = Table(title=f"Server Accounts ({len(accounts)})", box=box.ROUNDED)
+        t.add_column("ID", style="dim", width=6, justify="right")
+        t.add_column("Name", style="bold cyan", min_width=20)
+        t.add_column("Admin", width=7, justify="center")
+        for acct in accounts:
+            is_admin = "✓" if acct.get("id") == 1 else ""
+            t.add_row(
+                str(acct.get("id", "?")),
+                acct.get("name") or acct.get("title") or "—",
+                is_admin,
+            )
+        console.print(t)
+        console.print("[dim]Use [bold]userstats <name>[/bold] for per-user watch detail.[/dim]")
+
+    def do_userstats(self, arg: str):
+        """userstats [username]  — watch stats for all users, or detailed stats for one user"""
+        username_filter = arg.strip().lower()
+
+        with console.status("Fetching accounts and history..."):
+            accounts = self.client.accounts()
+            # Use a large history pull so per-user counts are meaningful
+            all_hist = self.client.history(count=2000)
+
+        if not all_hist:
+            console.print("[yellow]No history available (may require Plex Pass).[/yellow]")
+            return
+
+        if not username_filter:
+            # ── Summary table: one row per user ──────────────────────────────
+            # Build per-user stats from history
+            user_records: dict = {}
+            for h in all_hist:
+                uname = h.get("User", {}).get("title") or str(h.get("accountID") or "Unknown")
+                rec = user_records.setdefault(uname, {
+                    "plays": 0, "movies": 0, "episodes": 0, "last_at": 0,
+                })
+                rec["plays"] += 1
+                if h.get("type") == "movie":
+                    rec["movies"] += 1
+                elif h.get("type") == "episode":
+                    rec["episodes"] += 1
+                viewed_at = h.get("viewedAt") or 0
+                if viewed_at > rec["last_at"]:
+                    rec["last_at"] = viewed_at
+
+            t = Table(title="Watch Stats by User", box=box.ROUNDED)
+            t.add_column("User", style="bold cyan", min_width=20)
+            t.add_column("Total Plays", justify="right", width=12)
+            t.add_column("Movies", justify="right", width=8)
+            t.add_column("Episodes", justify="right", width=10)
+            t.add_column("Last Watched", style="dim", width=18)
+            for uname, rec in sorted(
+                user_records.items(), key=lambda x: x[1]["plays"], reverse=True
+            ):
+                t.add_row(
+                    uname,
+                    str(rec["plays"]),
+                    str(rec["movies"]),
+                    str(rec["episodes"]),
+                    format_ts(rec["last_at"]) if rec["last_at"] else "—",
+                )
+            console.print(t)
+            console.print(
+                f"[dim]Based on the last {len(all_hist)} history entries. "
+                "Run [bold]userstats <name>[/bold] for detail.[/dim]"
+            )
+            return
+
+        # ── Detail view for a single user ────────────────────────────────────
+        user_hist = [
+            h for h in all_hist
+            if (h.get("User", {}).get("title") or "").lower() == username_filter
+        ]
+        if not user_hist:
+            console.print(f"[yellow]No history found for user '{arg.strip()}'. "
+                          "Run [bold]users[/bold] to see account names.[/yellow]")
+            return
+
+        display_name = user_hist[0].get("User", {}).get("title", arg.strip())
+
+        movies   = [h for h in user_hist if h.get("type") == "movie"]
+        episodes = [h for h in user_hist if h.get("type") == "episode"]
+        other    = [h for h in user_hist if h.get("type") not in ("movie", "episode")]
+
+        last_item = user_hist[0]
+        last_title = last_item.get("grandparentTitle") or last_item.get("title", "?")
+        if last_item.get("grandparentTitle"):
+            last_title += f" — {last_item.get('title', '')}"
+
+        console.print(Panel(
+            f"[bold cyan]Total plays:[/bold cyan] {len(user_hist)}\n"
+            f"[bold cyan]Movies:[/bold cyan] {len(movies)}  "
+            f"[bold cyan]Episodes:[/bold cyan] {len(episodes)}  "
+            f"[bold cyan]Other:[/bold cyan] {len(other)}\n"
+            f"[bold cyan]Last watched:[/bold cyan] {last_title}  "
+            f"[dim]{format_ts(last_item.get('viewedAt'))}[/dim]",
+            title=f"[bold white]{display_name}[/bold white]",
+            border_style="cyan",
+        ))
+
+        # Most-watched titles
+        title_counts: Counter = Counter()
+        for h in user_hist:
+            key = h.get("grandparentTitle") or h.get("title") or "?"
+            title_counts[key] += 1
+
+        top_titles = title_counts.most_common(10)
+        t2 = Table(title="Most Watched", box=box.ROUNDED)
+        t2.add_column("Title", style="bold white", min_width=30)
+        t2.add_column("Plays", justify="right", width=7)
+        for title_str, cnt in top_titles:
+            t2.add_row(title_str, str(cnt))
+        console.print(t2)
+
+        # Recent plays
+        t3 = Table(title="Recent Plays (last 20)", box=box.ROUNDED)
+        t3.add_column("When", style="dim", width=17)
+        t3.add_column("Type", style="yellow", width=9)
+        t3.add_column("Title", style="bold white", min_width=30)
+        for h in user_hist[:20]:
+            title_str = h.get("title", "")
+            if h.get("grandparentTitle"):
+                title_str = f"{h['grandparentTitle']} — {h.get('parentTitle','')} — {title_str}"
+            t3.add_row(format_ts(h.get("viewedAt")), h.get("type", ""), title_str)
+        console.print(t3)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
