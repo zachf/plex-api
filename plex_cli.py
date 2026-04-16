@@ -677,7 +677,7 @@ _HELP_SECTIONS = [
     ("Library health", [
         ("dupes",           "",                                  "Items Plex flagged as duplicate files"),
         ("dupetitles",      "",                                  "Items sharing the same title and year"),
-        ("duplicates_smart","[--tolerance seconds] [--match-name]","Likely dupes by duration; --match-name also requires similar titles"),
+        ("duplicates_smart","[--tolerance s] [--match-name] [--library name]","--match-name alone: title-only search; --tolerance: duration grouping (±30s default)"),
         ("missing",         "",                                  "Items with incomplete metadata"),
         ("quality",         "",                                  "Resolution breakdown per library"),
         ("orphans",         "",                                  "Items with no associated media files"),
@@ -1126,65 +1126,103 @@ class PlexShell(cmd.Cmd):
         console.print(t)
 
     def do_duplicates_smart(self, arg: str):
-        """duplicates_smart [--tolerance seconds] [--match-name]  — find likely dupes by duration (±30s default); --match-name also requires similar titles"""
+        """duplicates_smart [--tolerance seconds] [--match-name] [--library name]
+        Without --tolerance: pure title similarity search (requires --match-name).
+        With --tolerance: duration grouping (default ±30s); add --match-name to also require similar titles."""
         _, flags = parse_search_args(arg)
-        tolerance_ms = int(flags.get("tolerance", 30)) * 1000
         match_name = bool(flags.get("match-name"))
+        library_filter = flags.get("library", "").lower()
+        tol_raw = flags.get("tolerance")
+        use_duration = tol_raw is not None or not match_name
+        tolerance_ms = int(tol_raw) * 1000 if tol_raw is not None else 30 * 1000
 
         with console.status("Scanning all media..."):
             rows = [r for r in self.client.all_media_rows() if r.get("duration")]
+
+        if library_filter:
+            rows = [r for r in rows if library_filter in r["library"].lower()]
+            if not rows:
+                console.print(f"[yellow]No media found in library '{flags['library']}'.[/yellow]")
+                return
 
         if not rows:
             console.print("[yellow]No media found.[/yellow]")
             return
 
-        rows.sort(key=lambda r: r["duration"])
+        if use_duration:
+            # ── Duration-based sliding-window grouping ─────────────────────
+            rows.sort(key=lambda r: r["duration"])
+            groups: list[list[dict]] = []
+            current: list[dict] = [rows[0]]
+            for row in rows[1:]:
+                if row["duration"] - current[0]["duration"] <= tolerance_ms:
+                    current.append(row)
+                else:
+                    if len(current) > 1:
+                        groups.append(current)
+                    current = [row]
+            if len(current) > 1:
+                groups.append(current)
 
-        # Sliding-window group: collect runs of items within tolerance of the group's first item
-        groups: list[list[dict]] = []
-        current: list[dict] = [rows[0]]
-        for row in rows[1:]:
-            if row["duration"] - current[0]["duration"] <= tolerance_ms:
-                current.append(row)
-            else:
-                if len(current) > 1:
-                    groups.append(current)
-                current = [row]
-        if len(current) > 1:
-            groups.append(current)
+            # Drop groups where every entry is the same ratingKey
+            groups = [g for g in groups if len({r["ratingKey"] for r in g}) > 1]
 
-        # Drop groups where every entry is the same ratingKey (already caught by dupes)
-        groups = [
-            g for g in groups
-            if len({r["ratingKey"] for r in g}) > 1
-        ]
-
-        # --match-name: within each duration group keep only items that share a
-        # similar title (≥82% SequenceMatcher ratio) with at least one other item.
-        if match_name:
-            name_groups: list[list[dict]] = []
-            for group in groups:
-                keep: set[int] = set()
-                for i, r1 in enumerate(group):
-                    for j, r2 in enumerate(group):
-                        if i < j:
-                            sim = SequenceMatcher(
-                                None,
-                                r1["title"].lower(),
-                                r2["title"].lower(),
-                            ).ratio()
-                            if sim >= 0.82:
-                                keep.add(i)
-                                keep.add(j)
-                if keep:
-                    name_groups.append([group[k] for k in sorted(keep)])
-            groups = name_groups
+            # Optional title-similarity filter within each duration group
+            if match_name:
+                name_groups: list[list[dict]] = []
+                for group in groups:
+                    keep: set[int] = set()
+                    for i, r1 in enumerate(group):
+                        for j, r2 in enumerate(group):
+                            if i < j:
+                                sim = SequenceMatcher(
+                                    None,
+                                    r1["title"].lower(),
+                                    r2["title"].lower(),
+                                ).ratio()
+                                if sim >= 0.82:
+                                    keep.add(i)
+                                    keep.add(j)
+                    if keep:
+                        name_groups.append([group[k] for k in sorted(keep)])
+                groups = name_groups
+        else:
+            # ── Pure title-similarity grouping (--match-name, no --tolerance) ─
+            THRESHOLD = 0.82
+            used: set[int] = set()
+            groups = []
+            with console.status("Comparing titles..."):
+                for i, r1 in enumerate(rows):
+                    if i in used:
+                        continue
+                    idxs = [i]
+                    for j in range(i + 1, len(rows)):
+                        if j in used:
+                            continue
+                        sim = SequenceMatcher(
+                            None,
+                            r1["title"].lower(),
+                            rows[j]["title"].lower(),
+                        ).ratio()
+                        if sim >= THRESHOLD:
+                            idxs.append(j)
+                    if len(idxs) > 1:
+                        group = [rows[k] for k in idxs]
+                        if len({r["ratingKey"] for r in group}) > 1:
+                            for k in idxs:
+                                used.add(k)
+                            groups.append(group)
 
         if not groups:
             console.print("[green]No smart duplicates found.[/green]")
             return
 
-        mode = " with similar titles" if match_name else ""
+        if use_duration and match_name:
+            mode = " (duration + title match)"
+        elif use_duration:
+            mode = f" (duration ±{tolerance_ms // 1000}s)"
+        else:
+            mode = " (title match)"
         total = sum(len(g) for g in groups)
         console.print(f"[yellow]{len(groups)} potential duplicate groups{mode} ({total} items)[/yellow]\n")
 
@@ -3257,8 +3295,11 @@ class PlexShell(cmd.Cmd):
     # ── duplicates_smart: --tolerance ────────────────────────────────────────
 
     def complete_duplicates_smart(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
         if text.startswith("-"):
-            return self._c_flags(text, ["--tolerance", "--match-name"])
+            return self._c_flags(text, ["--tolerance", "--match-name", "--library"])
         return []
 
     # ── play: --client values ────────────────────────────────────────────────
