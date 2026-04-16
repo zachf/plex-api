@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# Run with: py -3.14 plex_cli.py
+# Run with:  .venv\Scripts\python plex_cli.py
+# Or first:  .venv\Scripts\activate  then:  python plex_cli.py
 """Interactive Plex Media Server CLI — opus2.local:32400"""
 
 import cmd
 import csv
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -14,13 +16,18 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import requests
-from rich import box
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.prompt import Prompt
+try:
+    import requests
+    from rich import box
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+except ImportError as _e:
+    print(f"Missing dependency: {_e}")
+    print("Run:  py -m pip install -r requirements.txt")
+    sys.exit(1)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -77,10 +84,12 @@ def rating(item: dict) -> str:
     r = item.get("rating") or item.get("audienceRating")
     return f"{r:.1f}" if r else "—"
 
-SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type", "--title", "--tolerance", "--level", "--client", "--html"}
+SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year", "--library", "--type", "--title", "--tolerance", "--level", "--client", "--html", "--match-name"}
+# Flags that stand alone (no following value)
+BOOL_FLAGS = {"--match-name"}
 
 def parse_search_args(arg: str) -> tuple:
-    """Parse search args into (query, filters). Supports --flag value pairs."""
+    """Parse search args into (query, filters). Supports --flag value pairs and standalone --bool-flags."""
     try:
         tokens = shlex.split(arg)
     except ValueError:
@@ -91,7 +100,10 @@ def parse_search_args(arg: str) -> tuple:
     while i < len(tokens):
         t = tokens[i]
         if t in SEARCH_FLAGS:
-            if i + 1 < len(tokens):
+            if t in BOOL_FLAGS:
+                filters[t.lstrip("-")] = True
+                i += 1
+            elif i + 1 < len(tokens):
                 filters[t.lstrip("-")] = tokens[i + 1]
                 i += 2
             else:
@@ -386,8 +398,9 @@ class PlexClient:
     def analyze_library(self, section_id: str) -> bool:
         return self.put(f"/library/sections/{section_id}/analyze")
 
-    def get_text(self, path: str, **params) -> str | None:
-        """Fetch a plain-text endpoint, bypassing the JSON Accept header."""
+    def get_text(self, path: str, silent: bool = False, **params) -> str | None:
+        """Fetch a plain-text endpoint, bypassing the JSON Accept header.
+        Pass silent=True to suppress error messages (useful for try/fallback patterns)."""
         url = f"{BASE_URL}{path}"
         headers = {"Accept": "text/plain, */*"}
         try:
@@ -395,10 +408,12 @@ class PlexClient:
             r.raise_for_status()
             return r.text
         except requests.exceptions.ConnectionError:
-            console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+            if not silent:
+                console.print(f"[red]Cannot reach {BASE_URL}[/red]")
             return None
         except requests.exceptions.HTTPError as e:
-            console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+            if not silent:
+                console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
             return None
 
     def sessions(self) -> list:
@@ -662,7 +677,7 @@ _HELP_SECTIONS = [
     ("Library health", [
         ("dupes",           "",                                  "Items Plex flagged as duplicate files"),
         ("dupetitles",      "",                                  "Items sharing the same title and year"),
-        ("duplicates_smart","[--tolerance seconds]",             "Likely dupes matched by duration (±30s default)"),
+        ("duplicates_smart","[--tolerance seconds] [--match-name]","Likely dupes by duration; --match-name also requires similar titles"),
         ("missing",         "",                                  "Items with incomplete metadata"),
         ("quality",         "",                                  "Resolution breakdown per library"),
         ("orphans",         "",                                  "Items with no associated media files"),
@@ -756,9 +771,19 @@ class PlexShell(cmd.Cmd):
     prompt = "[plex]> "
     ruler = ""
 
+    _AUDIO_FORMATS = ("aac", "ac3", "eac3", "dts", "truehd", "flac", "mp3", "opus", "atmos", "vorbis", "pcm")
+    _VIDEO_CODECS  = ("h264", "hevc", "h265", "av1", "mpeg4", "vc1", "vp9", "xvid", "divx")
+    _ALL_CODECS    = _AUDIO_FORMATS + _VIDEO_CODECS
+
     def __init__(self, client: PlexClient):
         super().__init__()
         self.client = client
+        try:
+            import readline
+            # Keep "-" in word chars so "--flag" is completed as one token
+            readline.set_completer_delims(readline.get_completer_delims().replace("-", ""))
+        except ImportError:
+            pass
 
     def emptyline(self):
         pass
@@ -1101,9 +1126,10 @@ class PlexShell(cmd.Cmd):
         console.print(t)
 
     def do_duplicates_smart(self, arg: str):
-        """duplicates_smart [--tolerance seconds]  — find likely dupes by matching duration (default ±30s)"""
+        """duplicates_smart [--tolerance seconds] [--match-name]  — find likely dupes by duration (±30s default); --match-name also requires similar titles"""
         _, flags = parse_search_args(arg)
         tolerance_ms = int(flags.get("tolerance", 30)) * 1000
+        match_name = bool(flags.get("match-name"))
 
         with console.status("Scanning all media..."):
             rows = [r for r in self.client.all_media_rows() if r.get("duration")]
@@ -1133,12 +1159,34 @@ class PlexShell(cmd.Cmd):
             if len({r["ratingKey"] for r in g}) > 1
         ]
 
+        # --match-name: within each duration group keep only items that share a
+        # similar title (≥82% SequenceMatcher ratio) with at least one other item.
+        if match_name:
+            name_groups: list[list[dict]] = []
+            for group in groups:
+                keep: set[int] = set()
+                for i, r1 in enumerate(group):
+                    for j, r2 in enumerate(group):
+                        if i < j:
+                            sim = SequenceMatcher(
+                                None,
+                                r1["title"].lower(),
+                                r2["title"].lower(),
+                            ).ratio()
+                            if sim >= 0.82:
+                                keep.add(i)
+                                keep.add(j)
+                if keep:
+                    name_groups.append([group[k] for k in sorted(keep)])
+            groups = name_groups
+
         if not groups:
             console.print("[green]No smart duplicates found.[/green]")
             return
 
+        mode = " with similar titles" if match_name else ""
         total = sum(len(g) for g in groups)
-        console.print(f"[yellow]{len(groups)} potential duplicate groups ({total} items)[/yellow]\n")
+        console.print(f"[yellow]{len(groups)} potential duplicate groups{mode} ({total} items)[/yellow]\n")
 
         for group in groups:
             t = Table(box=box.ROUNDED, show_lines=True)
@@ -1897,11 +1945,24 @@ class PlexShell(cmd.Cmd):
         _, flags = parse_search_args(arg)
         lines = next((int(t) for t in arg.split() if t.isdigit()), 50)
         level_map = {"debug": 0, "info": 2, "warn": 3, "warning": 3, "error": 4}
-        level_name = flags.get("level", "info").lower()
+
+        # Accept both  --level info  and shorthand  --info / --debug / etc.
+        level_name = flags.get("level", "").lower()
+        if not level_name:
+            for shorthand in level_map:
+                if f"--{shorthand}" in arg.lower().split():
+                    level_name = shorthand
+                    break
+        if not level_name:
+            level_name = "info"
         min_level = level_map.get(level_name, 2)
 
         with console.status("Fetching server logs..."):
-            text = self.client.get_text("/log", minLevel=min_level, source="Plex Media Server")
+            # Some PMS versions reject minLevel — try with it, fall back without
+            text = self.client.get_text("/log", silent=True, minLevel=min_level)
+            server_filtered = text is not None
+            if text is None:
+                text = self.client.get_text("/log")
 
         if text is None:
             return
@@ -1911,6 +1972,8 @@ class PlexShell(cmd.Cmd):
             try:
                 data = json.loads(text)
                 entries = data.get("MediaContainer", {}).get("Log", [])
+                if not server_filtered and min_level > 0:
+                    entries = [e for e in entries if (e.get("level") or 0) >= min_level]
                 log_lines = [
                     f"{format_ts(e.get('time'))}  [{e.get('level','?'):5}]  {e.get('msg','')}"
                     for e in entries
@@ -1918,7 +1981,12 @@ class PlexShell(cmd.Cmd):
             except json.JSONDecodeError:
                 log_lines = []
         else:
-            log_lines = [l for l in text.splitlines() if l.strip()][-lines:]
+            all_lines = [l for l in text.splitlines() if l.strip()]
+            if not server_filtered and min_level > 0:
+                # Client-side filter: keep lines that contain a level keyword at or above threshold
+                above = {k.upper() for k, v in level_map.items() if v >= min_level}
+                all_lines = [l for l in all_lines if any(kw in l.upper() for kw in above)]
+            log_lines = all_lines[-lines:]
 
         if not log_lines:
             console.print("[yellow]No log entries returned.[/yellow]")
@@ -3046,6 +3114,187 @@ class PlexShell(cmd.Cmd):
         with console.status("Fetching collection..."):
             items = self.client.children(arg.strip())
         print_media_table(items, f"Collection {arg.strip()}")
+
+    # ── Tab completion ────────────────────────────────────────────────────────
+
+    # Cache helpers — fetched once per session, re-used for all completions
+
+    def _cached_libs(self) -> list[dict]:
+        if not hasattr(self, "_c_lib_data"):
+            try:
+                self._c_lib_data = self.client.libraries()
+            except Exception:
+                self._c_lib_data = []
+        return self._c_lib_data
+
+    def _cached_playlists(self) -> list[dict]:
+        if not hasattr(self, "_c_playlist_data"):
+            try:
+                self._c_playlist_data = self.client.get_playlists()
+            except Exception:
+                self._c_playlist_data = []
+        return self._c_playlist_data
+
+    def _cached_clients(self) -> list[dict]:
+        if not hasattr(self, "_c_client_data"):
+            try:
+                self._c_client_data = self.client.clients()
+            except Exception:
+                self._c_client_data = []
+        return self._c_client_data
+
+    # Low-level helpers
+
+    def _c_libs(self, text: str) -> list[str]:
+        """Library IDs and titles matching text."""
+        out = []
+        for lib in self._cached_libs():
+            for val in (lib.get("key", ""), lib.get("title", "")):
+                if val and val.lower().startswith(text.lower()):
+                    out.append(val)
+        return out
+
+    def _c_flags(self, text: str, flags: list[str]) -> list[str]:
+        return [f for f in flags if f.startswith(text)]
+
+    def _prev(self, line: str, begidx: int) -> str:
+        """Token immediately before the cursor position."""
+        tokens = line[:begidx].split()
+        return tokens[-1] if tokens else ""
+
+    # ── Commands whose only argument is [library_id] ─────────────────────────
+
+    def _c_lib_arg(self, text, line, begidx, endidx):
+        return self._c_libs(text)
+
+    complete_browse       = _c_lib_arg
+    complete_unwatched    = _c_lib_arg
+    complete_toprated     = _c_lib_arg
+    complete_bitrate      = _c_lib_arg
+    complete_subtitles    = _c_lib_arg
+    complete_hdr          = _c_lib_arg
+    complete_multiversion = _c_lib_arg
+    complete_genres       = _c_lib_arg
+    complete_studios      = _c_lib_arg
+    complete_collections  = _c_lib_arg
+    complete_popularity   = _c_lib_arg
+    complete_fixtitles    = _c_lib_arg
+    complete_stale        = _c_lib_arg
+
+    def complete_export(self, text, line, begidx, endidx):
+        # First arg is library_id; second is a filename — nothing to complete there
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return self._c_libs(text)
+        return []
+
+    # ── Commands that take library_id as their *second* argument ─────────────
+
+    def _c_lib_second(self, text, line, begidx, endidx):
+        tokens = line[:begidx].split()
+        if len(tokens) >= 2:
+            return self._c_libs(text)
+        return []
+
+    complete_bygenre    = _c_lib_second
+    complete_byactor    = _c_lib_second
+    complete_bydirector = _c_lib_second
+    complete_byyear     = _c_lib_second
+
+    # ── Commands with --library flag ─────────────────────────────────────────
+
+    def _c_lib_flag(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
+        if text.startswith("-"):
+            return self._c_flags(text, ["--library"])
+        return []
+
+    complete_largest  = _c_lib_flag
+    complete_smallest = _c_lib_flag
+    complete_long     = _c_lib_flag
+    complete_short    = _c_lib_flag
+
+    def complete_analyze(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
+        if text.startswith("-"):
+            return self._c_flags(text, ["--library"])
+        return []
+
+    # ── search: flags and their value completions ────────────────────────────
+
+    _SEARCH_FLAGS_LIST = [
+        "--actor", "--director", "--genre", "--studio",
+        "--year", "--library", "--type", "--title",
+    ]
+
+    def complete_search(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--type":
+            return [v for v in ("movie", "show", "episode", "artist", "album", "track")
+                    if v.startswith(text)]
+        if prev == "--library":
+            return self._c_libs(text)
+        if prev in self._SEARCH_FLAGS_LIST:
+            return []   # free-form value — nothing to suggest
+        if text.startswith("-"):
+            return self._c_flags(text, self._SEARCH_FLAGS_LIST)
+        return []
+
+    # ── logs: --level values ─────────────────────────────────────────────────
+
+    def complete_logs(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--level":
+            return [v for v in ("debug", "info", "warn", "error") if v.startswith(text)]
+        if text.startswith("-"):
+            return self._c_flags(text, ["--level"])
+        return []
+
+    # ── duplicates_smart: --tolerance ────────────────────────────────────────
+
+    def complete_duplicates_smart(self, text, line, begidx, endidx):
+        if text.startswith("-"):
+            return self._c_flags(text, ["--tolerance", "--match-name"])
+        return []
+
+    # ── play: --client values ────────────────────────────────────────────────
+
+    def complete_play(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--client":
+            return [c.get("name", "") for c in self._cached_clients()
+                    if c.get("name", "").lower().startswith(text.lower())]
+        if text.startswith("-"):
+            return self._c_flags(text, ["--client"])
+        return []
+
+    # ── codec / audio-format commands ────────────────────────────────────────
+
+    def complete_bycodec(self, text, line, begidx, endidx):
+        return [c for c in self._ALL_CODECS if c.startswith(text.lower())]
+
+    def complete_audioformat(self, text, line, begidx, endidx):
+        return [c for c in self._AUDIO_FORMATS if c.startswith(text.lower())]
+
+    # ── playlist commands ────────────────────────────────────────────────────
+
+    def complete_playlist(self, text, line, begidx, endidx):
+        return [p.get("ratingKey", "") for p in self._cached_playlists()
+                if p.get("ratingKey", "").startswith(text)]
+
+    def complete_playlist_add(self, text, line, begidx, endidx):
+        # First arg is the playlist ID
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return [p.get("ratingKey", "") for p in self._cached_playlists()
+                    if p.get("ratingKey", "").startswith(text)]
+        return []
+
+    complete_playlist_remove = complete_playlist_add
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
