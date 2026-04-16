@@ -270,6 +270,22 @@ class PlexClient:
             **{"userRating.value": rating, "userRating.locked": 1},
         )
 
+    def post(self, path: str, **params) -> dict:
+        url = f"{BASE_URL}{path}"
+        try:
+            r = self.session.post(url, params=params, timeout=15)
+            r.raise_for_status()
+            try:
+                return r.json()
+            except requests.exceptions.JSONDecodeError:
+                return {}
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+            return {}
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+            return {}
+
     def delete(self, path: str, **params) -> bool:
         url = f"{BASE_URL}{path}"
         try:
@@ -441,6 +457,49 @@ class PlexClient:
                 "info": lib,
                 "items": self.library_contents(lid),
             }
+        return result
+
+    # ── Playlists ──────────────────────────────────────────────────────────────
+
+    def get_playlists(self) -> list:
+        data = self.get("/playlists/all")
+        return data.get("MediaContainer", {}).get("Metadata", [])
+
+    def playlist_items(self, playlist_id: str) -> list:
+        data = self.get(f"/playlists/{playlist_id}/items")
+        return data.get("MediaContainer", {}).get("Metadata", [])
+
+    def _server_uri(self, rating_key: str) -> str:
+        info = self.server_info()
+        machine_id = info.get("machineIdentifier", "")
+        return f"server://{machine_id}/com.plexapp.plugins.library/library/metadata/{rating_key}"
+
+    def create_playlist(self, name: str, rating_key: str = "") -> dict:
+        params: dict = {"title": name, "type": "video", "smart": 0}
+        if rating_key:
+            params["uri"] = self._server_uri(rating_key)
+        data = self.post("/playlists", **params)
+        items = data.get("MediaContainer", {}).get("Metadata", [])
+        return items[0] if items else {}
+
+    def playlist_add_item(self, playlist_id: str, rating_key: str) -> bool:
+        uri = self._server_uri(rating_key)
+        return self.put(f"/playlists/{playlist_id}/items", uri=uri)
+
+    def playlist_remove_item(self, playlist_id: str, playlist_item_id: str) -> bool:
+        return self.delete(f"/playlists/{playlist_id}/items/{playlist_item_id}")
+
+    # ── Collections ────────────────────────────────────────────────────────────
+
+    def get_collections(self, section_id: str | None = None) -> list:
+        if section_id:
+            data = self.get(f"/library/sections/{section_id}/collections")
+            return data.get("MediaContainer", {}).get("Metadata", [])
+        result = []
+        for lib in self.libraries():
+            lid = lib.get("key", "")
+            data = self.get(f"/library/sections/{lid}/collections")
+            result.extend(data.get("MediaContainer", {}).get("Metadata", []))
         return result
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -659,6 +718,15 @@ _HELP_SECTIONS = [
     ("Users & sharing", [
         ("users",           "",                                  "List all server accounts"),
         ("userstats",       "[username]",                        "Watch stats per user, or detail for one user"),
+    ]),
+    ("Playlists & Collections", [
+        ("playlists",       "",                                  "List all playlists"),
+        ("playlist",        "<id>",                              "Show playlist contents"),
+        ("playlist_create", "<name> [key]",                      "Create a new playlist"),
+        ("playlist_add",    "<playlist_id> <key>",               "Add an item to a playlist"),
+        ("playlist_remove", "<playlist_id> <item_id>",           "Remove an item from a playlist"),
+        ("collections",     "[library_id]",                      "List collections (all or by library)"),
+        ("collection",      "<key>",                             "Show items in a collection"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -2675,6 +2743,155 @@ class PlexShell(cmd.Cmd):
                 title_str = f"{h['grandparentTitle']} — {h.get('parentTitle','')} — {title_str}"
             t3.add_row(format_ts(h.get("viewedAt")), h.get("type", ""), title_str)
         console.print(t3)
+
+    # ── Playlists & Collections ───────────────────────────────────────────────
+
+    def do_playlists(self, _):
+        """playlists — list all playlists"""
+        with console.status("Fetching playlists..."):
+            playlists = self.client.get_playlists()
+        if not playlists:
+            console.print("[yellow]No playlists found.[/yellow]")
+            return
+        t = Table(title=f"Playlists ({len(playlists)})", box=box.ROUNDED)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold cyan", min_width=28)
+        t.add_column("Type", style="yellow", width=10)
+        t.add_column("Items", justify="right", width=7)
+        t.add_column("Duration", justify="right", width=10)
+        for pl in playlists:
+            t.add_row(
+                pl.get("ratingKey", ""),
+                pl.get("title", ""),
+                pl.get("playlistType", pl.get("type", "")),
+                str(pl.get("leafCount", "?")),
+                format_duration(pl.get("duration")),
+            )
+        console.print(t)
+
+    def do_playlist(self, arg: str):
+        """playlist <id> — show playlist contents"""
+        if not arg.strip():
+            console.print("[yellow]Usage: playlist <id>[/yellow]")
+            return
+        with console.status("Fetching playlist..."):
+            items = self.client.playlist_items(arg.strip())
+        if not items:
+            console.print("[yellow]Playlist is empty or not found.[/yellow]")
+            return
+        noun = "item" if len(items) == 1 else "items"
+        t = Table(
+            title=f"Playlist {arg.strip()}",
+            caption=f"{len(items)} {noun}",
+            caption_justify="right",
+            box=box.ROUNDED,
+        )
+        t.add_column("Item ID", style="dim", width=9)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Type", style="yellow", width=10)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Duration", width=9, justify="right")
+        for item in items:
+            grandparent = item.get("grandparentTitle", "")
+            parent = item.get("parentTitle", "")
+            title_str = item.get("title", "")
+            if grandparent and parent:
+                full_title = f"[dim]{grandparent} — {parent} —[/dim] {title_str}"
+            elif parent:
+                full_title = f"[dim]{parent} —[/dim] {title_str}"
+            else:
+                full_title = title_str
+            t.add_row(
+                str(item.get("playlistItemID", "—")),
+                item.get("ratingKey", ""),
+                full_title,
+                item.get("type", ""),
+                year(item),
+                format_duration(item.get("duration")),
+            )
+        console.print(t)
+        console.print("[dim]Use the Item ID with [bold]playlist_remove[/bold] to remove an item.[/dim]")
+
+    def do_playlist_create(self, arg: str):
+        """playlist_create <name> [key] — create a new playlist (optionally with an initial item)"""
+        tokens = arg.strip().split()
+        if not tokens:
+            console.print("[yellow]Usage: playlist_create <name> [key][/yellow]")
+            return
+        # If last token is all digits, treat it as a media key
+        if len(tokens) > 1 and tokens[-1].isdigit():
+            rating_key = tokens[-1]
+            name = " ".join(tokens[:-1])
+        else:
+            rating_key = ""
+            name = " ".join(tokens)
+        with console.status(f"Creating playlist [cyan]{name}[/cyan]..."):
+            result = self.client.create_playlist(name, rating_key)
+        if result:
+            new_id = result.get("ratingKey", "")
+            console.print(f"[green]Playlist '{name}' created[/green] (key: {new_id})")
+        else:
+            console.print("[red]Failed to create playlist.[/red]")
+
+    def do_playlist_add(self, arg: str):
+        """playlist_add <playlist_id> <key> — add an item to a playlist"""
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            console.print("[yellow]Usage: playlist_add <playlist_id> <key>[/yellow]")
+            return
+        playlist_id, key = parts[0], parts[1]
+        with console.status(f"Adding item [cyan]{key}[/cyan] to playlist {playlist_id}..."):
+            ok = self.client.playlist_add_item(playlist_id, key)
+        if ok:
+            console.print(f"[green]Item {key} added to playlist {playlist_id}.[/green]")
+
+    def do_playlist_remove(self, arg: str):
+        """playlist_remove <playlist_id> <item_id> — remove an item from a playlist"""
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            console.print("[yellow]Usage: playlist_remove <playlist_id> <item_id>[/yellow]")
+            console.print("[dim]Use [bold]playlist <id>[/bold] to see item IDs in the 'Item ID' column.[/dim]")
+            return
+        playlist_id, item_id = parts[0], parts[1]
+        with console.status(f"Removing item {item_id} from playlist {playlist_id}..."):
+            ok = self.client.playlist_remove_item(playlist_id, item_id)
+        if ok:
+            console.print(f"[green]Item {item_id} removed from playlist {playlist_id}.[/green]")
+
+    def do_collections(self, arg: str):
+        """collections [library_id] — list collections in all libraries or a specific one"""
+        section_id = arg.strip() or None
+        with console.status("Fetching collections..."):
+            collections = self.client.get_collections(section_id)
+        if not collections:
+            msg = "No collections found"
+            if section_id:
+                msg += f" in library {section_id}"
+            console.print(f"[yellow]{msg}.[/yellow]")
+            return
+        t = Table(title=f"Collections ({len(collections)})", box=box.ROUNDED)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold cyan", min_width=28)
+        t.add_column("Items", justify="right", width=7)
+        t.add_column("Added", style="dim", width=17)
+        for c in sorted(collections, key=lambda x: x.get("title", "").lower()):
+            t.add_row(
+                c.get("ratingKey", ""),
+                c.get("title", ""),
+                str(c.get("childCount", "?")),
+                format_ts(c.get("addedAt")),
+            )
+        console.print(t)
+
+    def do_collection(self, arg: str):
+        """collection <key> — show items in a collection"""
+        if not arg.strip():
+            console.print("[yellow]Usage: collection <key>[/yellow]")
+            return
+        with console.status("Fetching collection..."):
+            items = self.client.children(arg.strip())
+        print_media_table(items, f"Collection {arg.strip()}")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
