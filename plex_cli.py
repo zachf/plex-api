@@ -390,12 +390,23 @@ class PlexClient:
             params["accountID"] = account_id
         return self._mc("/status/sessions/history/all", **params)
 
+    # Map library type → Plex item type number for leaf items with Media/Part
+    _LEAF_TYPE = {"show": 4, "artist": 10}   # episodes, tracks
+
+    def _leaf_items(self, lib: dict) -> list:
+        """Return the items that actually have Media/Part for a library.
+        TV and music libraries need leaf items (episodes/tracks); others use top-level."""
+        lid = lib.get("key", "")
+        leaf = self._LEAF_TYPE.get(lib.get("type", ""))
+        if leaf:
+            return self._mc(f"/library/sections/{lid}/all", type=leaf)
+        return self.library_contents(lid)
+
     def all_media_rows(self) -> list:
         rows = []
         for lib in self.libraries():
-            lid = lib.get("key", "")
-            for item in self.library_contents(lid):
-                rows.extend(get_media_rows(item, lib.get("title", lid)))
+            for item in self._leaf_items(lib):
+                rows.extend(get_media_rows(item, lib.get("title", lib.get("key", ""))))
         return rows
 
     def all_items_by_library(self) -> dict:
@@ -1105,7 +1116,14 @@ class PlexShell(cmd.Cmd):
     def do_stats(self, _):
         with console.status("Gathering stats..."):
             data = self.client.all_items_by_library()
+            media_rows = self.client.all_media_rows()
             hist = self.client.history(count=500)
+        # Aggregate size/duration from leaf-level media rows (correct for TV/music)
+        lib_size: dict = defaultdict(int)
+        lib_dur: dict = defaultdict(int)
+        for row in media_rows:
+            lib_size[row["library"]] += row.get("size") or 0
+            lib_dur[row["library"]] += row.get("duration") or 0
         t = Table(title="Library Summary", box=box.ROUNDED)
         t.add_column("Library", style="cyan"); t.add_column("Type", style="yellow", width=8)
         t.add_column("Items", justify="right", width=7); t.add_column("Total Duration", justify="right", width=14)
@@ -1113,8 +1131,8 @@ class PlexShell(cmd.Cmd):
         gi, gms, gb = 0, 0, 0
         for lib_title, d in data.items():
             items = d["items"]
-            ms = sum(i.get("duration",0) or 0 for i in items)
-            byt = sum(p.get("size",0) or 0 for i in items for m in i.get("Media",[]) for p in m.get("Part",[]))
+            ms = lib_dur[lib_title]
+            byt = lib_size[lib_title]
             gi += len(items); gms += ms; gb += byt
             t.add_row(lib_title, d["info"].get("type",""), str(len(items)), format_duration(ms), format_size(byt))
         t.add_section()
@@ -1740,6 +1758,12 @@ class PlexShell(cmd.Cmd):
             f"[bold cyan]Platform:[/bold cyan] {info.get('platform','')} {info.get('platformVersion','')}\n"
             f"[bold cyan]Generated:[/bold cyan] {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             title="[bold white]Plex Report[/bold white]", border_style="cyan"))
+        # Aggregate size/duration from leaf-level media rows (correct for TV/music)
+        lib_size: dict = defaultdict(int)
+        lib_dur: dict = defaultdict(int)
+        for row in media_rows:
+            lib_size[row["library"]] += row.get("size") or 0
+            lib_dur[row["library"]] += row.get("duration") or 0
         lt = Table(title="Library Summary", box=box.ROUNDED)
         lt.add_column("Library", style="cyan"); lt.add_column("Type", style="yellow", width=8)
         lt.add_column("Items", justify="right", width=7); lt.add_column("Duration", justify="right", width=14)
@@ -1747,8 +1771,8 @@ class PlexShell(cmd.Cmd):
         g = {"i":0,"ms":0,"b":0,"uw":0}
         for lib_title, d in libs_data.items():
             items = d["items"]
-            ms = sum(i.get("duration",0) or 0 for i in items)
-            byt = sum(p.get("size",0) or 0 for i in items for m in i.get("Media",[]) for p in m.get("Part",[]))
+            ms = lib_dur[lib_title]
+            byt = lib_size[lib_title]
             uw = sum(1 for i in items if not i.get("viewCount"))
             g["i"]+=len(items); g["ms"]+=ms; g["b"]+=byt; g["uw"]+=uw
             lt.add_row(lib_title, d["info"].get("type",""), str(len(items)), format_duration(ms), format_size(byt), str(uw))
