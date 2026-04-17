@@ -115,8 +115,8 @@ def resolution_label(res: str | None) -> str:
 
 SEARCH_FLAGS = {"--actor", "--director", "--genre", "--studio", "--year",
                 "--library", "--type", "--title", "--tolerance", "--level",
-                "--client", "--html", "--match-name"}
-BOOL_FLAGS = {"--match-name"}
+                "--client", "--html", "--match-name", "--force"}
+BOOL_FLAGS = {"--match-name", "--force"}
 
 def parse_search_args(arg: str) -> tuple:
     """Parse search args into (query, flags). Supports --flag value pairs and standalone --bool-flags."""
@@ -369,6 +369,11 @@ class PlexClient:
     def analyze_library(self, sid: str) -> bool:
         return self.put(f"/library/sections/{sid}/analyze")
 
+    def refresh_library(self, sid: str, force: bool = False) -> bool:
+        """Refresh library metadata. force=True re-downloads from agents for every item."""
+        params = {"force": 1} if force else {}
+        return self._request("GET", f"/library/sections/{sid}/refresh", **params) is not None
+
     def sessions(self) -> list:            return self._mc("/status/sessions")
     def recent(self, count: int = 20) -> list:
         return self._mc("/library/recentlyAdded", **{"X-Plex-Container-Size": count})
@@ -615,6 +620,7 @@ _HELP_SECTIONS = [
         ("stop",            "[session]",                         "Stop a session"),
     ]),
     ("Analysis & reports", [
+        ("refresh",         "<library_id> [--force]",             "Refresh library metadata (--force re-downloads from agents)"),
         ("analyze",         "<key> | --library <id>",            "Trigger deep media analysis"),
         ("report",          "[--html filename.html]",            "Comprehensive library report"),
         ("changelog",       "[days]",                            "Everything added/updated in last N days"),
@@ -1738,6 +1744,25 @@ class PlexShell(cmd.Cmd):
             if ok:
                 console.print(f"[green]Analysis queued[/green] for item {key}")
 
+    def do_refresh(self, arg: str):
+        """refresh <library_id> [--force] — refresh library metadata; --force re-downloads from agents"""
+        parts = arg.strip().split()
+        if not parts:
+            libs = self.client.libraries()
+            if libs:
+                print_libraries(libs)
+            console.print("[yellow]Usage: refresh <library_id> [--force][/yellow]")
+            return
+        _, flags = parse_search_args(arg)
+        lib_id = parts[0]
+        force = bool(flags.get("force"))
+        mode = "full metadata refresh (force)" if force else "scan for new/changed files"
+        with console.status(f"Refreshing library [cyan]{lib_id}[/cyan] — {mode}..."):
+            ok = self.client.refresh_library(lib_id, force=force)
+        if ok:
+            console.print(f"[green]Refresh queued[/green] for library {lib_id}"
+                          + (" [dim](force)[/dim]" if force else "") + " — runs in background")
+
     def do_report(self, arg: str):
         html_file = None
         if "--html" in arg:
@@ -2293,6 +2318,14 @@ class PlexShell(cmd.Cmd):
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = _c_lib_flag
+
+    def complete_refresh(self, text, line, begidx, *_):
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return self._c_libs(text)
+        if text.startswith("-"):
+            return self._c_flags(text, ["--force"])
+        return []
 
     def complete_export(self, text, line, begidx, endidx):
         return self._c_libs(text) if len(line[:begidx].split()) == 1 else []
