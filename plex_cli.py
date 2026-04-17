@@ -585,8 +585,8 @@ _HELP_SECTIONS = [
         ("smallest",        "[count] [--library name]",           "Titles with the smallest file sizes"),
         ("tvlargest",       "[count] [--library name]",           "TV shows with the most total disk usage"),
         ("tvsmallest",      "[count] [--library name]",           "TV shows with the least total disk usage"),
-        ("long",            "[count] [--library name]",           "Titles with the longest runtime"),
-        ("short",           "[count] [--library name]",           "Titles with the shortest runtime"),
+        ("longest",         "[count] [--library name]",           "Titles with the longest runtime"),
+        ("shortest",        "[count] [--library name]",           "Titles with the shortest runtime"),
         ("storage",         "",                                  "Disk usage breakdown by library"),
         ("bycodec",         "<codec>",                           "Titles using a given video or audio codec"),
         ("codecs",          "",                                  "Video / audio codec distribution"),
@@ -1328,9 +1328,9 @@ class PlexShell(cmd.Cmd):
             t.add_row(str(i), format_duration(dur), item.get("title",""), lt, year(item), item.get("type",""))
         console.print(t)
 
-    def do_long(self, arg: str):
+    def do_longest(self, arg: str):
         count, lib = self._parse_size_args(arg); self._duration_table(count, True, lib)
-    def do_short(self, arg: str):
+    def do_shortest(self, arg: str):
         count, lib = self._parse_size_args(arg); self._duration_table(count, False, lib)
 
     def do_storage(self, _):
@@ -2291,7 +2291,7 @@ class PlexShell(cmd.Cmd):
     complete_studios = complete_collections = complete_popularity = _c_lib_arg
     complete_fixtitles = complete_stale = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
-    complete_largest = complete_smallest = complete_long = complete_short = _c_lib_flag
+    complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = _c_lib_flag
 
     def complete_export(self, text, line, begidx, endidx):
