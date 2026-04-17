@@ -640,6 +640,11 @@ _HELP_SECTIONS = [
         ("multiversion",    "[library_id]",                      "Items with more than one media version"),
         ("genres",          "[library_id]",                      "Genre distribution across libraries"),
         ("studios",         "[library_id]",                      "Studio distribution across libraries"),
+        ("missing_episodes",  "[library_id]",                    "TV seasons with gaps in episode numbering"),
+        ("incomplete_seasons","[library_id]",                    "Seasons with fewer episodes than the show's typical season"),
+        ("abandoned",         "[threshold%] [--library id]",     "Shows started but not finished (default <80% watched)"),
+        ("duration_outliers", "[library_id]",                    "TV episodes with runtime far from the show's median"),
+        ("4k_audit",          "[library_id]",                    "4K content breakdown by HDR type, audio, and codec"),
     ]),
     ("Item extras", [
         ("extras",          "<key>",                             "Trailers, featurettes, and interviews"),
@@ -2035,6 +2040,274 @@ class PlexShell(cmd.Cmd):
                       ", ".join(resolution_label(m.get("videoResolution")) for m in ml))
         console.print(t)
 
+    # ── TV episode analysis ───────────────────────────────────────────────────
+
+    def _tv_episode_index(self, section_id: str | None) -> dict:
+        """Return {show: {season_num: [episode_indices]}} for all TV libraries (or one)."""
+        tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
+        if section_id:
+            tv_libs = [l for l in tv_libs if l.get("key") == section_id]
+        by_show: dict = {}
+        for lib in tv_libs:
+            for ep in self.client.library_episodes(lib.get("key", "")):
+                show = ep.get("grandparentTitle", "?")
+                season = ep.get("parentIndex") or 0
+                idx = ep.get("index") or 0
+                if season == 0:
+                    continue  # skip specials (season 0)
+                by_show.setdefault(show, {}).setdefault(season, []).append(idx)
+        return by_show
+
+    def do_missing_episodes(self, arg: str):
+        """missing_episodes [library_id] — TV seasons with gaps in episode numbering"""
+        section_id = arg.strip() or None
+        with console.status("Scanning episode numbers..."):
+            by_show = self._tv_episode_index(section_id)
+        if not by_show:
+            console.print("[yellow]No TV libraries found.[/yellow]"); return
+
+        gaps = []
+        for show, seasons in sorted(by_show.items()):
+            for season_num, indices in sorted(seasons.items()):
+                s = set(indices)
+                mn, mx = min(s), max(s)
+                missing = [i for i in range(mn, mx + 1) if i not in s]
+                if missing:
+                    gaps.append((show, season_num, len(indices), missing))
+
+        if not gaps:
+            console.print("[green]No missing episodes detected.[/green]"); return
+
+        t = Table(title=f"Missing Episodes ({len(gaps)} seasons affected)", box=box.ROUNDED)
+        t.add_column("Show", style="bold white", min_width=28)
+        t.add_column("Season", width=8, justify="center")
+        t.add_column("Have", width=6, justify="right")
+        t.add_column("Missing", style="yellow")
+        for show, season, have, missing in gaps:
+            t.add_row(show, f"S{season:02d}", str(have),
+                      ", ".join(f"E{m:02d}" for m in missing))
+        console.print(t)
+
+    def do_incomplete_seasons(self, arg: str):
+        """incomplete_seasons [library_id] — seasons with noticeably fewer episodes than the show's typical season"""
+        section_id = arg.strip() or None
+        with console.status("Scanning season lengths..."):
+            by_show = self._tv_episode_index(section_id)
+        if not by_show:
+            console.print("[yellow]No TV libraries found.[/yellow]"); return
+
+        incomplete = []
+        for show, seasons in sorted(by_show.items()):
+            if len(seasons) < 2:
+                continue  # can't compare without at least 2 seasons
+            counts = sorted(len(eps) for eps in seasons.values())
+            # Median season length for this show
+            n = len(counts)
+            median = counts[n // 2] if n % 2 else (counts[n // 2 - 1] + counts[n // 2]) / 2
+            if median < 4:
+                continue  # mini-series — skip
+            for season_num, indices in sorted(seasons.items()):
+                count = len(indices)
+                if count < median * 0.6 and count < median - 2:
+                    incomplete.append((show, season_num, count, int(median)))
+
+        if not incomplete:
+            console.print("[green]No incomplete seasons detected.[/green]"); return
+
+        incomplete.sort(key=lambda x: (x[0], x[1]))
+        t = Table(title=f"Incomplete Seasons ({len(incomplete)})", box=box.ROUNDED)
+        t.add_column("Show", style="bold white", min_width=28)
+        t.add_column("Season", width=8, justify="center")
+        t.add_column("Have", width=6, justify="right")
+        t.add_column("Typical", width=8, justify="right", style="dim")
+        t.add_column("Missing est.", width=12, justify="right", style="yellow")
+        for show, season, have, typical in incomplete:
+            t.add_row(show, f"S{season:02d}", str(have), str(typical), str(typical - have))
+        console.print(t)
+
+    def do_abandoned(self, arg: str):
+        """abandoned [threshold%] [--library id] — shows started but not finished (default < 80% watched)"""
+        _, flags = parse_search_args(arg)
+        section_id = flags.get("library")
+        threshold = next((int(t) / 100 for t in arg.split() if t.isdigit()), 0.80)
+
+        with console.status("Fetching TV libraries..."):
+            tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
+        if section_id:
+            tv_libs = [l for l in tv_libs if l.get("key") == section_id]
+        if not tv_libs:
+            console.print("[yellow]No TV libraries found.[/yellow]"); return
+
+        abandoned = []
+        with console.status("Scanning shows..."):
+            for lib in tv_libs:
+                for show in self.client.library_contents(lib.get("key", "")):
+                    total = show.get("leafCount") or 0
+                    watched = show.get("viewedLeafCount") or 0
+                    if total > 0 and 0 < watched < total * threshold:
+                        abandoned.append((lib.get("title", ""), show, watched, total, watched / total * 100))
+
+        if not abandoned:
+            console.print(f"[green]No abandoned shows (threshold {threshold*100:.0f}%).[/green]"); return
+
+        abandoned.sort(key=lambda x: x[4])
+        t = Table(title=f"Abandoned Shows ({len(abandoned)})",
+                  caption=f"Started but < {threshold*100:.0f}% watched",
+                  caption_justify="right", box=box.ROUNDED)
+        t.add_column("Library", style="cyan", width=14)
+        t.add_column("Show", style="bold white", min_width=28)
+        t.add_column("Watched", width=9, justify="right")
+        t.add_column("Total", width=7, justify="right")
+        t.add_column("Progress", min_width=24)
+        for lib_title, show, watched, total, pct in abandoned:
+            fill = int(pct / 5)
+            bar = f"[green]{'█' * fill}[/green][dim]{'░' * (20 - fill)}[/dim] {pct:.0f}%"
+            t.add_row(lib_title, show.get("title", ""), str(watched), str(total), bar)
+        console.print(t)
+
+    def do_duration_outliers(self, arg: str):
+        """duration_outliers [library_id] — TV episodes with runtime significantly different from the show's median"""
+        section_id = arg.strip() or None
+        with console.status("Fetching TV libraries..."):
+            tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
+        if section_id:
+            tv_libs = [l for l in tv_libs if l.get("key") == section_id]
+        if not tv_libs:
+            console.print("[yellow]No TV libraries found.[/yellow]"); return
+
+        by_show: dict = {}
+        with console.status("Scanning episode durations..."):
+            for lib in tv_libs:
+                for ep in self.client.library_episodes(lib.get("key", "")):
+                    if not ep.get("duration"):
+                        continue
+                    by_show.setdefault(ep.get("grandparentTitle", "?"), []).append(ep)
+
+        THRESHOLD = 0.5   # flag if runtime deviates > 50% from the show median
+        outliers = []
+        for show, episodes in by_show.items():
+            durs = sorted(ep["duration"] for ep in episodes)
+            if len(durs) < 3:
+                continue
+            n = len(durs)
+            med = durs[n // 2] if n % 2 else (durs[n // 2 - 1] + durs[n // 2]) / 2
+            if not med:
+                continue
+            for ep in episodes:
+                dev = abs(ep["duration"] - med) / med
+                if dev > THRESHOLD:
+                    outliers.append({
+                        "show": show,
+                        "season": ep.get("parentIndex", 0),
+                        "episode": ep.get("index", 0),
+                        "title": ep.get("title", ""),
+                        "duration": ep["duration"],
+                        "median": int(med),
+                        "deviation": dev,
+                        "ratingKey": ep.get("ratingKey", ""),
+                    })
+
+        if not outliers:
+            console.print("[green]No duration outliers detected.[/green]"); return
+
+        outliers.sort(key=lambda x: x["deviation"], reverse=True)
+        t = Table(title=f"Duration Outliers ({len(outliers)} episodes)", box=box.ROUNDED)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Show", style="bold white", min_width=24)
+        t.add_column("Episode", width=9, style="dim")
+        t.add_column("Runtime", width=9, justify="right")
+        t.add_column("Show Median", width=12, justify="right", style="dim")
+        t.add_column("Deviation", width=10, justify="right", style="yellow")
+        for o in outliers:
+            arrow = "▲" if o["duration"] > o["median"] else "▼"
+            t.add_row(o["ratingKey"], o["show"],
+                      f"S{o['season']:02d}E{o['episode']:02d}",
+                      format_duration(o["duration"]), format_duration(o["median"]),
+                      f"{arrow} {o['deviation']*100:.0f}%")
+        console.print(t)
+
+    def do_4k_audit(self, arg: str):
+        """4k_audit [library_id] — 4K content breakdown by HDR type, audio format, and codec"""
+        section_id = arg.strip() or None
+        libs = self._libs_for(section_id) if section_id else self.client.libraries()
+
+        items_4k = []
+        with console.status("Scanning for 4K content..."):
+            for lib in libs:
+                lid, lt = lib.get("key", ""), lib.get("title", "")
+                for item in self.client.library_contents(lid):
+                    for media in item.get("Media", []):
+                        if (media.get("videoResolution") or "").lower() not in ("4k", "2160"):
+                            continue
+                        hdr_type = None
+                        for part in media.get("Part", []):
+                            for stream in part.get("Stream", []):
+                                if stream.get("streamType") != 1:
+                                    continue
+                                ctrc = (stream.get("colorTrc") or "").lower()
+                                if stream.get("DOVIPresent") or stream.get("doviPresent"):
+                                    hdr_type = "Dolby Vision"
+                                elif "smpte2084" in ctrc or ctrc == "pq":
+                                    hdr_type = "HDR10"
+                                elif "arib-std-b67" in ctrc or ctrc == "hlg":
+                                    hdr_type = "HLG"
+                        if not hdr_type:
+                            profile = (media.get("videoProfile") or "").lower()
+                            if "main 10" in profile or "high 10" in profile:
+                                hdr_type = "HDR10 (profile)"
+                        items_4k.append({
+                            "ratingKey": item.get("ratingKey", ""),
+                            "title": item.get("title", ""),
+                            "year": item.get("year"),
+                            "library": lt,
+                            "hdr": hdr_type or "None",
+                            "videoCodec": (media.get("videoCodec") or "?").upper(),
+                            "audioCodec": (media.get("audioCodec") or "?").upper(),
+                            "size": sum(p.get("size", 0) or 0 for p in media.get("Part", [])),
+                        })
+                        break  # one media entry per item is enough
+
+        if not items_4k:
+            console.print("[yellow]No 4K content found.[/yellow]"); return
+
+        hdr_counts  = Counter(i["hdr"] for i in items_4k)
+        codec_counts = Counter(i["videoCodec"] for i in items_4k)
+        audio_counts = Counter(i["audioCodec"] for i in items_4k)
+        total_size  = sum(i["size"] for i in items_4k)
+
+        console.print(Panel(
+            f"[bold cyan]Total 4K items:[/bold cyan] {len(items_4k)}  "
+            f"[bold cyan]Total size:[/bold cyan] {format_size(total_size)}\n\n"
+            "[bold cyan]HDR:[/bold cyan]   " +
+            "  ".join(f"{tag}: {cnt}" for tag, cnt in hdr_counts.most_common()) + "\n"
+            "[bold cyan]Video:[/bold cyan] " +
+            "  ".join(f"{tag}: {cnt}" for tag, cnt in codec_counts.most_common()) + "\n"
+            "[bold cyan]Audio:[/bold cyan] " +
+            "  ".join(f"{tag}: {cnt}" for tag, cnt in audio_counts.most_common()),
+            title="[bold white]4K Content Audit[/bold white]", border_style="cyan"))
+
+        HDR_STYLE = {
+            "Dolby Vision":  "[bright_blue]Dolby Vision[/bright_blue]",
+            "HDR10":         "[yellow]HDR10[/yellow]",
+            "HDR10 (profile)": "[dim yellow]HDR10?[/dim yellow]",
+            "HLG":           "[yellow]HLG[/yellow]",
+            "None":          "[dim]—[/dim]",
+        }
+        t = Table(title="4K Items", box=box.ROUNDED)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Library", style="cyan", width=14)
+        t.add_column("HDR", width=16)
+        t.add_column("Video", width=7)
+        t.add_column("Audio", width=8)
+        t.add_column("Size", width=10, justify="right")
+        for i in sorted(items_4k, key=lambda x: x["title"].lower()):
+            t.add_row(i["ratingKey"], i["title"], str(i["year"] or "—"), i["library"],
+                      HDR_STYLE.get(i["hdr"], i["hdr"]),
+                      i["videoCodec"], i["audioCodec"], format_size(i["size"]))
+        console.print(t)
+
     # ── Breakdown views ───────────────────────────────────────────────────────
 
     def do_popularity(self, arg: str):
@@ -2315,9 +2588,11 @@ class PlexShell(cmd.Cmd):
     complete_subtitles = complete_hdr = complete_multiversion = complete_genres = _c_lib_arg
     complete_studios = complete_collections = complete_popularity = _c_lib_arg
     complete_fixtitles = complete_stale = _c_lib_arg
+    complete_missing_episodes = complete_incomplete_seasons = _c_lib_arg
+    complete_duration_outliers = complete_4k_audit = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
-    complete_tvlargest = complete_tvsmallest = complete_analyze = _c_lib_flag
+    complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
