@@ -216,14 +216,15 @@ class PlexClient:
                 console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
         return None
 
-    def get(self, path: str, **params) -> dict:
-        r = self._request("GET", path, **params)
+    def get(self, path: str, silent: bool = False, **params) -> dict:
+        r = self._request("GET", path, silent=silent, **params)
         if r is None:
             return {}
         try:
             return r.json()
         except requests.exceptions.JSONDecodeError:
-            console.print("[red]Server returned non-JSON response[/red]")
+            if not silent:
+                console.print("[red]Server returned non-JSON response[/red]")
             return {}
 
     def put(self, path: str, **params) -> bool:
@@ -1598,35 +1599,71 @@ class PlexShell(cmd.Cmd):
         if not level_name:
             level_name = "info"
         min_level = level_map.get(level_name, 2)
+
+        entries: list = []
+        raw_text: str | None = None
+        server_filtered = False
+
         with console.status("Fetching server logs..."):
-            text = self.client.get_text("/log", silent=True, minLevel=min_level)
-            server_filtered = text is not None
-            if text is None:
-                text = self.client.get_text("/log")
-        if text is None:
+            # 1. JSON with minLevel (most specific; uses session Accept: application/json)
+            data = self.client.get("/log", silent=True, minLevel=min_level)
+            entries = data.get("MediaContainer", {}).get("Log", [])
+            server_filtered = bool(entries)
+
+            # 2. JSON without params
+            if not entries:
+                data = self.client.get("/log", silent=True)
+                entries = data.get("MediaContainer", {}).get("Log", [])
+
+            # 3. Plain-text fallback (some older PMS versions return text/plain)
+            if not entries:
+                raw_text = self.client.get_text("/log", silent=True)
+
+        if not entries and raw_text is None:
+            console.print("[red]Could not retrieve server logs.[/red]")
+            console.print(
+                "[dim]The /log endpoint is not available on this server.\n"
+                "Find logs manually in the Plex data directory:\n"
+                "  Windows: %LOCALAPPDATA%\\Plex Media Server\\Logs\\\n"
+                "  Linux/Mac: ~/Library/Logs/Plex Media Server/[/dim]")
             return
-        if text.lstrip().startswith("{"):
-            try:
-                entries = json.loads(text).get("MediaContainer",{}).get("Log",[])
-                if not server_filtered and min_level > 0:
-                    entries = [e for e in entries if (e.get("level") or 0) >= min_level]
-                log_lines = [f"{format_ts(e.get('time'))}  [{e.get('level','?'):5}]  {e.get('msg','')}"
-                             for e in entries][-lines:]
-            except json.JSONDecodeError:
-                log_lines = []
-        else:
-            all_lines = [l for l in text.splitlines() if l.strip()]
+
+        styles = {"DEBUG": "dim", "INFO": "white", "WARN": "yellow",
+                  "WARNING": "yellow", "ERROR": "red", "FATAL": "bold red"}
+
+        if entries:
             if not server_filtered and min_level > 0:
-                above = {k.upper() for k,v in level_map.items() if v >= min_level}
-                all_lines = [l for l in all_lines if any(kw in l.upper() for kw in above)]
-            log_lines = all_lines[-lines:]
+                entries = [e for e in entries if (e.get("level") or 0) >= min_level]
+            log_lines = [
+                f"{format_ts(e.get('time'))}  [{str(e.get('level','?')):5}]  {e.get('msg','')}"
+                for e in entries
+            ][-lines:]
+        else:
+            # raw_text path
+            if raw_text and raw_text.lstrip().startswith("{"):
+                try:
+                    j_entries = json.loads(raw_text).get("MediaContainer", {}).get("Log", [])
+                    if not server_filtered and min_level > 0:
+                        j_entries = [e for e in j_entries if (e.get("level") or 0) >= min_level]
+                    log_lines = [
+                        f"{format_ts(e.get('time'))}  [{str(e.get('level','?')):5}]  {e.get('msg','')}"
+                        for e in j_entries
+                    ][-lines:]
+                except json.JSONDecodeError:
+                    log_lines = []
+            else:
+                all_lines = [l for l in (raw_text or "").splitlines() if l.strip()]
+                if not server_filtered and min_level > 0:
+                    above = {k.upper() for k, v in level_map.items() if v >= min_level}
+                    all_lines = [l for l in all_lines if any(kw in l.upper() for kw in above)]
+                log_lines = all_lines[-lines:]
+
         if not log_lines:
-            console.print("[yellow]No log entries returned.[/yellow]")
-            console.print(f"[dim]Raw response ({len(text)} chars): {text[:200]}[/dim]"); return
-        styles = {"DEBUG":"dim","INFO":"white","WARN":"yellow","WARNING":"yellow","ERROR":"red","FATAL":"bold red"}
+            console.print("[yellow]No log entries returned.[/yellow]"); return
+
         console.print(f"[bold cyan]Server Log[/bold cyan] [dim](last {len(log_lines)} lines, level≥{level_name})[/dim]")
         for line in log_lines:
-            style = next((sty for kw,sty in styles.items() if kw in line.upper()), "white")
+            style = next((sty for kw, sty in styles.items() if kw in line.upper()), "white")
             console.print(f"[{style}]{line}[/{style}]")
 
     def do_activities(self, _):
