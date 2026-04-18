@@ -641,6 +641,8 @@ _HELP_SECTIONS = [
         ("multiversion",    "[library_id]",                      "Items with more than one media version"),
         ("genres",          "[library_id]",                      "Genre distribution across libraries"),
         ("studios",         "[library_id]",                      "Studio distribution across libraries"),
+        ("decade",          "[library_id]",                      "Content count broken down by decade of release"),
+        ("content_rating",  "[library_id]",                      "Content rating distribution (G, PG, R, TV-MA, etc.)"),
         ("missing_episodes",  "[library_id]",                    "TV seasons with gaps in episode numbering"),
         ("incomplete_seasons","[library_id]",                    "Seasons with fewer episodes than the show's typical season"),
         ("abandoned",         "[threshold%] [--library id]",     "Shows started but not finished (default <80% watched)"),
@@ -2386,6 +2388,70 @@ class PlexShell(cmd.Cmd):
             if s: studio_counts[s] += 1
         _distribution_table("Studio Distribution", studio_counts, cap=30)
 
+    def do_decade(self, arg: str):
+        """decade [library_id] — content count broken down by decade of release"""
+        section_id = arg.strip() or None
+        with console.status("Scanning release years..."):
+            items = self._all_items(section_id)
+
+        decade_counts: Counter = Counter()
+        no_year = 0
+        for item in items:
+            y = item.get("year")
+            if y:
+                decade_counts[(y // 10) * 10] += 1
+            else:
+                no_year += 1
+
+        if not decade_counts:
+            console.print("[yellow]No year data found.[/yellow]"); return
+
+        total = sum(decade_counts.values())
+        t = Table(
+            title="Content by Decade" + (f" — Library {section_id}" if section_id else ""),
+            box=box.ROUNDED,
+        )
+        t.add_column("Decade", style="bold cyan", width=10)
+        t.add_column("Count", justify="right", width=8)
+        t.add_column("Share", justify="right", width=7)
+        t.add_column("", min_width=30)   # bar
+
+        for decade in sorted(decade_counts):
+            cnt = decade_counts[decade]
+            pct = cnt / total * 100
+            bar_len = int(pct / 2)   # 50 chars = 100%
+            t.add_row(
+                f"{decade}s",
+                str(cnt),
+                f"{pct:.1f}%",
+                f"[cyan]{'█' * bar_len}[/cyan]",
+            )
+
+        t.add_section()
+        t.add_row("[bold]Total[/bold]", f"[bold]{total}[/bold]", "", "")
+        console.print(t)
+
+        if no_year:
+            console.print(f"[dim]{no_year} items have no year and are excluded.[/dim]")
+
+    def do_content_rating(self, arg: str):
+        """content_rating [library_id] — content rating distribution (G, PG, PG-13, R, TV-MA, etc.)"""
+        with console.status("Scanning content ratings..."):
+            items = self._all_items(arg.strip() or None)
+        counts: Counter = Counter()
+        unrated = 0
+        for item in items:
+            cr = (item.get("contentRating") or "").strip()
+            if cr:
+                counts[cr] += 1
+            else:
+                unrated += 1
+        if not counts:
+            console.print("[yellow]No content rating data found.[/yellow]"); return
+        _distribution_table("Content Rating Distribution", counts)
+        if unrated:
+            console.print(f"[dim]{unrated} items have no content rating.[/dim]")
+
     # ── Item extras ───────────────────────────────────────────────────────────
 
     def do_extras(self, arg: str):
@@ -2626,7 +2692,7 @@ class PlexShell(cmd.Cmd):
     complete_studios = complete_collections = complete_popularity = _c_lib_arg
     complete_fixtitles = complete_stale = _c_lib_arg
     complete_missing_episodes = complete_incomplete_seasons = _c_lib_arg
-    complete_duration_outliers = complete_4k_audit = _c_lib_arg
+    complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
