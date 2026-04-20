@@ -29,6 +29,12 @@ except ImportError as _e:
     print("Run:  py -m pip install -r requirements.txt")
     sys.exit(1)
 
+# Ensure Unicode output works on Windows (cp1252 terminals reject many Rich chars)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 BASE_URL = "http://opus2.local:32400"
@@ -804,7 +810,7 @@ class PlexShell(cmd.Cmd):
             f"[bold cyan]Server:[/bold cyan] {info.get('friendlyName', 'Unknown')}\n"
             f"[bold cyan]Version:[/bold cyan] {info.get('version', '—')}\n"
             f"[bold cyan]Platform:[/bold cyan] {info.get('platform', '—')} {info.get('platformVersion', '')}\n"
-            f"[bold cyan]My Plex:[/bold cyan] {'✓' if info.get('myPlex') else '✗'}\n"
+            f"[bold cyan]My Plex:[/bold cyan] {'[green]yes[/green]' if info.get('myPlex') else '[dim]no[/dim]'}\n"
             f"[bold cyan]URL:[/bold cyan] {BASE_URL}",
             title="[bold white]Plex Media Server[/bold white]", border_style="green"))
 
@@ -2491,7 +2497,7 @@ class PlexShell(cmd.Cmd):
         t.add_column("Admin", width=7, justify="center")
         for acct in accounts:
             t.add_row(str(acct.get("id","?")), acct.get("name") or acct.get("title") or "—",
-                      "✓" if acct.get("id") == 1 else "")
+                      "[green]admin[/green]" if acct.get("id") == 1 else "")
         console.print(t)
         console.print("[dim]Use [bold]userstats <name>[/bold] for per-user watch detail.[/dim]")
 
@@ -2769,24 +2775,37 @@ def get_token() -> str:
     return token
 
 def main():
-    console.print(Panel("[bold white]Plex Media Server CLI[/bold white]\n"
-                        f"[dim]Connecting to {BASE_URL}[/dim]", border_style="cyan", expand=False))
+    one_shot = sys.argv[1:]   # command + args passed on the CLI, if any
+
+    if not one_shot:
+        console.print(Panel("[bold white]Plex Media Server CLI[/bold white]\n"
+                            f"[dim]Connecting to {BASE_URL}[/dim]", border_style="cyan", expand=False))
+
     token = get_token()
     if not token:
         console.print("[red]No token provided. Exiting.[/red]"); sys.exit(1)
+
     client = PlexClient(token)
     with console.status("Connecting..."):
         info = client.server_info()
-    if info:
-        console.print(f"[green]Connected to[/green] [bold]{info.get('friendlyName','Plex Server')}[/bold] "
-                      f"[dim]v{info.get('version','')}[/dim]")
+
+    if not one_shot:
+        if info:
+            console.print(f"[green]Connected to[/green] [bold]{info.get('friendlyName','Plex Server')}[/bold] "
+                          f"[dim]v{info.get('version','')}[/dim]")
+        else:
+            console.print(f"[yellow]Could not reach {BASE_URL} — commands may fail.[/yellow]")
+        console.print("[dim]Type [bold]help[/bold] for available commands.[/dim]\n")
+
+    shell = PlexShell(client)
+
+    if one_shot:
+        shell.onecmd(" ".join(one_shot))
     else:
-        console.print(f"[yellow]Could not reach {BASE_URL} — commands may fail.[/yellow]")
-    console.print("[dim]Type [bold]help[/bold] for available commands.[/dim]\n")
-    try:
-        PlexShell(client).cmdloop()
-    except KeyboardInterrupt:
-        console.print("\n[dim]Interrupted. Goodbye.[/dim]")
+        try:
+            shell.cmdloop()
+        except KeyboardInterrupt:
+            console.print("\n[dim]Interrupted. Goodbye.[/dim]")
 
 if __name__ == "__main__":
     main()
