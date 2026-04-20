@@ -638,6 +638,7 @@ _HELP_SECTIONS = [
         ("byactor",         "<name> [library_id]",               "Browse items by actor"),
         ("bydirector",      "<name> [library_id]",               "Browse items by director"),
         ("byyear",          "<year> [library_id]",               "Browse items by release year"),
+        ("bycontentrating", "<rating> [library_id]",             "Browse items by content rating (PG-13, TV-MA, etc.)"),
     ]),
     ("Deeper analysis", [
         ("bitrate",         "[library_id]",                      "Bitrate distribution with outlier flagging"),
@@ -1949,6 +1950,23 @@ class PlexShell(cmd.Cmd):
                 results.extend(self.client.section_search(lib.get("key",""), year=year_val))
         print_media_table(results, f"Year: {year_val}")
 
+    def do_bycontentrating(self, arg: str):
+        """bycontentrating <rating> [library_id] — browse items by content rating (e.g. PG-13, TV-MA)"""
+        parts = arg.strip().split()
+        if not parts:
+            console.print("[yellow]Usage: bycontentrating <rating> [library_id][/yellow]")
+            console.print("[dim]Movies: G  PG  PG-13  R  NC-17  NR[/dim]")
+            console.print("[dim]TV:     TV-Y  TV-Y7  TV-G  TV-PG  TV-14  TV-MA[/dim]")
+            return
+        rating_val = parts[0]
+        section_id = parts[1] if len(parts) > 1 else None
+        libs = self._libs_for(section_id)
+        with console.status(f"Browsing content rating [cyan]{rating_val}[/cyan]..."):
+            results = []
+            for lib in libs:
+                results.extend(self.client.section_search(lib.get("key", ""), contentRating=rating_val))
+        print_media_table(results, f"Content Rating: {rating_val}")
+
     # ── Deeper Analysis ───────────────────────────────────────────────────────
 
     def do_bitrate(self, arg: str):
@@ -2700,6 +2718,19 @@ class PlexShell(cmd.Cmd):
     complete_missing_episodes = complete_incomplete_seasons = _c_lib_arg
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
+
+    _CONTENT_RATINGS = (
+        "G", "PG", "PG-13", "R", "NC-17", "NR",
+        "TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA",
+    )
+
+    def complete_bycontentrating(self, text, line, begidx, *_):
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return [r for r in self._CONTENT_RATINGS if r.lower().startswith(text.lower())]
+        if len(tokens) >= 2:
+            return self._c_libs(text)
+        return []
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
 
