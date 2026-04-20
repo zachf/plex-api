@@ -195,6 +195,7 @@ def get_media_rows(item: dict, library: str = "") -> list:
                 "file": part.get("file", ""),
                 "size": part.get("size"),
                 "duration": media.get("duration") or item.get("duration"),
+                "videoFrameRate": media.get("videoFrameRate", ""),
             })
     return rows
 
@@ -421,6 +422,15 @@ class PlexClient:
                 rows.extend(get_media_rows(item, lib.get("title", lib.get("key", ""))))
         return rows
 
+    def media_rows_for(self, section_id: str | None = None) -> list:
+        """Media rows for one library (correctly using leaf items) or all libraries."""
+        if not section_id:
+            return self.all_media_rows()
+        lib = next((l for l in self.libraries() if l.get("key") == section_id),
+                   {"key": section_id, "title": section_id, "type": ""})
+        return [row for item in self._leaf_items(lib)
+                for row in get_media_rows(item, lib.get("title", section_id))]
+
     def all_items_by_library(self) -> dict:
         result = {}
         for lib in self.libraries():
@@ -591,6 +601,8 @@ _HELP_SECTIONS = [
         ("toprated",        "[library_id]",                      "Highest-rated items"),
         ("recently_played", "[count]",                           "Most recently watched"),
         ("popularity",      "[library_id]",                      "Most-watched titles ranked by play count"),
+        ("watch_calendar",  "[days]",                            "Day-by-day view of what was watched (default 7)"),
+        ("recommendations", "[library_id]",                      "Highly rated unwatched content (≥7.5)"),
     ]),
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
@@ -639,6 +651,8 @@ _HELP_SECTIONS = [
         ("bydirector",      "<name> [library_id]",               "Browse items by director"),
         ("byyear",          "<year> [library_id]",               "Browse items by release year"),
         ("bycontentrating", "<rating> [library_id]",             "Browse items by content rating (PG-13, TV-MA, etc.)"),
+        ("director_stats",  "[library_id]",                      "Directors ranked by titles owned, with watched counts"),
+        ("actor_stats",     "[library_id]",                      "Actors ranked by titles owned, with watched counts"),
     ]),
     ("Deeper analysis", [
         ("bitrate",         "[library_id]",                      "Bitrate distribution with outlier flagging"),
@@ -655,6 +669,7 @@ _HELP_SECTIONS = [
         ("abandoned",         "[threshold%] [--library id]",     "Shows started but not finished (default <80% watched)"),
         ("duration_outliers", "[library_id]",                    "TV episodes with runtime far from the show's median"),
         ("4k_audit",          "[library_id]",                    "4K content breakdown by HDR type, audio, and codec"),
+        ("framerate",         "[library_id]",                    "Content broken down by frame rate"),
     ]),
     ("Item extras", [
         ("extras",          "<key>",                             "Trailers, featurettes, and interviews"),
@@ -1232,6 +1247,67 @@ class PlexShell(cmd.Cmd):
             console.print("[yellow]No history available (may require Plex Pass).[/yellow]")
             return
         self._history_table(records, f"Recently Played (last {count})")
+
+    def do_watch_calendar(self, arg: str):
+        """watch_calendar [days] — day-by-day view of what was watched (default 7 days)"""
+        days = int(arg.strip()) if arg.strip().isdigit() else 7
+        cutoff = int(time.time()) - days * 86400
+        with console.status("Fetching watch history..."):
+            hist = [h for h in self.client.history(count=2000)
+                    if (h.get("viewedAt") or 0) >= cutoff]
+        if not hist:
+            console.print(f"[yellow]No watch history in the last {days} days.[/yellow]")
+            return
+        by_date: dict = defaultdict(list)
+        for h in hist:
+            d = datetime.fromtimestamp(h["viewedAt"]).strftime("%a  %b %d")
+            by_date[d].append(h)
+        t = Table(title=f"Watch Calendar — Last {days} Days ({len(hist)} plays)",
+                  box=box.ROUNDED, show_lines=True)
+        t.add_column("Date", style="bold cyan", width=12, no_wrap=True)
+        t.add_column("User", style="dim", width=12)
+        t.add_column("Title", style="bold white", min_width=32)
+        t.add_column("Type", style="yellow", width=9)
+        for date in sorted(by_date, reverse=True):
+            for i, h in enumerate(by_date[date]):
+                parent = h.get("grandparentTitle", "")
+                title = h.get("title", "")
+                t.add_row(
+                    date if i == 0 else "",
+                    h.get("User", {}).get("title", "—"),
+                    f"{parent} — {title}" if parent else title,
+                    h.get("type", ""),
+                )
+            t.add_section()
+        console.print(t)
+
+    def do_recommendations(self, arg: str):
+        """recommendations [library_id] — highly rated unwatched content (audience rating ≥ 7.5)"""
+        section_id = arg.strip() or None
+        MIN_RATING = 7.5
+        with console.status("Finding recommendations..."):
+            items = self._all_items(section_id)
+        recs = []
+        for item in items:
+            if item.get("viewCount"):
+                continue
+            r = item.get("audienceRating") or item.get("rating")
+            if r and float(r) >= MIN_RATING:
+                recs.append((float(r), item))
+        if not recs:
+            console.print(f"[yellow]No unwatched items with rating ≥ {MIN_RATING}.[/yellow]")
+            return
+        recs.sort(key=lambda x: x[0], reverse=True)
+        t = Table(title=f"Recommendations — Unwatched, Rating ≥ {MIN_RATING}",
+                  caption=f"{len(recs)} items", caption_justify="right", box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Rating", width=7, justify="right", style="bold green")
+        t.add_column("Title", style="bold white", min_width=30)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Type", style="yellow", width=10)
+        for i, (r, item) in enumerate(recs[:50], 1):
+            t.add_row(str(i), f"{r:.1f}", item.get("title", ""), year(item), item.get("type", ""))
+        console.print(t)
 
     # ── Storage analysis ──────────────────────────────────────────────────────
 
@@ -1967,6 +2043,48 @@ class PlexShell(cmd.Cmd):
                 results.extend(self.client.section_search(lib.get("key", ""), contentRating=rating_val))
         print_media_table(results, f"Content Rating: {rating_val}")
 
+    def _tag_stats_table(self, title: str, tag_key: str, items: list):
+        """Shared helper for director_stats / actor_stats."""
+        data: dict = {}
+        for item in items:
+            for tag in item.get(tag_key, []):
+                name = tag.get("tag", "")
+                if not name:
+                    continue
+                rec = data.setdefault(name, {"total": 0, "watched": 0})
+                rec["total"] += 1
+                if item.get("viewCount"):
+                    rec["watched"] += 1
+        if not data:
+            console.print(f"[yellow]No {title.lower()} data found.[/yellow]")
+            return
+        rows = sorted(data.items(), key=lambda x: x[1]["total"], reverse=True)[:50]
+        col = title.split()[0]   # "Director" or "Actor"
+        t = Table(title=title, box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4)
+        t.add_column(col, style="bold cyan", min_width=24)
+        t.add_column("Titles", justify="right", width=7)
+        t.add_column("Watched", justify="right", width=9)
+        t.add_column("Progress", min_width=24)
+        for i, (name, rec) in enumerate(rows, 1):
+            pct = rec["watched"] / rec["total"] * 100
+            fill = int(pct / 5)
+            bar = f"[green]{'█' * fill}[/green][dim]{'░' * (20 - fill)}[/dim] {pct:.0f}%"
+            t.add_row(str(i), name, str(rec["total"]), str(rec["watched"]), bar)
+        console.print(t)
+
+    def do_director_stats(self, arg: str):
+        """director_stats [library_id] — directors ranked by number of titles owned, with watched counts"""
+        with console.status("Scanning directors..."):
+            items = self._all_items(arg.strip() or None)
+        self._tag_stats_table("Director Stats (top 50)", "Director", items)
+
+    def do_actor_stats(self, arg: str):
+        """actor_stats [library_id] — actors ranked by number of titles owned, with watched counts"""
+        with console.status("Scanning cast..."):
+            items = self._all_items(arg.strip() or None)
+        self._tag_stats_table("Actor Stats (top 50)", "Role", items)
+
     # ── Deeper Analysis ───────────────────────────────────────────────────────
 
     def do_bitrate(self, arg: str):
@@ -2371,6 +2489,16 @@ class PlexShell(cmd.Cmd):
                       i["videoCodec"], i["audioCodec"], format_size(i["size"]))
         console.print(t)
 
+    def do_framerate(self, arg: str):
+        """framerate [library_id] — content broken down by frame rate (23.976, 25, 30, 60fps, etc.)"""
+        section_id = arg.strip() or None
+        with console.status("Scanning frame rates..."):
+            rows = self.client.media_rows_for(section_id)
+        fps_counts: Counter = Counter(
+            (r.get("videoFrameRate") or "Unknown") for r in rows
+        )
+        _distribution_table("Frame Rate Distribution", fps_counts)
+
     # ── Breakdown views ───────────────────────────────────────────────────────
 
     def do_popularity(self, arg: str):
@@ -2717,6 +2845,7 @@ class PlexShell(cmd.Cmd):
     complete_fixtitles = complete_stale = _c_lib_arg
     complete_missing_episodes = complete_incomplete_seasons = _c_lib_arg
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
+    complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
 
     _CONTENT_RATINGS = (
