@@ -196,6 +196,7 @@ def get_media_rows(item: dict, library: str = "") -> list:
                 "size": part.get("size"),
                 "duration": media.get("duration") or item.get("duration"),
                 "videoFrameRate": media.get("videoFrameRate", ""),
+                "aspectRatio": media.get("aspectRatio"),
             })
     return rows
 
@@ -603,6 +604,9 @@ _HELP_SECTIONS = [
         ("popularity",      "[library_id]",                      "Most-watched titles ranked by play count"),
         ("watch_calendar",  "[days]",                            "Day-by-day view of what was watched (default 7)"),
         ("recommendations", "[library_id]",                      "Highly rated unwatched content (≥7.5)"),
+        ("rewatched",       "[library_id]",                      "Titles played more than once, ranked by play count"),
+        ("show_progress",   "[library_id]",                      "Every TV show with watched %, episode counts, last watched"),
+        ("added_trend",     "[months]",                          "Items added per month — library growth over time (default 12)"),
     ]),
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
@@ -670,6 +674,8 @@ _HELP_SECTIONS = [
         ("duration_outliers", "[library_id]",                    "TV episodes with runtime far from the show's median"),
         ("4k_audit",          "[library_id]",                    "4K content breakdown by HDR type, audio, and codec"),
         ("framerate",         "[library_id]",                    "Content broken down by frame rate"),
+        ("aspect_ratio",      "[library_id]",                    "Video aspect ratio distribution (16:9, 2.35:1, 4:3, etc.)"),
+        ("audio_languages",   "[library_id]",                    "Audio track language breakdown across the library"),
     ]),
     ("Item extras", [
         ("extras",          "<key>",                             "Trailers, featurettes, and interviews"),
@@ -1307,6 +1313,88 @@ class PlexShell(cmd.Cmd):
         t.add_column("Type", style="yellow", width=10)
         for i, (r, item) in enumerate(recs[:50], 1):
             t.add_row(str(i), f"{r:.1f}", item.get("title", ""), year(item), item.get("type", ""))
+        console.print(t)
+
+    def do_rewatched(self, arg: str):
+        """rewatched [library_id] — titles played more than once, ranked by play count"""
+        section_id = arg.strip() or None
+        with console.status("Scanning watch counts..."):
+            items = self._all_items(section_id)
+        rows = sorted(
+            [(item.get("viewCount", 0), item) for item in items if (item.get("viewCount") or 0) > 1],
+            key=lambda x: x[0], reverse=True,
+        )
+        if not rows:
+            console.print("[yellow]No rewatched titles found.[/yellow]"); return
+        t = Table(title=f"Most Rewatched ({len(rows)} titles)", box=box.ROUNDED,
+                  caption=f"showing top {min(50, len(rows))}", caption_justify="right")
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Plays", width=6, justify="right", style="bold green")
+        t.add_column("Title", style="bold white", min_width=30)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Type", style="yellow", width=10)
+        for i, (plays, item) in enumerate(rows[:50], 1):
+            t.add_row(str(i), str(plays), item.get("title", ""), year(item), item.get("type", ""))
+        console.print(t)
+
+    def do_show_progress(self, arg: str):
+        """show_progress [library_id] — every TV show with episode count, watched %, and last watched date"""
+        section_id = arg.strip() or None
+        with console.status("Fetching TV libraries..."):
+            tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
+        if section_id:
+            tv_libs = [l for l in tv_libs if l.get("key") == section_id]
+        if not tv_libs:
+            console.print("[yellow]No TV show libraries found.[/yellow]"); return
+        shows = []
+        with console.status("Scanning shows..."):
+            for lib in tv_libs:
+                for show in self.client.library_contents(lib.get("key", "")):
+                    total   = show.get("leafCount") or 0
+                    watched = show.get("viewedLeafCount") or 0
+                    shows.append((lib.get("title", ""), show, watched, total))
+        shows.sort(key=lambda x: (x[0], x[1].get("title", "").lower()))
+        t = Table(title=f"TV Show Progress ({len(shows)} shows)", box=box.ROUNDED)
+        t.add_column("Library", style="cyan", width=14)
+        t.add_column("Show", style="bold white", min_width=28)
+        t.add_column("Watched", width=9, justify="right")
+        t.add_column("Total", width=7, justify="right")
+        t.add_column("Progress", min_width=24)
+        t.add_column("Last Watched", width=17, style="dim")
+        for lib_title, show, watched, total in shows:
+            pct  = watched / total * 100 if total else 0
+            fill = int(pct / 5)
+            bar  = f"[green]{'█' * fill}[/green][dim]{'░' * (20 - fill)}[/dim] {pct:.0f}%"
+            t.add_row(lib_title, show.get("title", ""), str(watched), str(total),
+                      bar, format_ts(show.get("lastViewedAt")))
+        console.print(t)
+
+    def do_added_trend(self, arg: str):
+        """added_trend [months] — items added per month, showing library growth over time (default 12)"""
+        months = int(arg.strip()) if arg.strip().isdigit() else 12
+        cutoff = int(time.time()) - months * 30 * 86400
+        with console.status("Scanning added dates..."):
+            libs_data = self.client.all_items_by_library()
+        month_counts: Counter = Counter()
+        for d in libs_data.values():
+            for item in d["items"]:
+                added = item.get("addedAt") or 0
+                if added >= cutoff:
+                    month_counts[datetime.fromtimestamp(added).strftime("%Y-%m")] += 1
+        if not month_counts:
+            console.print(f"[yellow]No items added in the last {months} months.[/yellow]"); return
+        total = sum(month_counts.values())
+        peak  = max(month_counts.values())
+        t = Table(title=f"Items Added per Month — Last {months} Months", box=box.ROUNDED)
+        t.add_column("Month", style="bold cyan", width=10)
+        t.add_column("Added", justify="right", width=8)
+        t.add_column("", min_width=32)
+        for month in sorted(month_counts):
+            cnt     = month_counts[month]
+            bar_len = int(cnt / peak * 30) if peak else 0
+            t.add_row(month, str(cnt), f"[cyan]{'█' * bar_len}[/cyan]")
+        t.add_section()
+        t.add_row("[bold]Total[/bold]", f"[bold]{total}[/bold]", "")
         console.print(t)
 
     # ── Storage analysis ──────────────────────────────────────────────────────
@@ -2499,6 +2587,46 @@ class PlexShell(cmd.Cmd):
         )
         _distribution_table("Frame Rate Distribution", fps_counts)
 
+    def do_aspect_ratio(self, arg: str):
+        """aspect_ratio [library_id] — distribution of video aspect ratios (16:9, 2.35:1, 4:3, etc.)"""
+        def _label(ar) -> str:
+            if ar is None: return "Unknown"
+            if abs(ar - 1.33) < 0.05: return "4:3   (1.33)"
+            if abs(ar - 1.78) < 0.05: return "16:9  (1.78)"
+            if abs(ar - 1.85) < 0.06: return "1.85:1"
+            if abs(ar - 2.35) < 0.06: return "2.35:1"
+            if abs(ar - 2.39) < 0.04: return "2.39:1"
+            if abs(ar - 2.40) < 0.04: return "2.40:1"
+            return f"{ar:.2f}:1"
+
+        section_id = arg.strip() or None
+        with console.status("Scanning aspect ratios..."):
+            rows = self.client.media_rows_for(section_id)
+        ar_counts: Counter = Counter(_label(r.get("aspectRatio")) for r in rows)
+        _distribution_table("Aspect Ratio Distribution", ar_counts)
+
+    def do_audio_languages(self, arg: str):
+        """audio_languages [library_id] — breakdown of audio track languages across the library"""
+        section_id = arg.strip() or None
+        libs = self._libs_for(section_id) if section_id else self.client.libraries()
+        lang_counts: Counter = Counter()
+        with console.status("Scanning audio tracks..."):
+            for lib in libs:
+                for item in self.client._leaf_items(lib):
+                    seen: set = set()
+                    for media in item.get("Media", []):
+                        for part in media.get("Part", []):
+                            for stream in part.get("Stream", []):
+                                if stream.get("streamType") != 2:
+                                    continue   # 2 = audio
+                                lang = (stream.get("language")
+                                        or stream.get("languageCode")
+                                        or "Unknown")
+                                if lang not in seen:
+                                    lang_counts[lang] += 1
+                                    seen.add(lang)
+        _distribution_table("Audio Language Distribution", lang_counts)
+
     # ── Breakdown views ───────────────────────────────────────────────────────
 
     def do_popularity(self, arg: str):
@@ -2846,6 +2974,7 @@ class PlexShell(cmd.Cmd):
     complete_missing_episodes = complete_incomplete_seasons = _c_lib_arg
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
+    complete_rewatched = complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
 
     _CONTENT_RATINGS = (
