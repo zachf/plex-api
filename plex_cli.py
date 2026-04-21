@@ -594,6 +594,7 @@ _HELP_SECTIONS = [
         ("missing",         "",                                  "Items with incomplete metadata"),
         ("quality",         "",                                  "Resolution breakdown per library"),
         ("orphans",         "",                                  "Items with no associated media files"),
+        ("zero_duration",   "[library_id]",                      "Items with no detected duration (likely corrupt)"),
     ]),
     ("Watch statistics", [
         ("stats",           "",                                  "Library totals and watch history summary"),
@@ -643,6 +644,7 @@ _HELP_SECTIONS = [
         ("stop",            "[session]",                         "Stop a session"),
     ]),
     ("Analysis & reports", [
+        ("scan",            "[library_id]",                       "Scan one or all libraries for new/changed files"),
         ("refresh",         "<library_id> [--force]",             "Refresh library metadata (--force re-downloads from agents)"),
         ("analyze",         "<key> | --library <id>",            "Trigger deep media analysis"),
         ("report",          "[--html filename.html]",            "Comprehensive library report"),
@@ -1152,6 +1154,27 @@ class PlexShell(cmd.Cmd):
         else:
             console.print(t)
             console.print(f"[yellow]{count} orphaned items.[/yellow]")
+
+    def do_zero_duration(self, arg: str):
+        """zero_duration [library_id] — items with no detected duration (likely corrupt or stub files)"""
+        section_id = arg.strip() or None
+        with console.status("Scanning for zero-duration items..."):
+            rows = self.client.media_rows_for(section_id)
+        bad = [r for r in rows if not r.get("duration")]
+        if not bad:
+            console.print("[green]No zero-duration items found.[/green]")
+            return
+        t = Table(title=f"Zero-Duration Items ({len(bad)})", box=box.ROUNDED)
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=30)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("File", style="dim", min_width=40, overflow="fold")
+        for r in sorted(bad, key=lambda x: x.get("title", "").lower()):
+            t.add_row(r.get("ratingKey", ""), r.get("title", "—"),
+                      r.get("library", "—"), r.get("file", "—"))
+        console.print(t)
+        console.print(f"[yellow]{len(bad)} item(s) with no detected duration — "
+                      "check files for corruption or re-run Analyze.[/yellow]")
 
     # ── Watch statistics ──────────────────────────────────────────────────────
 
@@ -1977,6 +2000,29 @@ class PlexShell(cmd.Cmd):
         if ok:
             console.print(f"[green]Refresh queued[/green] for library {lib_id}"
                           + (" [dim](force)[/dim]" if force else "") + " — runs in background")
+
+    def do_scan(self, arg: str):
+        """scan [library_id] — scan one or all libraries for new/changed files"""
+        section_id = arg.strip() or None
+        libs = self._libs_for(section_id) if section_id else self.client.libraries()
+        if not libs:
+            console.print("[yellow]No libraries found.[/yellow]")
+            return
+        results = []
+        with console.status("Queuing scans..."):
+            for lib in libs:
+                lid = lib.get("key", "")
+                title = lib.get("title", lid or "?")
+                ok = self.client.refresh_library(lid, force=False)
+                results.append((title, lid, ok))
+        t = Table(title="Library Scans Queued", box=box.ROUNDED)
+        t.add_column("Library", style="bold white", min_width=24)
+        t.add_column("ID", style="dim", width=6)
+        t.add_column("Status", width=10)
+        for title, lid, ok in results:
+            t.add_row(title, lid, "[green]queued[/green]" if ok else "[red]failed[/red]")
+        console.print(t)
+        console.print("[dim]Scans run in the background — new files will appear shortly.[/dim]")
 
     def do_report(self, arg: str):
         html_file = None
@@ -2975,6 +3021,7 @@ class PlexShell(cmd.Cmd):
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
     complete_rewatched = complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
+    complete_zero_duration = complete_scan = complete_added_trend = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
 
     _CONTENT_RATINGS = (
