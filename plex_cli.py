@@ -601,7 +601,6 @@ _HELP_SECTIONS = [
         ("history",         "[user] [count]",                    "Recent watch history"),
         ("unwatched",       "[library_id]",                      "Content never played"),
         ("toprated",        "[library_id]",                      "Highest-rated items"),
-        ("recently_played", "[count]",                           "Most recently watched"),
         ("popularity",      "[library_id]",                      "Most-watched titles ranked by play count"),
         ("watch_calendar",  "[days]",                            "Day-by-day view of what was watched (default 7)"),
         ("recommendations", "[library_id]",                      "Highly rated unwatched content (≥7.5)"),
@@ -644,8 +643,7 @@ _HELP_SECTIONS = [
         ("stop",            "[session]",                         "Stop a session"),
     ]),
     ("Analysis & reports", [
-        ("scan",            "[library_id]",                       "Scan one or all libraries for new/changed files"),
-        ("refresh",         "<library_id> [--force]",             "Refresh library metadata (--force re-downloads from agents)"),
+        ("refresh",         "[library_id] [--force]",             "Scan one or all libraries; --force re-downloads metadata from agents"),
         ("analyze",         "<key> | --library <id>",            "Trigger deep media analysis"),
         ("report",          "[--html filename.html]",            "Comprehensive library report"),
         ("changelog",       "[days]",                            "Everything added/updated in last N days"),
@@ -657,6 +655,7 @@ _HELP_SECTIONS = [
         ("bydirector",      "<name> [library_id]",               "Browse items by director"),
         ("byyear",          "<year> [library_id]",               "Browse items by release year"),
         ("bycontentrating", "<rating> [library_id]",             "Browse items by content rating (PG-13, TV-MA, etc.)"),
+        ("byresolution",    "<res> [library_id]",                "Browse items by resolution (4K, 1080p, 720p, SD)"),
         ("director_stats",  "[library_id]",                      "Directors ranked by titles owned, with watched counts"),
         ("actor_stats",     "[library_id]",                      "Actors ranked by titles owned, with watched counts"),
     ]),
@@ -678,6 +677,7 @@ _HELP_SECTIONS = [
         ("framerate",         "[library_id]",                    "Content broken down by frame rate"),
         ("aspect_ratio",      "[library_id]",                    "Video aspect ratio distribution (16:9, 2.35:1, 4:3, etc.)"),
         ("audio_languages",   "[library_id]",                    "Audio track language breakdown across the library"),
+        ("resolution_trend",  "[library_id]",                    "4K/1080p/720p/SD share by year items were added"),
     ]),
     ("Item extras", [
         ("extras",          "<key>",                             "Trailers, featurettes, and interviews"),
@@ -1267,15 +1267,6 @@ class PlexShell(cmd.Cmd):
         for i, (r, lt, item) in enumerate(all_items[:50], 1):
             t.add_row(str(i), f"{r:.1f}", item.get("title",""), year(item), lt)
         console.print(t)
-
-    def do_recently_played(self, arg: str):
-        count = int(arg.strip()) if arg.strip().isdigit() else 20
-        with console.status("Fetching history..."):
-            records = self.client.history(count=count)
-        if not records:
-            console.print("[yellow]No history available (may require Plex Pass).[/yellow]")
-            return
-        self._history_table(records, f"Recently Played (last {count})")
 
     def do_watch_calendar(self, arg: str):
         """watch_calendar [days] — day-by-day view of what was watched (default 7 days)"""
@@ -1983,46 +1974,37 @@ class PlexShell(cmd.Cmd):
                 console.print(f"[green]Analysis queued[/green] for item {key}")
 
     def do_refresh(self, arg: str):
-        """refresh <library_id> [--force] — refresh library metadata; --force re-downloads from agents"""
-        parts = arg.strip().split()
-        if not parts:
-            libs = self.client.libraries()
-            if libs:
-                print_libraries(libs)
-            console.print("[yellow]Usage: refresh <library_id> [--force][/yellow]")
-            return
+        """refresh [library_id] [--force] — scan one or all libraries; --force re-downloads metadata from agents"""
         _, flags = parse_search_args(arg)
-        lib_id = parts[0]
         force = bool(flags.get("force"))
-        mode = "full metadata refresh (force)" if force else "scan for new/changed files"
-        with console.status(f"Refreshing library [cyan]{lib_id}[/cyan] — {mode}..."):
-            ok = self.client.refresh_library(lib_id, force=force)
-        if ok:
-            console.print(f"[green]Refresh queued[/green] for library {lib_id}"
-                          + (" [dim](force)[/dim]" if force else "") + " — runs in background")
-
-    def do_scan(self, arg: str):
-        """scan [library_id] — scan one or all libraries for new/changed files"""
-        section_id = arg.strip() or None
-        libs = self._libs_for(section_id) if section_id else self.client.libraries()
+        parts = [p for p in arg.strip().split() if not p.startswith("-")]
+        lib_id = parts[0] if parts else None
+        libs = self._libs_for(lib_id) if lib_id else self.client.libraries()
         if not libs:
             console.print("[yellow]No libraries found.[/yellow]")
             return
+        mode = "full metadata refresh" if force else "scan for new/changed files"
         results = []
-        with console.status("Queuing scans..."):
+        with console.status(f"Queuing {mode}..."):
             for lib in libs:
-                lid = lib.get("key", "")
+                lid   = lib.get("key", "")
                 title = lib.get("title", lid or "?")
-                ok = self.client.refresh_library(lid, force=False)
+                ok    = self.client.refresh_library(lid, force=force)
                 results.append((title, lid, ok))
-        t = Table(title="Library Scans Queued", box=box.ROUNDED)
-        t.add_column("Library", style="bold white", min_width=24)
-        t.add_column("ID", style="dim", width=6)
-        t.add_column("Status", width=10)
-        for title, lid, ok in results:
-            t.add_row(title, lid, "[green]queued[/green]" if ok else "[red]failed[/red]")
-        console.print(t)
-        console.print("[dim]Scans run in the background — new files will appear shortly.[/dim]")
+        if len(results) == 1:
+            title, lid, ok = results[0]
+            if ok:
+                console.print(f"[green]Refresh queued[/green] for library {title}"
+                              + (" [dim](force)[/dim]" if force else "") + " — runs in background")
+        else:
+            t = Table(title=f"Libraries — {mode}", box=box.ROUNDED)
+            t.add_column("Library", style="bold white", min_width=24)
+            t.add_column("ID", style="dim", width=6)
+            t.add_column("Status", width=10)
+            for title, lid, ok in results:
+                t.add_row(title, lid, "[green]queued[/green]" if ok else "[red]failed[/red]")
+            console.print(t)
+            console.print("[dim]Runs in the background.[/dim]")
 
     def do_report(self, arg: str):
         html_file = None
@@ -2176,6 +2158,30 @@ class PlexShell(cmd.Cmd):
             for lib in libs:
                 results.extend(self.client.section_search(lib.get("key", ""), contentRating=rating_val))
         print_media_table(results, f"Content Rating: {rating_val}")
+
+    def do_byresolution(self, arg: str):
+        """byresolution <resolution> [library_id] — list items at a given resolution (4K, 1080p, 720p, SD)"""
+        _ALIASES = {
+            "4k": "4K", "2160": "4K", "2160p": "4K",
+            "1080": "1080p", "1080p": "1080p",
+            "720": "720p", "720p": "720p",
+            "sd": "SD", "480": "SD", "480p": "SD", "576": "SD", "576p": "SD",
+        }
+        parts = arg.strip().split()
+        if not parts:
+            console.print("[yellow]Usage: byresolution <resolution> [library_id][/yellow]")
+            console.print("[dim]Resolutions: 4K  1080p  720p  SD[/dim]")
+            return
+        target = _ALIASES.get(parts[0].lower())
+        if not target:
+            console.print(f"[yellow]Unknown resolution '{parts[0]}'. Try: 4K, 1080p, 720p, SD[/yellow]")
+            return
+        section_id = parts[1] if len(parts) > 1 else None
+        with console.status(f"Finding [cyan]{target}[/cyan] items..."):
+            items = self._all_items(section_id)
+        results = [i for i in items
+                   if i.get("Media") and resolution_label(i["Media"][0].get("videoResolution")) == target]
+        print_media_table(results, f"Resolution: {target}")
 
     def _tag_stats_table(self, title: str, tag_key: str, items: list):
         """Shared helper for director_stats / actor_stats."""
@@ -2673,6 +2679,72 @@ class PlexShell(cmd.Cmd):
                                     seen.add(lang)
         _distribution_table("Audio Language Distribution", lang_counts)
 
+    def do_resolution_trend(self, arg: str):
+        """resolution_trend [library_id] — 4K/1080p/720p/SD share by year items were added"""
+        section_id = arg.strip() or None
+        TIERS = ("4K", "1080p", "720p", "SD", "Unknown")
+        SKIP  = {"show", "season", "artist", "album"}
+
+        def _bucket(res) -> str:
+            lbl = resolution_label(res)
+            if lbl in TIERS:
+                return lbl
+            return "SD"
+
+        with console.status("Scanning resolutions by year added..."):
+            items = self._all_items(section_id)
+
+        by_year: dict[int, Counter] = {}
+        for item in items:
+            if item.get("type") in SKIP or not item.get("Media"):
+                continue
+            added = item.get("addedAt")
+            if not added:
+                continue
+            year  = datetime.fromtimestamp(added).year
+            res   = item["Media"][0].get("videoResolution")
+            by_year.setdefault(year, Counter())[_bucket(res)] += 1
+
+        if not by_year:
+            console.print("[yellow]No data found.[/yellow]")
+            return
+
+        title = "Resolution Trend by Year Added" + (f" — Library {section_id}" if section_id else "")
+        t = Table(title=title, box=box.ROUNDED)
+        t.add_column("Year",  style="bold cyan",   width=6)
+        t.add_column("4K",    justify="right",      width=7,  style="bright_blue")
+        t.add_column("1080p", justify="right",      width=7,  style="green")
+        t.add_column("720p",  justify="right",      width=7,  style="yellow")
+        t.add_column("SD",    justify="right",      width=7,  style="dim")
+        t.add_column("Total", justify="right",      width=7)
+        t.add_column("HD%",   justify="right",      width=7)
+
+        grand: Counter = Counter()
+        for year in sorted(by_year):
+            c = by_year[year]
+            total = sum(c.values())
+            hd    = c["4K"] + c["1080p"]
+            def _v(n): return str(n) if n else "[dim]—[/dim]"
+            t.add_row(
+                str(year),
+                _v(c["4K"]), _v(c["1080p"]), _v(c["720p"]), _v(c["SD"]),
+                str(total),
+                f"{hd/total*100:.0f}%" if total else "—",
+            )
+            grand.update(c)
+
+        t.add_section()
+        g_total = sum(grand.values())
+        g_hd    = grand["4K"] + grand["1080p"]
+        t.add_row(
+            "[bold]All[/bold]",
+            str(grand["4K"]) or "—", str(grand["1080p"]) or "—",
+            str(grand["720p"]) or "—", str(grand["SD"]) or "—",
+            f"[bold]{g_total}[/bold]",
+            f"[bold]{g_hd/g_total*100:.0f}%[/bold]" if g_total else "—",
+        )
+        console.print(t)
+
     # ── Breakdown views ───────────────────────────────────────────────────────
 
     def do_popularity(self, arg: str):
@@ -3021,7 +3093,7 @@ class PlexShell(cmd.Cmd):
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
     complete_rewatched = complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
-    complete_zero_duration = complete_scan = complete_added_trend = _c_lib_arg
+    complete_zero_duration = complete_added_trend = complete_resolution_trend = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
 
     _CONTENT_RATINGS = (
@@ -3033,6 +3105,16 @@ class PlexShell(cmd.Cmd):
         tokens = line[:begidx].split()
         if len(tokens) == 1:
             return [r for r in self._CONTENT_RATINGS if r.lower().startswith(text.lower())]
+        if len(tokens) >= 2:
+            return self._c_libs(text)
+        return []
+
+    _RESOLUTIONS = ("4K", "1080p", "720p", "SD")
+
+    def complete_byresolution(self, text, line, begidx, *_):
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return [r for r in self._RESOLUTIONS if r.lower().startswith(text.lower())]
         if len(tokens) >= 2:
             return self._c_libs(text)
         return []
