@@ -602,11 +602,14 @@ _HELP_SECTIONS = [
         ("unwatched",       "[library_id]",                      "Content never played"),
         ("toprated",        "[library_id]",                      "Highest-rated items"),
         ("popularity",      "[library_id]",                      "Most-watched titles ranked by play count"),
-        ("watch_calendar",  "[days]",                            "Day-by-day view of what was watched (default 7)"),
-        ("recommendations", "[library_id]",                      "Highly rated unwatched content (≥7.5)"),
-        ("rewatched",       "[library_id]",                      "Titles played more than once, ranked by play count"),
-        ("show_progress",   "[library_id]",                      "Every TV show with watched %, episode counts, last watched"),
-        ("added_trend",     "[months]",                          "Items added per month — library growth over time (default 12)"),
+        ("watch_calendar",    "[days]",                          "Day-by-day view of what was watched (default 7)"),
+        ("watched_by_decade", "[count]",                         "Which release decade you watch most, from play history"),
+        ("recommendations",   "[library_id]",                    "Highly rated unwatched content (≥7.5)"),
+        ("rewatched",         "[library_id]",                    "Titles played more than once, ranked by play count"),
+        ("show_progress",     "[library_id]",                    "Every TV show with watched %, episode counts, last watched"),
+        ("binge_candidates",  "[library_id]",                    "TV shows ranked by number of unwatched episodes"),
+        ("overdue",           "[months] [library_id]",           "Items added >N months ago never played (default 12)"),
+        ("added_trend",       "[months]",                        "Items added per month — library growth over time (default 12)"),
     ]),
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
@@ -678,6 +681,9 @@ _HELP_SECTIONS = [
         ("aspect_ratio",      "[library_id]",                    "Video aspect ratio distribution (16:9, 2.35:1, 4:3, etc.)"),
         ("audio_languages",   "[library_id]",                    "Audio track language breakdown across the library"),
         ("resolution_trend",  "[library_id]",                    "4K/1080p/720p/SD share by year items were added"),
+        ("container_format",  "[library_id]",                    "Distribution of file container formats (mkv, mp4, avi, etc.)"),
+        ("size_by_codec",     "[library_id]",                    "Total and average file size grouped by video codec"),
+        ("channel_dist",      "[library_id]",                    "Audio channel layout distribution (stereo, 5.1, 7.1, etc.)"),
     ]),
     ("Item extras", [
         ("extras",          "<key>",                             "Trailers, featurettes, and interviews"),
@@ -1301,6 +1307,41 @@ class PlexShell(cmd.Cmd):
             t.add_section()
         console.print(t)
 
+    def do_watched_by_decade(self, arg: str):
+        """watched_by_decade [count] — which release decade you watch most, based on play history"""
+        count = int(arg.strip()) if arg.strip().isdigit() else 2000
+        with console.status("Fetching watch history..."):
+            hist = self.client.history(count=count)
+        if not hist:
+            console.print("[yellow]No history available (may require Plex Pass).[/yellow]"); return
+        decade_counts: Counter = Counter()
+        no_year = 0
+        for h in hist:
+            y = h.get("year")
+            if y:
+                decade_counts[(int(y) // 10) * 10] += 1
+            else:
+                no_year += 1
+        if not decade_counts:
+            console.print("[yellow]No year data in history.[/yellow]"); return
+        total = sum(decade_counts.values())
+        peak  = max(decade_counts.values())
+        t = Table(title=f"Watch History by Decade ({total} plays)", box=box.ROUNDED)
+        t.add_column("Decade", style="bold cyan", width=10)
+        t.add_column("Plays",  justify="right",   width=8)
+        t.add_column("Share",  justify="right",   width=7)
+        t.add_column("",       min_width=30)
+        for decade in sorted(decade_counts):
+            cnt     = decade_counts[decade]
+            pct     = cnt / total * 100
+            bar_len = int(cnt / peak * 30) if peak else 0
+            t.add_row(f"{decade}s", str(cnt), f"{pct:.1f}%", f"[cyan]{'█' * bar_len}[/cyan]")
+        t.add_section()
+        t.add_row("[bold]Total[/bold]", f"[bold]{total}[/bold]", "", "")
+        console.print(t)
+        if no_year:
+            console.print(f"[dim]{no_year} history entries had no year data.[/dim]")
+
     def do_recommendations(self, arg: str):
         """recommendations [library_id] — highly rated unwatched content (audience rating ≥ 7.5)"""
         section_id = arg.strip() or None
@@ -1409,6 +1450,72 @@ class PlexShell(cmd.Cmd):
             t.add_row(month, str(cnt), f"[cyan]{'█' * bar_len}[/cyan]")
         t.add_section()
         t.add_row("[bold]Total[/bold]", f"[bold]{total}[/bold]", "")
+        console.print(t)
+
+    def do_overdue(self, arg: str):
+        """overdue [months] [library_id] — items added more than N months ago that have never been played (default 12)"""
+        parts = arg.strip().split()
+        months, section_id = 12, None
+        for p in parts:
+            if p.isdigit(): months = int(p)
+            elif not p.startswith("-"): section_id = p
+        cutoff = int(time.time()) - months * 30 * 86400
+        SKIP = {"show", "season", "artist", "album"}
+        with console.status(f"Finding content unplayed for >{months} months..."):
+            items = self._all_items(section_id)
+        results = [i for i in items
+                   if i.get("type") not in SKIP
+                   and not i.get("viewCount")
+                   and (i.get("addedAt") or 0) < cutoff]
+        results.sort(key=lambda x: x.get("addedAt") or 0)
+        if not results:
+            console.print(f"[green]No unplayed items older than {months} months.[/green]"); return
+        now = int(time.time())
+        t = Table(title=f"Overdue — Unplayed >{months} Months ({len(results)} items)", box=box.ROUNDED)
+        t.add_column("Key",      style="dim",        width=7)
+        t.add_column("Title",    style="bold white",  min_width=30)
+        t.add_column("Year",     width=6,             justify="right")
+        t.add_column("Added",    width=12,            style="dim")
+        t.add_column("Age (mo)", width=9,             justify="right", style="yellow")
+        for item in results:
+            added      = item.get("addedAt") or 0
+            age_months = (now - added) // (30 * 86400)
+            t.add_row(item.get("ratingKey", ""), item.get("title", "—"),
+                      str(item.get("year") or "—"),
+                      datetime.fromtimestamp(added).strftime("%Y-%m-%d") if added else "—",
+                      str(age_months))
+        console.print(t)
+
+    def do_binge_candidates(self, arg: str):
+        """binge_candidates [library_id] — TV shows ranked by number of unwatched episodes"""
+        section_id = arg.strip() or None
+        with console.status("Scanning TV shows..."):
+            items = self._all_items(section_id)
+        candidates = []
+        for item in items:
+            if item.get("type") != "show":
+                continue
+            total     = item.get("leafCount", 0) or 0
+            watched   = item.get("viewedLeafCount", 0) or 0
+            unwatched = total - watched
+            if unwatched > 0:
+                candidates.append({"title": item.get("title", ""), "total": total,
+                                   "watched": watched, "unwatched": unwatched})
+        if not candidates:
+            console.print("[green]No unwatched episodes.[/green]"); return
+        candidates.sort(key=lambda x: x["unwatched"], reverse=True)
+        t = Table(title=f"Binge Candidates — {len(candidates)} Shows with Unwatched Episodes",
+                  box=box.ROUNDED)
+        t.add_column("#",         style="dim",        width=4)
+        t.add_column("Title",     style="bold white",  min_width=32)
+        t.add_column("Unwatched", justify="right",     width=10, style="yellow")
+        t.add_column("Total Eps", justify="right",     width=10)
+        t.add_column("Progress",  min_width=24)
+        for i, c in enumerate(candidates[:50], 1):
+            pct  = c["watched"] / c["total"] * 100 if c["total"] else 0
+            fill = int(pct / 5)
+            bar  = f"[green]{'█' * fill}[/green][dim]{'░' * (20 - fill)}[/dim] {pct:.0f}%"
+            t.add_row(str(i), c["title"], str(c["unwatched"]), str(c["total"]), bar)
         console.print(t)
 
     # ── Storage analysis ──────────────────────────────────────────────────────
@@ -2745,6 +2852,56 @@ class PlexShell(cmd.Cmd):
         )
         console.print(t)
 
+    def do_container_format(self, arg: str):
+        """container_format [library_id] — distribution of file container formats (mkv, mp4, avi, etc.)"""
+        section_id = arg.strip() or None
+        with console.status("Scanning file containers..."):
+            rows = self.client.media_rows_for(section_id)
+        counts: Counter = Counter((r.get("container") or "unknown").lower() for r in rows)
+        _distribution_table("File Container Distribution", counts)
+
+    def do_size_by_codec(self, arg: str):
+        """size_by_codec [library_id] — total and average file size grouped by video codec"""
+        section_id = arg.strip() or None
+        with console.status("Scanning codecs and sizes..."):
+            rows = [r for r in self.client.media_rows_for(section_id)
+                    if r.get("size") and r.get("videoCodec")]
+        if not rows:
+            console.print("[yellow]No data found.[/yellow]"); return
+        groups: dict = {}
+        for r in rows:
+            codec = r["videoCodec"].upper()
+            rec   = groups.setdefault(codec, {"total": 0, "count": 0})
+            rec["total"] += r["size"]
+            rec["count"] += 1
+        grand_total = sum(v["total"] for v in groups.values())
+        t = Table(title="Size by Video Codec", box=box.ROUNDED)
+        t.add_column("Codec",      style="bold cyan",   width=10)
+        t.add_column("Files",      justify="right",     width=8)
+        t.add_column("Total Size", justify="right",     width=12, style="bold yellow")
+        t.add_column("Avg Size",   justify="right",     width=12)
+        t.add_column("Share",      justify="right",     width=7)
+        for codec, rec in sorted(groups.items(), key=lambda x: x[1]["total"], reverse=True):
+            avg = rec["total"] // rec["count"]
+            pct = rec["total"] / grand_total * 100 if grand_total else 0
+            t.add_row(codec, str(rec["count"]), format_size(rec["total"]), format_size(avg), f"{pct:.1f}%")
+        t.add_section()
+        t.add_row("[bold]All[/bold]", str(len(rows)), f"[bold]{format_size(grand_total)}[/bold]", "", "")
+        console.print(t)
+
+    def do_channel_dist(self, arg: str):
+        """channel_dist [library_id] — audio channel layout distribution (stereo, 5.1, 7.1, etc.)"""
+        LABELS = {1: "Mono (1.0)", 2: "Stereo (2.0)", 6: "Surround (5.1)", 8: "Surround (7.1)"}
+        section_id = arg.strip() or None
+        with console.status("Scanning audio channels..."):
+            rows = self.client.media_rows_for(section_id)
+        counts: Counter = Counter()
+        for r in rows:
+            ch    = r.get("audioChannels")
+            label = LABELS.get(ch, f"{ch}ch" if ch else "Unknown")
+            counts[label] += 1
+        _distribution_table("Audio Channel Distribution", counts)
+
     # ── Breakdown views ───────────────────────────────────────────────────────
 
     def do_popularity(self, arg: str):
@@ -3094,6 +3251,8 @@ class PlexShell(cmd.Cmd):
     complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
     complete_rewatched = complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
     complete_zero_duration = complete_added_trend = complete_resolution_trend = _c_lib_arg
+    complete_container_format = complete_size_by_codec = complete_channel_dist = _c_lib_arg
+    complete_binge_candidates = complete_overdue = complete_watched_by_decade = _c_lib_arg
     complete_bygenre = complete_byactor = complete_bydirector = complete_byyear = _c_lib_second
 
     _CONTENT_RATINGS = (
