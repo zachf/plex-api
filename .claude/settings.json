@@ -9,7 +9,10 @@
       "Bash(.venv/Scripts/python plex_cli.py framerate 2)",
       "Bash(.venv/Scripts/python plex_cli.py recommendations 2)",
       "Bash(.venv/Scripts/python plex_cli.py resolution_trend)",
-      "Bash(.venv/Scripts/python plex_cli.py byresolution 4K)"
+      "Bash(.venv/Scripts/python plex_cli.py byresolution 4K)",
+      "WebFetch(domain:www.themoviedb.org)",
+      "WebFetch(domain:api.themoviedb.org)",
+      "Bash(.venv/Scripts/python plex_cli.py radarr_list afi_top_100)"
     ]
   }
 }

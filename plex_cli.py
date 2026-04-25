@@ -464,6 +464,111 @@ class PlexClient:
             result.extend(self._mc(f"/library/sections/{lib.get('key','')}/collections"))
         return result
 
+# ── Radarr client ─────────────────────────────────────────────────────────────
+
+class RadarrClient:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.session  = requests.Session()
+        self.session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
+
+    def _request(self, method: str, path: str, silent: bool = False, **kwargs):
+        url = f"{self.base_url}/api/v3{path}"
+        try:
+            r = self.session.request(method, url, timeout=15, **kwargs)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.ConnectionError:
+            if not silent:
+                console.print(f"[red]Cannot reach Radarr at {self.base_url}[/red]")
+        except requests.exceptions.HTTPError as e:
+            if not silent:
+                console.print(f"[red]Radarr HTTP {e.response.status_code}:[/red] {path}")
+        return None
+
+    def get(self, path: str, silent: bool = False, **params):
+        r = self._request("GET", path, silent=silent, params=params)
+        if r is None: return {}
+        try: return r.json()
+        except Exception: return {}
+
+    def post(self, path: str, payload: dict) -> dict:
+        r = self._request("POST", path, json=payload)
+        if r is None: return {}
+        try: return r.json()
+        except Exception: return {}
+
+    def status(self)           -> dict: return self.get("/system/status") or {}
+    def movies(self)           -> list: r = self.get("/movie"); return r if isinstance(r, list) else []
+    def quality_profiles(self) -> list: r = self.get("/qualityprofile"); return r if isinstance(r, list) else []
+    def root_folders(self)     -> list: r = self.get("/rootfolder"); return r if isinstance(r, list) else []
+
+    def add_movie(self, tmdb_id: int, title: str, year: int,
+                  quality_profile_id: int, root_folder_path: str,
+                  monitored: bool = True, search_on_add: bool = False) -> dict:
+        return self.post("/movie", {
+            "tmdbId": tmdb_id, "title": title, "year": year,
+            "qualityProfileId": quality_profile_id, "rootFolderPath": root_folder_path,
+            "monitored": monitored, "addOptions": {"searchForMovie": search_on_add},
+        })
+
+# ── TMDB client ───────────────────────────────────────────────────────────────
+
+class TMDBClient:
+    BASE = "https://api.themoviedb.org/3"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.session = requests.Session()
+
+    def _get(self, path: str, **params) -> dict:
+        try:
+            r = self.session.get(f"{self.BASE}{path}",
+                                 params={"api_key": self.api_key, **params}, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ConnectionError:
+            console.print("[red]Cannot reach TMDB.[/red]"); return {}
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]TMDB HTTP {e.response.status_code}:[/red] {path}"); return {}
+
+    def list_movies(self, list_id: int) -> list[dict]:
+        def _parse(items):
+            return [{"tmdb_id": m["id"], "title": m["title"],
+                     "year": int((m.get("release_date") or "0")[:4] or 0)}
+                    for m in items]
+        first = self._get(f"/list/{list_id}")
+        results = _parse(first.get("items", []))
+        total_pages = first.get("total_pages", 1)
+        for page in range(2, total_pages + 1):
+            data = self._get(f"/list/{list_id}", page=page)
+            results.extend(_parse(data.get("items", [])))
+        return results
+
+    def search_person(self, name: str) -> list[dict]:
+        return self._get("/search/person", query=name).get("results", [])
+
+    def director_filmography(self, person_id: int) -> list[dict]:
+        data = self._get(f"/person/{person_id}/movie_credits")
+        return sorted(
+            [{"tmdb_id": m["id"], "title": m["title"],
+              "year": int((m.get("release_date") or "0")[:4] or 0)}
+             for m in data.get("crew", [])
+             if m.get("job") == "Director" and m.get("release_date")],
+            key=lambda x: x["year"],
+        )
+
+# ── TMDB named lists ──────────────────────────────────────────────────────────
+# Values are TMDB list IDs (user-created lists on themoviedb.org).
+# Verify at https://www.themoviedb.org/list/<id> if a list seems wrong.
+_TMDB_LISTS: dict[str, int] = {
+    "afi_top_100":        145406,  # AFI 100 Greatest American Films (2007 ed.)
+    "oscar_best_picture": 28,      # Academy Award Best Picture winners
+    "cannes_palme_dor":   229,     # Cannes Film Festival — Palme d'Or winners
+    "golden_globe_drama": 2469,    # Golden Globe Best Motion Picture — Drama
+    "imdb_top_250":       10265,   # IMDb Top 250 (community-maintained snapshot)
+}
+
 # ── Display helpers ───────────────────────────────────────────────────────────
 
 def print_libraries(libs: list):
@@ -702,6 +807,13 @@ _HELP_SECTIONS = [
         ("collections",     "[library_id]",                      "List collections (all or by library)"),
         ("collection",      "<key>",                             "Show items in a collection"),
     ]),
+    ("Radarr", [
+        ("radarr_status",   "",                                                "Radarr connection info, quality profiles, root folders"),
+        ("radarr_lists",    "",                                                "Show available named TMDB lists"),
+        ("radarr_list",     "<name>",                                          "Preview a list: title/year/in-Radarr/in-Plex (fetched live from TMDB)"),
+        ("radarr_import",   "<name> [--dry-run] [--profile <id>] [--search]", "Add missing movies from a named list to Radarr"),
+        ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
+    ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
         ("quit / exit",     "",                                  "Exit"),
@@ -829,6 +941,149 @@ class PlexShell(cmd.Cmd):
     def _parse_size_args(self, arg: str) -> tuple[int, str]:
         _, flags = parse_search_args(arg)
         return next((int(t) for t in arg.split() if t.isdigit()), 25), flags.get("library", "")
+
+    def _get_radarr_client(self) -> "RadarrClient | None":
+        cfg = load_config()
+        url = cfg.get("radarr_url", "") or os.environ.get("RADARR_URL", "")
+        key = cfg.get("radarr_api_key", "") or os.environ.get("RADARR_API_KEY", "")
+        if not url or not key:
+            console.print(Panel(
+                "Radarr URL and API key are required.\n\n"
+                "Find your API key: Radarr → Settings → General → Security → API Key",
+                title="[yellow]Radarr Setup[/yellow]", border_style="yellow"))
+            url = Prompt.ask("[yellow]Radarr URL[/yellow]", default="http://localhost:7878")
+            key = Prompt.ask("[yellow]Radarr API Key[/yellow]")
+            if not url or not key:
+                console.print("[red]Radarr URL and API key are required.[/red]"); return None
+            cfg["radarr_url"] = url; cfg["radarr_api_key"] = key; save_config(cfg)
+        rc = RadarrClient(url, key)
+        with console.status("Connecting to Radarr..."):
+            info = rc.status()
+        if not info:
+            return None
+        return rc
+
+    def _get_tmdb_client(self) -> "TMDBClient | None":
+        cfg = load_config()
+        key = cfg.get("tmdb_api_key", "") or os.environ.get("TMDB_API_KEY", "")
+        if not key:
+            console.print(Panel(
+                "A TMDB API key is required for director and list lookups.\n\n"
+                "Get a free key: themoviedb.org → Settings → API",
+                title="[yellow]TMDB Setup[/yellow]", border_style="yellow"))
+            key = Prompt.ask("[yellow]TMDB API Key[/yellow]")
+            if not key:
+                console.print("[red]TMDB API key is required.[/red]"); return None
+            cfg["tmdb_api_key"] = key; save_config(cfg)
+        return TMDBClient(key)
+
+    def _plex_movie_set(self) -> set[tuple[str, int]]:
+        result: set[tuple[str, int]] = set()
+        for lib in self.client.libraries():
+            if lib.get("type") != "movie":
+                continue
+            for item in self.client.library_contents(lib.get("key", "")):
+                t = (item.get("title") or "").lower().strip()
+                y = item.get("year") or 0
+                if t:
+                    result.add((t, y))
+        return result
+
+    def _in_plex(self, title: str, year: int, plex_set: set) -> bool:
+        t = title.lower().strip()
+        if (t, year) in plex_set:
+            return True
+        for pt, py in plex_set:
+            if abs(py - year) <= 1 and SequenceMatcher(None, t, pt).ratio() >= 0.90:
+                return True
+        return False
+
+    def _radarr_import_workflow(self, movies: list[dict], rc: "RadarrClient",
+                                dry_run: bool, profile_id: int | None,
+                                search: bool) -> None:
+        with console.status("Loading Radarr state..."):
+            existing_ids = {m.get("tmdbId") for m in rc.movies()}
+            profiles     = rc.quality_profiles()
+            folders      = rc.root_folders()
+        if not profiles:
+            console.print("[red]No quality profiles found in Radarr.[/red]"); return
+        if not folders:
+            console.print("[red]No root folders configured in Radarr.[/red]"); return
+
+        to_add = [m for m in movies if m.get("tmdb_id") not in existing_ids]
+        if not to_add:
+            console.print(f"[green]All {len(movies)} titles are already in Radarr.[/green]"); return
+
+        # Resolve quality profile
+        if profile_id is None:
+            if len(profiles) == 1:
+                profile_id = profiles[0]["id"]
+                console.print(f"[dim]Quality profile: {profiles[0]['name']}[/dim]")
+            else:
+                pt = Table(title="Quality Profiles", box=box.ROUNDED)
+                pt.add_column("ID", style="dim", width=6); pt.add_column("Name", style="bold cyan")
+                for p in profiles: pt.add_row(str(p["id"]), p["name"])
+                console.print(pt)
+                profile_id = int(Prompt.ask("Select profile ID",
+                                            choices=[str(p["id"]) for p in profiles],
+                                            default=str(profiles[0]["id"])))
+
+        # Resolve root folder
+        if len(folders) == 1:
+            root_folder = folders[0]["path"]
+            console.print(f"[dim]Root folder: {root_folder}[/dim]")
+        else:
+            ft = Table(title="Root Folders", box=box.ROUNDED)
+            ft.add_column("ID", style="dim", width=6); ft.add_column("Path", style="bold white")
+            for f in folders: ft.add_row(str(f["id"]), f["path"])
+            console.print(ft)
+            folder_map = {str(f["id"]): f["path"] for f in folders}
+            root_folder = folder_map[Prompt.ask("Select root folder ID",
+                                                choices=list(folder_map),
+                                                default=list(folder_map)[0])]
+
+        # Preview table
+        with console.status("Loading Plex movie library..."):
+            plex_set = self._plex_movie_set()
+        tag = "[dim][DRY RUN][/dim] " if dry_run else ""
+        t = Table(title=f"{tag}Adding {len(to_add)} of {len(movies)} movies", box=box.ROUNDED)
+        t.add_column("Title",   style="bold white", min_width=32)
+        t.add_column("Year",    width=6, justify="right")
+        t.add_column("TMDB ID", style="dim", width=9, justify="right")
+        t.add_column("In Plex", width=9, justify="center")
+        for m in to_add:
+            in_plex = self._in_plex(m["title"], m["year"], plex_set)
+            t.add_row(m["title"], str(m["year"]), str(m.get("tmdb_id", "")),
+                      "[green]yes[/green]" if in_plex else "[dim]no[/dim]")
+        console.print(t)
+
+        if dry_run:
+            console.print(f"[yellow]Dry run — {len(to_add)} movies would be added. "
+                          "Re-run without --dry-run to import.[/yellow]"); return
+
+        if Prompt.ask(f"Add {len(to_add)} movies to Radarr?",
+                      choices=["y", "n"], default="n") != "y":
+            console.print("[dim]Cancelled.[/dim]"); return
+
+        ok = fail = already = 0
+        for m in to_add:
+            with console.status(f"Adding [cyan]{m['title']}[/cyan]..."):
+                result = rc.add_movie(m["tmdb_id"], m["title"], m["year"],
+                                      profile_id, root_folder, search_on_add=search)
+            if result.get("id"):
+                ok += 1
+            elif "already" in str(result).lower() or result.get("isExisting"):
+                already += 1
+            else:
+                fail += 1
+                console.print(f"[red]Failed:[/red] {m['title']} — {result}")
+
+        parts = [f"[green]{ok} added[/green]"]
+        if already: parts.append(f"[dim]{already} already existed[/dim]")
+        if fail:    parts.append(f"[red]{fail} failed[/red]")
+        console.print(", ".join(parts) + ".")
+        if search and ok:
+            console.print("[dim]Radarr will search for files in the background.[/dim]")
 
     # ── Basic commands ────────────────────────────────────────────────────────
 
@@ -3203,6 +3458,169 @@ class PlexShell(cmd.Cmd):
             items = self.client.children(arg.strip())
         print_media_table(items, f"Collection {arg.strip()}")
 
+    # ── Radarr commands ───────────────────────────────────────────────────────
+
+    def do_radarr_status(self, _):
+        """radarr_status — Radarr connection info, quality profiles, and root folders"""
+        rc = self._get_radarr_client()
+        if not rc: return
+        with console.status("Fetching Radarr info..."):
+            info     = rc.status()
+            profiles = rc.quality_profiles()
+            folders  = rc.root_folders()
+        console.print(Panel(
+            f"[bold cyan]Version:[/bold cyan]  {info.get('version','—')}\n"
+            f"[bold cyan]URL:[/bold cyan]      {rc.base_url}\n"
+            f"[bold cyan]OS:[/bold cyan]       {info.get('osName','—')} {info.get('osVersion','—')}",
+            title="[bold white]Radarr[/bold white]", border_style="green"))
+        pt = Table(title="Quality Profiles", box=box.ROUNDED)
+        pt.add_column("ID", style="dim", width=6); pt.add_column("Name", style="bold cyan")
+        for p in profiles: pt.add_row(str(p.get("id","")), p.get("name",""))
+        console.print(pt)
+        ft = Table(title="Root Folders", box=box.ROUNDED)
+        ft.add_column("Path", style="bold white", min_width=28)
+        ft.add_column("Free Space", justify="right", width=12)
+        for f in folders: ft.add_row(f.get("path",""), format_size(f.get("freeSpace")))
+        console.print(ft)
+
+    def do_radarr_lists(self, _):
+        """radarr_lists — show available named TMDB lists"""
+        t = Table(title=f"Available Lists ({len(_TMDB_LISTS)})", box=box.ROUNDED)
+        t.add_column("Name",        style="bold cyan",  min_width=22)
+        t.add_column("TMDB List ID", style="dim",       width=14, justify="right")
+        for name, list_id in sorted(_TMDB_LISTS.items()):
+            t.add_row(name, str(list_id))
+        console.print(t)
+        console.print("[dim]Use [bold]radarr_list <name>[/bold] to preview, "
+                      "[bold]radarr_import <name>[/bold] to add to Radarr, "
+                      "or [bold]radarr_director <name>[/bold] for any director.[/dim]")
+
+    def do_radarr_list(self, arg: str):
+        """radarr_list <name> — preview a list: title/year/in-Radarr/in-Plex (fetched live from TMDB)"""
+        name = arg.strip()
+        if not name:
+            console.print("[yellow]Usage: radarr_list <name>[/yellow]")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+        if name not in _TMDB_LISTS:
+            console.print(f"[red]Unknown list:[/red] '{name}'")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+        tc = self._get_tmdb_client()
+        rc = self._get_radarr_client()
+        if not tc or not rc: return
+        with console.status(f"Fetching list from TMDB..."):
+            movies = tc.list_movies(_TMDB_LISTS[name])
+        if not movies:
+            console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
+        with console.status("Loading Radarr and Plex libraries..."):
+            radarr_ids = {m.get("tmdbId") for m in rc.movies()}
+            plex_set   = self._plex_movie_set()
+        missing = 0
+        t = Table(title=f"{name}  ({len(movies)} titles)", box=box.ROUNDED)
+        t.add_column("#",      style="dim",       width=4,  justify="right")
+        t.add_column("Title",  style="bold white", min_width=32)
+        t.add_column("Year",   width=6,            justify="right")
+        t.add_column("Radarr", width=9,            justify="center")
+        t.add_column("Plex",   width=9,            justify="center")
+        for i, m in enumerate(movies, 1):
+            in_r = m["tmdb_id"] in radarr_ids
+            in_p = self._in_plex(m["title"], m["year"], plex_set)
+            if not in_r: missing += 1
+            t.add_row(str(i), m["title"], str(m["year"]),
+                      "[green]yes[/green]" if in_r else "[red]no[/red]",
+                      "[green]yes[/green]" if in_p else "[dim]no[/dim]")
+        console.print(t)
+        console.print(f"[yellow]{missing} titles not in Radarr.[/yellow]  "
+                      f"[dim]Run [bold]radarr_import {name}[/bold] to add them.[/dim]")
+
+    def do_radarr_import(self, arg: str):
+        """radarr_import <name> [--dry-run] [--profile <id>] [--search] — add missing movies from a named list"""
+        try:
+            tokens = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            tokens = arg.strip().split()
+        if not tokens:
+            console.print("[yellow]Usage: radarr_import <name> [--dry-run] [--profile <id>] [--search][/yellow]")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+        name      = tokens[0]
+        dry_run   = "--dry-run" in tokens
+        search    = "--search"  in tokens
+        profile_id: int | None = None
+        if "--profile" in tokens:
+            idx = tokens.index("--profile")
+            if idx + 1 < len(tokens):
+                try: profile_id = int(tokens[idx + 1])
+                except ValueError:
+                    console.print("[red]--profile requires an integer ID.[/red]"); return
+        if name not in _TMDB_LISTS:
+            console.print(f"[red]Unknown list:[/red] '{name}'")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+        tc = self._get_tmdb_client()
+        rc = self._get_radarr_client()
+        if not tc or not rc: return
+        with console.status("Fetching list from TMDB..."):
+            movies = tc.list_movies(_TMDB_LISTS[name])
+        if not movies:
+            console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
+        self._radarr_import_workflow(movies, rc, dry_run, profile_id, search)
+
+    def do_radarr_director(self, arg: str):
+        """radarr_director <name> [--dry-run] [--profile <id>] [--search] — import a director's filmography"""
+        try:
+            tokens = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            tokens = arg.strip().split()
+        # Separate name tokens from flags
+        flag_starts = next((i for i, t in enumerate(tokens) if t.startswith("-")), len(tokens))
+        name_tokens = tokens[:flag_starts]
+        flag_tokens = tokens[flag_starts:]
+        if not name_tokens:
+            console.print("[yellow]Usage: radarr_director <name> [--dry-run] [--profile <id>] [--search][/yellow]")
+            return
+        name      = " ".join(name_tokens)
+        dry_run   = "--dry-run" in flag_tokens
+        search    = "--search"  in flag_tokens
+        profile_id: int | None = None
+        if "--profile" in flag_tokens:
+            idx = flag_tokens.index("--profile")
+            if idx + 1 < len(flag_tokens):
+                try: profile_id = int(flag_tokens[idx + 1])
+                except ValueError:
+                    console.print("[red]--profile requires an integer ID.[/red]"); return
+        tc = self._get_tmdb_client()
+        rc = self._get_radarr_client()
+        if not tc or not rc: return
+        with console.status(f"Searching TMDB for [cyan]{name}[/cyan]..."):
+            results = tc.search_person(name)
+        # Filter to directors/crew
+        directors = [r for r in results
+                     if r.get("known_for_department") in ("Directing", "Writing", "Production")
+                     or any(k.get("media_type") == "movie" for k in r.get("known_for", []))]
+        if not directors:
+            directors = results  # fall back to all results if no directors found
+        if not directors:
+            console.print(f"[yellow]No person found for '{name}'.[/yellow]"); return
+        if len(directors) == 1:
+            person = directors[0]
+            console.print(f"[dim]Found: {person.get('name')} (TMDB #{person.get('id')})[/dim]")
+        else:
+            pt = Table(title=f"Multiple matches for '{name}'", box=box.ROUNDED)
+            pt.add_column("#",        style="dim",       width=4)
+            pt.add_column("Name",     style="bold white", min_width=24)
+            pt.add_column("Known For", style="dim",      min_width=16)
+            pt.add_column("TMDB ID",  style="dim",       width=10, justify="right")
+            for i, p in enumerate(directors[:10], 1):
+                known = p.get("known_for_department", "—")
+                pt.add_row(str(i), p.get("name",""), known, str(p.get("id","")))
+            console.print(pt)
+            choice = Prompt.ask("Select #", choices=[str(i) for i in range(1, min(len(directors),10)+1)])
+            person = directors[int(choice) - 1]
+        with console.status(f"Fetching filmography for [cyan]{person.get('name')}[/cyan]..."):
+            movies = tc.director_filmography(person["id"])
+        if not movies:
+            console.print(f"[yellow]No directed films found for {person.get('name')}.[/yellow]"); return
+        console.print(f"[dim]{len(movies)} directed films found.[/dim]")
+        self._radarr_import_workflow(movies, rc, dry_run, profile_id, search)
+
     # ── Tab completion ────────────────────────────────────────────────────────
 
     def _cached_libs(self) -> list[dict]:
@@ -3279,6 +3697,22 @@ class PlexShell(cmd.Cmd):
         return []
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
+
+    def _cached_radarr_lists(self) -> list[str]:
+        if not hasattr(self, "_c_radarr_lists"):
+            self._c_radarr_lists = sorted(_TMDB_LISTS.keys())
+        return self._c_radarr_lists
+
+    def complete_radarr_list(self, text, line, begidx, endidx):
+        return [n for n in self._cached_radarr_lists() if n.startswith(text)]
+
+    def complete_radarr_import(self, text, line, begidx, endidx):
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return [n for n in self._cached_radarr_lists() if n.startswith(text)]
+        if text.startswith("-"):
+            return self._c_flags(text, ["--dry-run", "--profile", "--search"])
+        return []
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
