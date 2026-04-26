@@ -512,6 +512,10 @@ class RadarrClient:
             "monitored": monitored, "addOptions": {"searchForMovie": search_on_add},
         })
 
+    def search_movies(self, movie_ids: list[int]) -> dict:
+        """Trigger an immediate search for movies already in Radarr by their Radarr IDs."""
+        return self.post("/command", {"name": "MoviesSearch", "movieIds": movie_ids})
+
 # ── TMDB client ───────────────────────────────────────────────────────────────
 
 class TMDBClient:
@@ -813,6 +817,7 @@ _HELP_SECTIONS = [
         ("radarr_list",     "<name>",                                          "Preview a list: title/year/in-Radarr/in-Plex (fetched live from TMDB)"),
         ("radarr_import",   "<name> [--dry-run] [--profile <id>] [--search]", "Add missing movies from a named list to Radarr"),
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
+        ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -3621,6 +3626,194 @@ class PlexShell(cmd.Cmd):
         console.print(f"[dim]{len(movies)} directed films found.[/dim]")
         self._radarr_import_workflow(movies, rc, dry_run, profile_id, search)
 
+    def do_radarr_download(self, arg: str):
+        """radarr_download <name> [--dry-run] [--profile <id>] — download missing movies from a list"""
+        try:
+            tokens = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            tokens = arg.strip().split()
+        if not tokens:
+            console.print("[yellow]Usage: radarr_download <name> [--dry-run] [--profile <id>][/yellow]")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+        name       = tokens[0]
+        dry_run    = "--dry-run" in tokens
+        # Optional pre-selected movie number: radarr_download afi_top_100 5
+        preselect  = next((t for t in tokens[1:] if t.isdigit()), None)
+        profile_id: int | None = None
+        if "--profile" in tokens:
+            idx = tokens.index("--profile")
+            if idx + 1 < len(tokens):
+                try: profile_id = int(tokens[idx + 1])
+                except ValueError:
+                    console.print("[red]--profile requires an integer ID.[/red]"); return
+        if name not in _TMDB_LISTS:
+            console.print(f"[red]Unknown list:[/red] '{name}'")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+
+        tc = self._get_tmdb_client()
+        rc = self._get_radarr_client()
+        if not tc or not rc: return
+
+        with console.status("Fetching list from TMDB..."):
+            movies = tc.list_movies(_TMDB_LISTS[name])
+        if not movies:
+            console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
+
+        with console.status("Loading Radarr and Plex libraries..."):
+            radarr_by_tmdb = {m.get("tmdbId"): m for m in rc.movies()}
+            plex_set        = self._plex_movie_set()
+
+        # Classify every movie in the list
+        STATUS_LABEL = {
+            "in_plex":        "[green]in Plex[/green]",
+            "has_file":       "[green]downloaded[/green]",
+            "missing":        "[yellow]missing[/yellow]",
+            "not_in_radarr":  "[cyan]not in Radarr[/cyan]",
+        }
+        rows = []
+        for m in movies:
+            rm = radarr_by_tmdb.get(m["tmdb_id"])
+            if self._in_plex(m["title"], m["year"], plex_set):
+                status = "in_plex"
+            elif rm is None:
+                status = "not_in_radarr"
+            elif rm.get("hasFile"):
+                status = "has_file"
+            else:
+                status = "missing"
+            rows.append({**m, "radarr": rm, "status": status})
+
+        # Downloadable = missing or not_in_radarr
+        downloadable = [r for r in rows if r["status"] in ("missing", "not_in_radarr")]
+
+        # Assign a selection number only to downloadable entries
+        dl_num: dict[int, int] = {}   # index-in-rows → selection number
+        for sel_n, r in enumerate(downloadable, 1):
+            dl_num[id(r)] = sel_n
+
+        # Full list table
+        t = Table(title=f"{name}  ({len(rows)} titles)", box=box.ROUNDED)
+        t.add_column("#",       style="dim",       width=5,  justify="right")
+        t.add_column("Title",   style="bold white", min_width=32)
+        t.add_column("Year",    width=6,            justify="right")
+        t.add_column("In Plex", width=9,            justify="center")
+        t.add_column("Status",  width=16)
+        for r in rows:
+            num = dl_num.get(id(r), "")
+            t.add_row(
+                str(num) if num else "[dim]—[/dim]",
+                r["title"], str(r["year"]),
+                "[green]yes[/green]" if r["status"] == "in_plex" else "[dim]no[/dim]",
+                STATUS_LABEL[r["status"]],
+            )
+        console.print(t)
+
+        # Summary panel
+        from collections import Counter as _C
+        counts = _C(r["status"] for r in rows)
+        console.print(Panel(
+            f"[green]In Plex:[/green]       {counts['in_plex']}  → skipped\n"
+            f"[green]Downloaded:[/green]    {counts['has_file']}  → skipped\n"
+            f"[yellow]Missing:[/yellow]       {counts['missing']}  → will search\n"
+            f"[cyan]Not in Radarr:[/cyan] {counts['not_in_radarr']}  → will add and search",
+            title=f"[bold white]{name}[/bold white]", border_style="cyan"))
+
+        if not downloadable:
+            console.print("[green]Nothing to download.[/green]"); return
+
+        # Selection — use preselected number if given on command line, else prompt
+        # (done before dry-run exit so --dry-run shows exactly what would be downloaded)
+        if preselect:
+            sel_input = preselect
+        elif dry_run:
+            sel_input = ""   # dry-run with no number = show all
+        else:
+            sel_input = Prompt.ask(
+                f"Enter numbers to download (e.g. [bold]1 3 5-10[/bold]), "
+                f"or blank for all [bold]{len(downloadable)}[/bold] missing",
+                default="",
+            ).strip()
+
+        if sel_input:
+            selected_nums: set[int] = set()
+            for part in sel_input.split():
+                if "-" in part:
+                    try:
+                        a, b = part.split("-", 1)
+                        selected_nums.update(range(int(a), int(b) + 1))
+                    except ValueError:
+                        console.print(f"[yellow]Skipping invalid range: {part}[/yellow]")
+                else:
+                    try: selected_nums.add(int(part))
+                    except ValueError:
+                        console.print(f"[yellow]Skipping invalid number: {part}[/yellow]")
+            selected = [downloadable[n - 1] for n in sorted(selected_nums)
+                        if 1 <= n <= len(downloadable)]
+        else:
+            selected = downloadable
+
+        if not selected:
+            console.print("[dim]Nothing selected.[/dim]"); return
+
+        if dry_run:
+            for r in selected:
+                console.print(f"  [dim]would download:[/dim] {r['title']} ({r['year']})")
+            console.print(f"[yellow]Dry run — {len(selected)} movie(s) would be downloaded. "
+                          "Re-run without --dry-run to execute.[/yellow]"); return
+
+        to_search = [(r, r["radarr"]["id"]) for r in selected if r["status"] == "missing"]
+        to_add    = [r for r in selected if r["status"] == "not_in_radarr"]
+
+        # 1. Trigger search for movies already in Radarr
+        if to_search:
+            radarr_ids = [rm_id for _, rm_id in to_search]
+            rc.search_movies(radarr_ids)
+            console.print(f"[green]Search triggered[/green] for {len(to_search)} existing movies.")
+
+        # 2. Add + search movies not in Radarr
+        if to_add:
+            profiles = rc.quality_profiles()
+            folders  = rc.root_folders()
+            if not profiles or not folders:
+                console.print("[red]Cannot add movies — check Radarr quality profiles and root folders.[/red]")
+                return
+            if profile_id is None:
+                if len(profiles) == 1:
+                    profile_id = profiles[0]["id"]
+                    console.print(f"[dim]Quality profile: {profiles[0]['name']}[/dim]")
+                else:
+                    pt = Table(title="Quality Profiles", box=box.ROUNDED)
+                    pt.add_column("ID", style="dim", width=6); pt.add_column("Name", style="bold cyan")
+                    for p in profiles: pt.add_row(str(p["id"]), p["name"])
+                    console.print(pt)
+                    profile_id = int(Prompt.ask("Select profile ID",
+                                                choices=[str(p["id"]) for p in profiles],
+                                                default=str(profiles[0]["id"])))
+            if len(folders) == 1:
+                root_folder = folders[0]["path"]
+            else:
+                ft = Table(title="Root Folders", box=box.ROUNDED)
+                ft.add_column("ID", style="dim", width=6); ft.add_column("Path", style="bold white")
+                for f in folders: ft.add_row(str(f["id"]), f["path"])
+                console.print(ft)
+                folder_map  = {str(f["id"]): f["path"] for f in folders}
+                root_folder = folder_map[Prompt.ask("Select root folder ID",
+                                                    choices=list(folder_map),
+                                                    default=list(folder_map)[0])]
+            ok = fail = 0
+            for r in to_add:
+                with console.status(f"Adding [cyan]{r['title']}[/cyan]..."):
+                    result = rc.add_movie(r["tmdb_id"], r["title"], r["year"],
+                                         profile_id, root_folder, search_on_add=True)
+                if result.get("id"): ok += 1
+                else:
+                    fail += 1
+                    console.print(f"[red]Failed:[/red] {r['title']} — {result}")
+            console.print(f"[green]{ok} added and queued for search.[/green]"
+                          + (f" [red]{fail} failed.[/red]" if fail else ""))
+
+        console.print("[dim]Radarr is searching in the background.[/dim]")
+
     # ── Tab completion ────────────────────────────────────────────────────────
 
     def _cached_libs(self) -> list[dict]:
@@ -3712,6 +3905,14 @@ class PlexShell(cmd.Cmd):
             return [n for n in self._cached_radarr_lists() if n.startswith(text)]
         if text.startswith("-"):
             return self._c_flags(text, ["--dry-run", "--profile", "--search"])
+        return []
+
+    def complete_radarr_download(self, text, line, begidx, endidx):
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return [n for n in self._cached_radarr_lists() if n.startswith(text)]
+        if text.startswith("-"):
+            return self._c_flags(text, ["--dry-run", "--profile"])
         return []
 
     def complete_refresh(self, text, line, begidx, *_):
