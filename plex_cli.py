@@ -39,6 +39,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 BASE_URL = "http://opus2.local:32400"
 CONFIG_FILE = Path.home() / ".plex_cli.json"
+LISTS_FILE  = Path.home() / ".plex_cli_lists.json"
 PLEX_HEADERS = {
     "X-Plex-Client-Identifier": "plex-cli-interactive",
     "X-Plex-Product": "Plex CLI",
@@ -549,6 +550,10 @@ class TMDBClient:
             results.extend(_parse(data.get("items", [])))
         return results
 
+    def list_info(self, list_id: int) -> dict:
+        """Fetch metadata for a TMDB list (name, description, item_count, created_by)."""
+        return self._get(f"/list/{list_id}") or {}
+
     def search_person(self, name: str) -> list[dict]:
         return self._get("/search/person", query=name).get("results", [])
 
@@ -563,15 +568,29 @@ class TMDBClient:
         )
 
 # ── TMDB named lists ──────────────────────────────────────────────────────────
-# Values are TMDB list IDs (user-created lists on themoviedb.org).
-# Verify at https://www.themoviedb.org/list/<id> if a list seems wrong.
-_TMDB_LISTS: dict[str, int] = {
+
+_DEFAULT_TMDB_LISTS: dict[str, int] = {
     "afi_top_100":        145406,  # AFI 100 Greatest American Films (2007 ed.)
     "oscar_best_picture": 28,      # Academy Award Best Picture winners
     "cannes_palme_dor":   229,     # Cannes Film Festival — Palme d'Or winners
     "golden_globe_drama": 2469,    # Golden Globe Best Motion Picture — Drama
     "imdb_top_250":       10265,   # IMDb Top 250 (community-maintained snapshot)
 }
+
+def load_lists() -> dict[str, int]:
+    """Load TMDB lists from LISTS_FILE; fall back to defaults if missing."""
+    if not LISTS_FILE.exists():
+        return dict(_DEFAULT_TMDB_LISTS)
+    try:
+        data = json.loads(LISTS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {k: int(v) for k, v in data.items()}
+    except Exception:
+        console.print(f"[yellow]Warning: could not parse {LISTS_FILE} — using defaults.[/yellow]")
+    return dict(_DEFAULT_TMDB_LISTS)
+
+def save_lists(lists: dict[str, int]) -> None:
+    LISTS_FILE.write_text(json.dumps(lists, indent=2), encoding="utf-8")
 
 # ── Display helpers ───────────────────────────────────────────────────────────
 
@@ -813,8 +832,11 @@ _HELP_SECTIONS = [
     ]),
     ("Radarr", [
         ("radarr_status",   "",                                                "Radarr connection info, quality profiles, root folders"),
-        ("radarr_lists",    "",                                                "Show available named TMDB lists"),
-        ("radarr_list",     "<name>",                                          "Preview a list: title/year/in-Radarr/in-Plex (fetched live from TMDB)"),
+        ("radarr_lists",       "",                                             "Show available named TMDB lists"),
+        ("radarr_list_info",   "<id|url>",                                       "Show name, description and item count for any TMDB list ID or URL"),
+        ("radarr_list_add",    "<name> <id|url>",                              "Add or update a named list in the config"),
+        ("radarr_list_remove", "<name>",                                       "Remove a named list from the config"),
+        ("radarr_list",        "<name>",                                       "Preview a list: title/year/in-Radarr/in-Plex (fetched live from TMDB)"),
         ("radarr_import",   "<name> [--dry-run] [--profile <id>] [--search]", "Add missing movies from a named list to Radarr"),
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
@@ -3490,15 +3512,90 @@ class PlexShell(cmd.Cmd):
 
     def do_radarr_lists(self, _):
         """radarr_lists — show available named TMDB lists"""
-        t = Table(title=f"Available Lists ({len(_TMDB_LISTS)})", box=box.ROUNDED)
-        t.add_column("Name",        style="bold cyan",  min_width=22)
+        lists = load_lists()
+        t = Table(title=f"Available Lists ({len(lists)})", box=box.ROUNDED)
+        t.add_column("Name",         style="bold cyan", min_width=22)
         t.add_column("TMDB List ID", style="dim",       width=14, justify="right")
-        for name, list_id in sorted(_TMDB_LISTS.items()):
-            t.add_row(name, str(list_id))
+        for n, list_id in sorted(lists.items()):
+            t.add_row(n, str(list_id))
         console.print(t)
+        console.print(f"[dim]Config: {LISTS_FILE}[/dim]")
         console.print("[dim]Use [bold]radarr_list <name>[/bold] to preview, "
+                      "[bold]radarr_list_add <name> <id>[/bold] to add a list, "
                       "[bold]radarr_import <name>[/bold] to add to Radarr, "
                       "or [bold]radarr_director <name>[/bold] for any director.[/dim]")
+
+    def do_radarr_list_add(self, arg: str):
+        """radarr_list_add <name> <tmdb_list_id|url> — add or update a named TMDB list in the config"""
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            console.print("[yellow]Usage: radarr_list_add <name> <tmdb_list_id_or_url>[/yellow]")
+            console.print(f"[dim]Lists are saved to {LISTS_FILE}[/dim]"); return
+        name = parts[0]
+        raw_id = parts[1]
+        # Accept a full TMDB URL or a bare integer ID
+        m = re.search(r"/list/(\d+)", raw_id)
+        if m:
+            list_id = int(m.group(1))
+        else:
+            try:
+                list_id = int(raw_id)
+            except ValueError:
+                console.print("[red]Second argument must be a TMDB list ID or URL.[/red]"); return
+        lists = load_lists()
+        existed = name in lists
+        lists[name] = list_id
+        save_lists(lists)
+        action = "Updated" if existed else "Added"
+        console.print(f"[green]{action}:[/green] [bold]{name}[/bold] → TMDB list {list_id}")
+        console.print(f"[dim]Saved to {LISTS_FILE}[/dim]")
+        if hasattr(self, "_c_radarr_lists"):
+            del self._c_radarr_lists  # invalidate tab-completion cache
+
+    def do_radarr_list_remove(self, arg: str):
+        """radarr_list_remove <name> — remove a named list from the config"""
+        name = arg.strip()
+        if not name:
+            console.print("[yellow]Usage: radarr_list_remove <name>[/yellow]"); return
+        lists = load_lists()
+        if name not in lists:
+            console.print(f"[yellow]'{name}' not found in list config.[/yellow]"); return
+        del lists[name]
+        save_lists(lists)
+        console.print(f"[green]Removed:[/green] [bold]{name}[/bold]")
+        if hasattr(self, "_c_radarr_lists"):
+            del self._c_radarr_lists
+
+    def do_radarr_list_info(self, arg: str):
+        """radarr_list_info <id|url> — show name, description and item count for any TMDB list"""
+        raw = arg.strip()
+        if not raw:
+            console.print("[yellow]Usage: radarr_list_info <tmdb_list_id_or_url>[/yellow]")
+            console.print("[dim]Example: radarr_list_info 145406[/dim]")
+            console.print("[dim]Example: radarr_list_info https://www.themoviedb.org/list/145406-afi[/dim]")
+            return
+        # Accept a full TMDB URL or a bare ID
+        m = re.search(r"/list/(\d+)", raw)
+        list_id = int(m.group(1)) if m else None
+        if not list_id:
+            try: list_id = int(raw)
+            except ValueError:
+                console.print(f"[red]Cannot parse list ID from:[/red] {raw}"); return
+        tc = self._get_tmdb_client()
+        if not tc: return
+        with console.status(f"Fetching TMDB list {list_id}..."):
+            info = tc.list_info(list_id)
+        if not info:
+            console.print(f"[red]List {list_id} not found on TMDB.[/red]"); return
+        console.print(Panel(
+            f"[bold cyan]Name:[/bold cyan]        {info.get('name','—')}\n"
+            f"[bold cyan]Created by:[/bold cyan]  {info.get('created_by','—')}\n"
+            f"[bold cyan]Items:[/bold cyan]        {info.get('item_count', info.get('total_results','—'))}\n"
+            f"[bold cyan]Description:[/bold cyan] {info.get('description','—') or '—'}\n"
+            f"[bold cyan]TMDB ID:[/bold cyan]     {list_id}",
+            title="[bold white]TMDB List Info[/bold white]", border_style="cyan"))
+        safe_name = re.sub(r"[^a-z0-9]+", "_", info.get("name","list").lower()).strip("_")
+        console.print(f"[dim]To add: [bold]radarr_list_add {safe_name} {list_id}[/bold][/dim]")
 
     def do_radarr_list(self, arg: str):
         """radarr_list <name> — preview a list: title/year/in-Radarr/in-Plex (fetched live from TMDB)"""
@@ -3506,14 +3603,14 @@ class PlexShell(cmd.Cmd):
         if not name:
             console.print("[yellow]Usage: radarr_list <name>[/yellow]")
             console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
-        if name not in _TMDB_LISTS:
+        if name not in load_lists():
             console.print(f"[red]Unknown list:[/red] '{name}'")
             console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
         tc = self._get_tmdb_client()
         rc = self._get_radarr_client()
         if not tc or not rc: return
         with console.status(f"Fetching list from TMDB..."):
-            movies = tc.list_movies(_TMDB_LISTS[name])
+            movies = tc.list_movies(load_lists()[name])
         if not movies:
             console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
         with console.status("Loading Radarr and Plex libraries..."):
@@ -3556,14 +3653,14 @@ class PlexShell(cmd.Cmd):
                 try: profile_id = int(tokens[idx + 1])
                 except ValueError:
                     console.print("[red]--profile requires an integer ID.[/red]"); return
-        if name not in _TMDB_LISTS:
+        if name not in load_lists():
             console.print(f"[red]Unknown list:[/red] '{name}'")
             console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
         tc = self._get_tmdb_client()
         rc = self._get_radarr_client()
         if not tc or not rc: return
         with console.status("Fetching list from TMDB..."):
-            movies = tc.list_movies(_TMDB_LISTS[name])
+            movies = tc.list_movies(load_lists()[name])
         if not movies:
             console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
         self._radarr_import_workflow(movies, rc, dry_run, profile_id, search)
@@ -3646,7 +3743,7 @@ class PlexShell(cmd.Cmd):
                 try: profile_id = int(tokens[idx + 1])
                 except ValueError:
                     console.print("[red]--profile requires an integer ID.[/red]"); return
-        if name not in _TMDB_LISTS:
+        if name not in load_lists():
             console.print(f"[red]Unknown list:[/red] '{name}'")
             console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
 
@@ -3655,7 +3752,7 @@ class PlexShell(cmd.Cmd):
         if not tc or not rc: return
 
         with console.status("Fetching list from TMDB..."):
-            movies = tc.list_movies(_TMDB_LISTS[name])
+            movies = tc.list_movies(load_lists()[name])
         if not movies:
             console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
 
@@ -3893,7 +3990,7 @@ class PlexShell(cmd.Cmd):
 
     def _cached_radarr_lists(self) -> list[str]:
         if not hasattr(self, "_c_radarr_lists"):
-            self._c_radarr_lists = sorted(_TMDB_LISTS.keys())
+            self._c_radarr_lists = sorted(load_lists().keys())
         return self._c_radarr_lists
 
     def complete_radarr_list(self, text, line, begidx, endidx):
