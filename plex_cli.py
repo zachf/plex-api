@@ -570,11 +570,15 @@ class TMDBClient:
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
 _DEFAULT_TMDB_LISTS: dict[str, int] = {
-    "afi_top_100":        145406,  # AFI 100 Greatest American Films (2007 ed.)
-    "oscar_best_picture": 28,      # Academy Award Best Picture winners
-    "cannes_palme_dor":   229,     # Cannes Film Festival — Palme d'Or winners
-    "golden_globe_drama": 2469,    # Golden Globe Best Motion Picture — Drama
-    "imdb_top_250":       10265,   # IMDb Top 250 (community-maintained snapshot)
+    "afi_top_100":          145406,  # AFI 100 Greatest American Films (2007 ed.)
+    "oscar_best_picture":   28,      # Academy Award Best Picture winners
+    "oscar_foreign_film":   264,     # Academy Award Best Foreign Language Film
+    "cannes_palme_dor":     229,     # Cannes Film Festival — Palme d'Or winners
+    "golden_globe_drama":   2469,    # Golden Globe Best Motion Picture — Drama
+    "bafta_best_film":      3681,    # BAFTA Best Film winners
+    "bfi_top_100":          6221,    # BFI (Sight & Sound) Top 100 Greatest Films
+    "rotten_tomatoes_100":  3697,    # Rotten Tomatoes Top 100 Movies of All Time
+    "imdb_top_250":         10265,   # IMDb Top 250 (community-maintained snapshot)
 }
 
 def load_lists() -> dict[str, int]:
