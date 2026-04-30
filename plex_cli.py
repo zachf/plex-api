@@ -844,6 +844,7 @@ _HELP_SECTIONS = [
         ("radarr_import",   "<name> [--dry-run] [--profile <id>] [--search]", "Add missing movies from a named list to Radarr"),
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
+        ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -3862,16 +3863,18 @@ class PlexShell(cmd.Cmd):
             console.print(f"[yellow]Dry run — {len(selected)} movie(s) would be downloaded. "
                           "Re-run without --dry-run to execute.[/yellow]"); return
 
+        self._execute_radarr_download(selected, rc, profile_id)
+
+    def _execute_radarr_download(self, selected: list[dict], rc: "RadarrClient",
+                                 profile_id: "int | None" = None) -> None:
+        """Trigger Radarr searches / adds for a pre-filtered list of movie dicts."""
         to_search = [(r, r["radarr"]["id"]) for r in selected if r["status"] == "missing"]
         to_add    = [r for r in selected if r["status"] == "not_in_radarr"]
 
-        # 1. Trigger search for movies already in Radarr
         if to_search:
-            radarr_ids = [rm_id for _, rm_id in to_search]
-            rc.search_movies(radarr_ids)
+            rc.search_movies([rm_id for _, rm_id in to_search])
             console.print(f"[green]Search triggered[/green] for {len(to_search)} existing movies.")
 
-        # 2. Add + search movies not in Radarr
         if to_add:
             profiles = rc.quality_profiles()
             folders  = rc.root_folders()
@@ -3914,6 +3917,90 @@ class PlexShell(cmd.Cmd):
                           + (f" [red]{fail} failed.[/red]" if fail else ""))
 
         console.print("[dim]Radarr is searching in the background.[/dim]")
+
+    def do_radarr_pick(self, arg: str):
+        """radarr_pick <name> [--profile <id>] — interactively select movies to download"""
+        try:
+            import questionary
+        except ImportError:
+            console.print("[red]questionary not installed.[/red]  "
+                          "Run: [bold]pip install questionary[/bold]"); return
+
+        try:
+            tokens = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            tokens = arg.strip().split()
+        if not tokens:
+            console.print("[yellow]Usage: radarr_pick <name> [--profile <id>][/yellow]")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+
+        name       = tokens[0]
+        profile_id: int | None = None
+        if "--profile" in tokens:
+            idx = tokens.index("--profile")
+            if idx + 1 < len(tokens):
+                try: profile_id = int(tokens[idx + 1])
+                except ValueError:
+                    console.print("[red]--profile requires an integer ID.[/red]"); return
+
+        lists = load_lists()
+        if name not in lists:
+            console.print(f"[red]Unknown list:[/red] '{name}'")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+
+        tc = self._get_tmdb_client()
+        rc = self._get_radarr_client()
+        if not tc or not rc: return
+
+        with console.status("Fetching list from TMDB..."):
+            movies = tc.list_movies(lists[name])
+        if not movies:
+            console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
+
+        with console.status("Loading Radarr and Plex libraries..."):
+            radarr_by_tmdb = {m.get("tmdbId"): m for m in rc.movies()}
+            plex_set        = self._plex_movie_set()
+
+        rows = []
+        for m in movies:
+            rm = radarr_by_tmdb.get(m["tmdb_id"])
+            if self._in_plex(m["title"], m["year"], plex_set):
+                status = "in_plex"
+            elif rm is None:
+                status = "not_in_radarr"
+            elif rm.get("hasFile"):
+                status = "has_file"
+            else:
+                status = "missing"
+            rows.append({**m, "radarr": rm, "status": status})
+
+        downloadable = [r for r in rows if r["status"] in ("missing", "not_in_radarr")]
+        if not downloadable:
+            console.print("[green]Nothing to download — all movies are in Plex or already downloaded.[/green]")
+            return
+
+        STATUS_TAG = {"missing": "missing", "not_in_radarr": "not in Radarr"}
+        choices = [
+            questionary.Choice(
+                title=f"{r['title']} ({r['year']})  [{STATUS_TAG[r['status']]}]",
+                value=r,
+            )
+            for r in downloadable
+        ]
+
+        console.print(f"\n[bold]{name}[/bold]  —  {len(downloadable)} downloadable movies")
+        console.print("[dim]↑↓ scroll · Space toggle · a select all · enter confirm · ctrl-c cancel[/dim]\n")
+
+        selected = questionary.checkbox(
+            f"Select movies to download:",
+            choices=choices,
+            instruction=" ",
+        ).ask()
+
+        if not selected:
+            console.print("[dim]Nothing selected.[/dim]"); return
+
+        self._execute_radarr_download(selected, rc, profile_id)
 
     # ── Tab completion ────────────────────────────────────────────────────────
 
@@ -4014,6 +4101,14 @@ class PlexShell(cmd.Cmd):
             return [n for n in self._cached_radarr_lists() if n.startswith(text)]
         if text.startswith("-"):
             return self._c_flags(text, ["--dry-run", "--profile"])
+        return []
+
+    def complete_radarr_pick(self, text, line, begidx, endidx):
+        tokens = line[:begidx].split()
+        if len(tokens) == 1:
+            return [n for n in self._cached_radarr_lists() if n.startswith(text)]
+        if text.startswith("-"):
+            return self._c_flags(text, ["--profile"])
         return []
 
     def complete_refresh(self, text, line, begidx, *_):

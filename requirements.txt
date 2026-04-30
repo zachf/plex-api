@@ -1,5 +1,6 @@
 requests>=2.31
 rich>=13.0
+questionary>=2.0
 
 # Tab completion on Windows requires a readline-compatible library.
 # Install one of the following if Tab doesn't complete commands:
