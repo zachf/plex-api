@@ -845,6 +845,8 @@ _HELP_SECTIONS = [
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
         ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
+        ("radarr_upgrade", "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
+        ("radarr_sync",    "",                                                "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -4001,6 +4003,201 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Nothing selected.[/dim]"); return
 
         self._execute_radarr_download(selected, rc, profile_id)
+
+    def do_radarr_upgrade(self, arg: str):
+        """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        with console.status("Loading Radarr library..."):
+            profiles_raw = rc.quality_profiles()
+            movies       = rc.movies()
+
+        # Build quality_id → {name, resolution} from all profiles (handles nested groups)
+        qual_map: dict[int, dict] = {}
+        def _extract_quals(items: list) -> None:
+            for item in items:
+                if item.get("quality"):
+                    q = item["quality"]
+                    qual_map[q["id"]] = {"name": q.get("name", "?"), "res": q.get("resolution", 0)}
+                _extract_quals(item.get("items", []))
+        for p in profiles_raw:
+            _extract_quals(p.get("items", []))
+
+        # Build profile_id → {name, cutoff_id, cutoff_res, cutoff_name, upgrade_allowed}
+        profile_map: dict[int, dict] = {}
+        for p in profiles_raw:
+            cid = p.get("cutoff", 0)
+            cq  = qual_map.get(cid, {})
+            profile_map[p["id"]] = {
+                "name":            p["name"],
+                "cutoff_id":       cid,
+                "cutoff_res":      cq.get("res", 0),
+                "cutoff_name":     cq.get("name", "?"),
+                "upgrade_allowed": p.get("upgradeAllowed", True),
+            }
+
+        upgradeable = []
+        for m in movies:
+            if not m.get("hasFile"): continue
+            prof = profile_map.get(m.get("qualityProfileId", 0), {})
+            if not prof.get("upgrade_allowed", True): continue
+            mf        = m.get("movieFile") or {}
+            curr_q    = (mf.get("quality") or {}).get("quality") or {}
+            curr_res  = curr_q.get("resolution", 0)
+            curr_name = curr_q.get("name", "?")
+            cutoff_res = prof.get("cutoff_res", 0)
+            if cutoff_res > 0 and curr_res < cutoff_res:
+                upgradeable.append({
+                    "id":         m["id"],
+                    "title":      m.get("title", ""),
+                    "year":       m.get("year", 0),
+                    "current":    curr_name,
+                    "current_res": curr_res,
+                    "target":     prof["cutoff_name"],
+                    "target_res": cutoff_res,
+                    "profile":    prof["name"],
+                })
+        upgradeable.sort(key=lambda x: (-(x["target_res"] - x["current_res"]), x["title"]))
+
+        if not upgradeable:
+            console.print("[green]All downloaded movies meet their quality profile cutoff.[/green]"); return
+
+        t = Table(title=f"Movies below quality cutoff  ({len(upgradeable)})", box=box.ROUNDED)
+        t.add_column("#",       style="dim",       width=4,  justify="right")
+        t.add_column("Title",   style="bold white", min_width=30)
+        t.add_column("Year",    width=6,            justify="right")
+        t.add_column("Have",    width=16)
+        t.add_column("Want",    width=16)
+        t.add_column("Profile", width=14,           style="dim")
+        for i, r in enumerate(upgradeable, 1):
+            t.add_row(str(i), r["title"], str(r["year"]),
+                      f"[yellow]{r['current']}[/yellow]",
+                      f"[cyan]{r['target']}[/cyan]",
+                      r["profile"])
+        console.print(t)
+
+        try:
+            import questionary
+            console.print(f"\n[dim]↑↓ scroll · Space toggle · a select all · Enter confirm · Ctrl-C cancel[/dim]\n")
+            choices = [
+                questionary.Choice(
+                    title=f"{r['title']} ({r['year']})  {r['current']} → {r['target']}",
+                    value=r,
+                )
+                for r in upgradeable
+            ]
+            selected = questionary.checkbox(
+                "Select movies to trigger upgrade search:", choices=choices, instruction=" ",
+            ).ask()
+        except ImportError:
+            sel_input = Prompt.ask(
+                f"Enter numbers to search (e.g. [bold]1 3 5-10[/bold]), or blank for all {len(upgradeable)}",
+                default="",
+            ).strip()
+            if sel_input:
+                selected_nums: set[int] = set()
+                for part in sel_input.split():
+                    if "-" in part:
+                        try:
+                            a, b = part.split("-", 1)
+                            selected_nums.update(range(int(a), int(b) + 1))
+                        except ValueError: pass
+                    else:
+                        try: selected_nums.add(int(part))
+                        except ValueError: pass
+                selected = [upgradeable[n - 1] for n in sorted(selected_nums)
+                            if 1 <= n <= len(upgradeable)]
+            else:
+                selected = upgradeable
+
+        if not selected:
+            console.print("[dim]Nothing selected.[/dim]"); return
+
+        rc.search_movies([r["id"] for r in selected])
+        console.print(f"[green]Upgrade search triggered[/green] for {len(selected)} movie(s).")
+        console.print("[dim]Radarr will replace files when a better version is found.[/dim]")
+
+    def do_radarr_sync(self, _arg: str):
+        """radarr_sync — find movies downloaded in Radarr but missing from Plex, and vice versa"""
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        with console.status("Loading Radarr and Plex libraries..."):
+            radarr_movies = rc.movies()
+            plex_set      = self._plex_movie_set()
+
+            plex_movies: list[dict] = []
+            for lib in self.client.libraries():
+                if lib.get("type") != "movie": continue
+                for item in self.client.library_contents(lib.get("key", "")):
+                    plex_movies.append({
+                        "title":   item.get("title", ""),
+                        "year":    item.get("year", 0),
+                        "library": lib.get("title", ""),
+                    })
+
+        # ── Section 1: Downloaded in Radarr but not indexed in Plex ──────────
+        radarr_not_plex = sorted(
+            [m for m in radarr_movies
+             if m.get("hasFile") and not self._in_plex(m.get("title", ""), m.get("year", 0), plex_set)],
+            key=lambda x: x.get("title", ""),
+        )
+
+        # ── Section 2: In Plex but not monitored by Radarr ───────────────────
+        # Build year-bucketed lookup for efficient fuzzy matching
+        from collections import defaultdict as _dd
+        radarr_by_year: dict[int, set[str]] = _dd(set)
+        for m in radarr_movies:
+            radarr_by_year[m.get("year", 0)].add(m.get("title", "").lower().strip())
+
+        def _in_radarr(title: str, year: int) -> bool:
+            t = title.lower().strip()
+            for y in (year - 1, year, year + 1):
+                for rt in radarr_by_year.get(y, set()):
+                    if t == rt or SequenceMatcher(None, t, rt).ratio() >= 0.90:
+                        return True
+            return False
+
+        plex_not_radarr = sorted(
+            [pm for pm in plex_movies if not _in_radarr(pm["title"], pm["year"])],
+            key=lambda x: x.get("title", ""),
+        )
+
+        # ── Display ───────────────────────────────────────────────────────────
+        console.print()
+        if radarr_not_plex:
+            t1 = Table(
+                title=f"[yellow]Downloaded in Radarr — not indexed in Plex[/yellow]  "
+                      f"({len(radarr_not_plex)})",
+                box=box.ROUNDED,
+            )
+            t1.add_column("Title",    style="bold white", min_width=30)
+            t1.add_column("Year",     width=6, justify="right")
+            t1.add_column("File path", style="dim", min_width=30)
+            for m in radarr_not_plex:
+                path = (m.get("movieFile") or {}).get("path") or "—"
+                t1.add_row(m.get("title", ""), str(m.get("year", "")), path)
+            console.print(t1)
+            console.print("[dim]Tip: trigger a Plex library scan — the file may just need indexing.[/dim]\n")
+        else:
+            console.print("[green]✓ All Radarr downloads are indexed in Plex.[/green]\n")
+
+        if plex_not_radarr:
+            t2 = Table(
+                title=f"[yellow]In Plex — not monitored by Radarr[/yellow]  "
+                      f"({len(plex_not_radarr)})",
+                box=box.ROUNDED,
+            )
+            t2.add_column("Title",   style="bold white", min_width=30)
+            t2.add_column("Year",    width=6, justify="right")
+            t2.add_column("Library", width=18, style="dim")
+            for pm in plex_not_radarr:
+                t2.add_row(pm["title"], str(pm["year"]), pm["library"])
+            console.print(t2)
+            console.print("[dim]Tip: use radarr_list_info + radarr_list_add to add these to a monitored list.[/dim]")
+        else:
+            console.print("[green]✓ All Plex movies are monitored by Radarr.[/green]")
 
     # ── Tab completion ────────────────────────────────────────────────────────
 
