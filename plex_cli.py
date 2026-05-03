@@ -705,6 +705,9 @@ def _distribution_table(title: str, counts: Counter, cap: int = 0):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 _HELP_SECTIONS = [
+    ("Dashboard", [
+        ("health",          "",                                  "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
+    ]),
     ("Basic", [
         ("status",          "",                                  "Server info and version"),
         ("libraries",       "",                                  "List all media libraries"),
@@ -4003,6 +4006,171 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Nothing selected.[/dim]"); return
 
         self._execute_radarr_download(selected, rc, profile_id)
+
+    def do_health(self, _arg: str):
+        """health — one-page summary: library stats, zero-duration, stale shows, Radarr sync/upgrade gaps"""
+        import concurrent.futures
+
+        cfg          = load_config()
+        radarr_url   = cfg.get("radarr_url")   or os.environ.get("RADARR_URL",   "")
+        radarr_key   = cfg.get("radarr_api_key") or os.environ.get("RADARR_API_KEY", "")
+        radarr_configured = bool(radarr_url and radarr_key)
+
+        with console.status("Running health checks..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                f_items = pool.submit(self.client.all_items_by_library)
+                f_media = pool.submit(self.client.all_media_rows)
+                if radarr_configured:
+                    rc           = RadarrClient(radarr_url, radarr_key)
+                    f_r_status   = pool.submit(rc.status)
+                    f_r_movies   = pool.submit(rc.movies)
+                    f_r_profiles = pool.submit(rc.quality_profiles)
+
+                lib_data   = f_items.result()
+                media_rows = f_media.result()
+                if radarr_configured:
+                    radarr_ok       = bool(f_r_status.result())
+                    radarr_movies   = f_r_movies.result()   if radarr_ok else []
+                    radarr_profiles = f_r_profiles.result() if radarr_ok else []
+                else:
+                    radarr_ok = False
+                    radarr_movies = radarr_profiles = []
+
+        # ── Plex aggregates ───────────────────────────────────────────────────
+        lib_size: dict[str, int] = defaultdict(int)
+        lib_dur:  dict[str, int] = defaultdict(int)
+        for row in media_rows:
+            lib_size[row["library"]] += row.get("size") or 0
+            lib_dur[row["library"]]  += row.get("duration") or 0
+
+        STALE_MONTHS  = 6
+        stale_cutoff  = int(time.time()) - STALE_MONTHS * 30 * 86400
+        stale_shows   = 0
+        total_size    = 0
+        overview_rows = []
+
+        plex_set: set[tuple[str, int]] = set()
+        plex_movie_items: list[dict]   = []
+
+        for lib_name, d in lib_data.items():
+            lib_type = d["info"].get("type", "")
+            items    = d["items"]
+            size     = lib_size[lib_name]
+            total_size += size
+            watched = sum(1 for i in items if (i.get("viewCount") or 0) > 0)
+
+            if lib_type == "show":
+                stale_shows += sum(1 for i in items if (i.get("updatedAt") or 0) < stale_cutoff)
+            elif lib_type == "movie":
+                for item in items:
+                    t = (item.get("title") or "").lower().strip()
+                    y = item.get("year") or 0
+                    if t:
+                        plex_set.add((t, y))
+                plex_movie_items.extend(items)
+
+            watch_str = (f"{watched}/{len(items)} ({100 * watched // len(items)}%)"
+                         if lib_type == "movie" and items else "—")
+            overview_rows.append((lib_name, lib_type, len(items), size, watch_str))
+
+        zero_dur = sum(1 for r in media_rows if not r.get("duration"))
+
+        # ── Radarr aggregates ─────────────────────────────────────────────────
+        radarr_not_plex = plex_not_radarr = upgrade_candidates = 0
+        if radarr_ok and radarr_movies:
+            # Downloads not indexed in Plex
+            radarr_not_plex = sum(
+                1 for m in radarr_movies
+                if m.get("hasFile")
+                and not self._in_plex(m.get("title", ""), m.get("year", 0), plex_set)
+            )
+
+            # Plex movies not monitored in Radarr
+            radarr_by_year: dict[int, set[str]] = defaultdict(set)
+            for m in radarr_movies:
+                radarr_by_year[m.get("year", 0)].add(m.get("title", "").lower().strip())
+
+            def _in_radarr(title: str, year: int) -> bool:
+                t = title.lower().strip()
+                for y in (year - 1, year, year + 1):
+                    for rt in radarr_by_year.get(y, set()):
+                        if t == rt or SequenceMatcher(None, t, rt).ratio() >= 0.90:
+                            return True
+                return False
+
+            plex_not_radarr = sum(
+                1 for pm in plex_movie_items
+                if not _in_radarr(pm.get("title", ""), pm.get("year", 0))
+            )
+
+            # Quality upgrade candidates
+            qual_res: dict[int, int] = {}
+            def _extract_q(items: list) -> None:
+                for item in items:
+                    if item.get("quality"):
+                        q = item["quality"]
+                        qual_res[q["id"]] = q.get("resolution", 0)
+                    _extract_q(item.get("items", []))
+            for p in radarr_profiles:
+                _extract_q(p.get("items", []))
+
+            prof_cutoff = {p["id"]: qual_res.get(p.get("cutoff", 0), 0) for p in radarr_profiles}
+            upgrade_candidates = sum(
+                1 for m in radarr_movies
+                if m.get("hasFile")
+                and prof_cutoff.get(m.get("qualityProfileId", 0), 0) > 0
+                and ((m.get("movieFile") or {}).get("quality") or {}).get("quality", {})
+                    .get("resolution", 0)
+                    < prof_cutoff.get(m.get("qualityProfileId", 0), 0)
+            )
+
+        # ── Display ───────────────────────────────────────────────────────────
+        ov = Table(box=box.SIMPLE_HEAVY, padding=(0, 1), show_header=True)
+        ov.add_column("Library",     style="bold cyan")
+        ov.add_column("Type",        style="dim",   width=8)
+        ov.add_column("Items",       justify="right", width=7)
+        ov.add_column("Size",        justify="right", width=10)
+        ov.add_column("Watched",     justify="right", width=14)
+        for lib_name, lib_type, n, size, watch_str in overview_rows:
+            ov.add_row(lib_name, lib_type, str(n), format_size(size), watch_str)
+        ov.add_section()
+        ov.add_row("[bold]TOTAL[/bold]", "", "", format_size(total_size), "")
+        console.print(Panel(ov, title="[bold white]Libraries[/bold white]", border_style="blue"))
+
+        def chk(ok: bool, label: str, ok_text: str, warn_text: str, hint: str = "") -> str:
+            if ok:
+                return f"  [green]✓[/green]  {label:<42} [dim]{ok_text}[/dim]"
+            detail = f"[yellow]{warn_text}[/yellow]"
+            detail += f"  [dim]{hint}[/dim]" if hint else ""
+            return f"  [yellow]⚠[/yellow]  {label:<42} {detail}"
+
+        lines = [
+            chk(zero_dur == 0,    "Zero-duration files",
+                "none", f"{zero_dur} item(s)",   "→ zero_duration for details"),
+            chk(stale_shows == 0, f"Stale TV shows (6+ months without update)",
+                "none", f"{stale_shows} show(s)", "→ stale for details"),
+        ]
+
+        if not radarr_configured:
+            lines.append("\n  [dim]Radarr not configured — run radarr_status to set up.[/dim]")
+        elif not radarr_ok:
+            lines.append("\n  [red]✗[/red]  [dim]Radarr: could not connect[/dim]")
+        else:
+            lines += [
+                "",
+                chk(radarr_not_plex == 0,    "Radarr downloads not indexed in Plex",
+                    "all indexed",   f"{radarr_not_plex} movie(s)", "→ radarr_sync"),
+                chk(plex_not_radarr == 0,    "Plex movies not monitored by Radarr",
+                    "all monitored", f"{plex_not_radarr} movie(s)", "→ radarr_sync"),
+                chk(upgrade_candidates == 0, "Movies below quality cutoff",
+                    "none",          f"{upgrade_candidates} movie(s)", "→ radarr_upgrade"),
+            ]
+
+        console.print(Panel(
+            "\n".join(lines),
+            title="[bold white]Health Checks[/bold white]",
+            border_style="cyan",
+        ))
 
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
