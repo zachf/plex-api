@@ -1149,7 +1149,13 @@ class PlexShell(cmd.Cmd):
         if (t, year) in plex_set:
             return True
         for pt, py in plex_set:
-            if abs(py - year) <= 1 and SequenceMatcher(None, t, pt).ratio() >= 0.90:
+            if abs(py - year) > 1:
+                continue
+            if SequenceMatcher(None, t, pt).ratio() >= 0.90:
+                return True
+            # Handle "Star Wars" ↔ "Star Wars: Episode IV - A New Hope"
+            shorter, longer = (t, pt) if len(t) <= len(pt) else (pt, t)
+            if longer.startswith(shorter + ":") or longer.startswith(shorter + " -"):
                 return True
         return False
 
