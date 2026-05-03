@@ -517,6 +517,77 @@ class RadarrClient:
         """Trigger an immediate search for movies already in Radarr by their Radarr IDs."""
         return self.post("/command", {"name": "MoviesSearch", "movieIds": movie_ids})
 
+# ── Sonarr client ─────────────────────────────────────────────────────────────
+
+class SonarrClient:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.session  = requests.Session()
+        self.session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
+
+    def _request(self, method: str, path: str, silent: bool = False, **kwargs):
+        url = f"{self.base_url}/api/v3{path}"
+        try:
+            r = self.session.request(method, url, timeout=15, **kwargs)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.ConnectionError:
+            if not silent:
+                console.print(f"[red]Cannot reach Sonarr at {self.base_url}[/red]")
+        except requests.exceptions.HTTPError as e:
+            if not silent:
+                console.print(f"[red]Sonarr HTTP {e.response.status_code}:[/red] {path}")
+        return None
+
+    def get(self, path: str, silent: bool = False, **params):
+        r = self._request("GET", path, silent=silent, params=params)
+        if r is None: return {}
+        try: return r.json()
+        except Exception: return {}
+
+    def post(self, path: str, payload: dict) -> dict:
+        r = self._request("POST", path, json=payload)
+        if r is None: return {}
+        try: return r.json()
+        except Exception: return {}
+
+    def status(self)           -> dict: return self.get("/system/status") or {}
+    def series(self)           -> list: r = self.get("/series"); return r if isinstance(r, list) else []
+    def quality_profiles(self) -> list: r = self.get("/qualityprofile"); return r if isinstance(r, list) else []
+    def root_folders(self)     -> list: r = self.get("/rootfolder"); return r if isinstance(r, list) else []
+
+    def wanted_missing(self, page_size: int = 1000) -> list:
+        r = self.get("/wanted/missing", pageSize=page_size,
+                     sortKey="series.sortTitle", sortDirection="ascending")
+        return r.get("records", []) if isinstance(r, dict) else []
+
+    def wanted_missing_count(self) -> int:
+        r = self.get("/wanted/missing", pageSize=1)
+        return r.get("totalRecords", 0) if isinstance(r, dict) else 0
+
+    def wanted_cutoff(self, page_size: int = 1000) -> list:
+        r = self.get("/wanted/cutoff", pageSize=page_size,
+                     sortKey="series.sortTitle", sortDirection="ascending")
+        return r.get("records", []) if isinstance(r, dict) else []
+
+    def series_lookup(self, term: str) -> list:
+        r = self.get("/series/lookup", term=term)
+        return r if isinstance(r, list) else []
+
+    def add_series(self, tvdb_id: int, title: str, year: int,
+                   quality_profile_id: int, root_folder_path: str,
+                   seasons: list | None = None, monitored: bool = True,
+                   search_on_add: bool = False) -> dict:
+        return self.post("/series", {
+            "tvdbId": tvdb_id, "title": title, "year": year,
+            "qualityProfileId": quality_profile_id, "rootFolderPath": root_folder_path,
+            "monitored": monitored, "seasons": seasons or [],
+            "addOptions": {"searchForMissingEpisodes": search_on_add},
+        })
+
+    def search_series(self, series_id: int) -> dict:
+        return self.post("/command", {"name": "SeriesSearch", "seriesId": series_id})
+
 # ── TMDB client ───────────────────────────────────────────────────────────────
 
 class TMDBClient:
@@ -837,6 +908,13 @@ _HELP_SECTIONS = [
         ("collections",     "[library_id]",                      "List collections (all or by library)"),
         ("collection",      "<key>",                             "Show items in a collection"),
     ]),
+    ("Sonarr", [
+        ("sonarr_status",  "",           "Sonarr connection info, quality profiles, root folders"),
+        ("sonarr_sync",    "",           "Find Sonarr downloads missing from Plex, and Plex shows not in Sonarr"),
+        ("sonarr_missing", "",           "Shows with monitored but missing episodes; select to trigger search"),
+        ("sonarr_upgrade", "",           "Shows with episodes below quality cutoff; select to trigger re-search"),
+        ("sonarr_add",     "<name>",     "Search for a TV show and add it to Sonarr"),
+    ]),
     ("Radarr", [
         ("radarr_status",   "",                                                "Radarr connection info, quality profiles, root folders"),
         ("radarr_lists",       "",                                             "Show available named TMDB lists"),
@@ -999,6 +1077,46 @@ class PlexShell(cmd.Cmd):
         if not info:
             return None
         return rc
+
+    def _get_sonarr_client(self) -> "SonarrClient | None":
+        cfg = load_config()
+        url = cfg.get("sonarr_url", "") or os.environ.get("SONARR_URL", "")
+        key = cfg.get("sonarr_api_key", "") or os.environ.get("SONARR_API_KEY", "")
+        if not url or not key:
+            console.print(Panel(
+                "Sonarr URL and API key are required.\n\n"
+                "Find your API key: Sonarr → Settings → General → Security → API Key",
+                title="[yellow]Sonarr Setup[/yellow]", border_style="yellow"))
+            url = Prompt.ask("[yellow]Sonarr URL[/yellow]", default="http://localhost:8989")
+            key = Prompt.ask("[yellow]Sonarr API Key[/yellow]")
+            if not url or not key:
+                console.print("[red]Sonarr URL and API key are required.[/red]"); return None
+            cfg["sonarr_url"] = url; cfg["sonarr_api_key"] = key; save_config(cfg)
+        sc = SonarrClient(url, key)
+        with console.status("Connecting to Sonarr..."):
+            info = sc.status()
+        if not info:
+            return None
+        return sc
+
+    def _plex_show_set(self) -> set[tuple[str, int]]:
+        result: set[tuple[str, int]] = set()
+        for lib in self.client.libraries():
+            if lib.get("type") != "show":
+                continue
+            for item in self.client.library_contents(lib.get("key", "")):
+                t = (item.get("title") or "").lower().strip()
+                y = item.get("year") or 0
+                if t:
+                    result.add((t, y))
+        return result
+
+    def _in_plex_show(self, title: str, plex_show_set: set) -> bool:
+        t = title.lower().strip()
+        for pt, _ in plex_show_set:
+            if t == pt or SequenceMatcher(None, t, pt).ratio() >= 0.88:
+                return True
+        return False
 
     def _get_tmdb_client(self) -> "TMDBClient | None":
         cfg = load_config()
@@ -4012,12 +4130,15 @@ class PlexShell(cmd.Cmd):
         import concurrent.futures
 
         cfg          = load_config()
-        radarr_url   = cfg.get("radarr_url")   or os.environ.get("RADARR_URL",   "")
+        radarr_url   = cfg.get("radarr_url")    or os.environ.get("RADARR_URL",    "")
         radarr_key   = cfg.get("radarr_api_key") or os.environ.get("RADARR_API_KEY", "")
+        sonarr_url   = cfg.get("sonarr_url")    or os.environ.get("SONARR_URL",    "")
+        sonarr_key   = cfg.get("sonarr_api_key") or os.environ.get("SONARR_API_KEY", "")
         radarr_configured = bool(radarr_url and radarr_key)
+        sonarr_configured = bool(sonarr_url and sonarr_key)
 
         with console.status("Running health checks..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 f_items = pool.submit(self.client.all_items_by_library)
                 f_media = pool.submit(self.client.all_media_rows)
                 if radarr_configured:
@@ -4025,6 +4146,11 @@ class PlexShell(cmd.Cmd):
                     f_r_status   = pool.submit(rc.status)
                     f_r_movies   = pool.submit(rc.movies)
                     f_r_profiles = pool.submit(rc.quality_profiles)
+                if sonarr_configured:
+                    sc           = SonarrClient(sonarr_url, sonarr_key)
+                    f_s_status   = pool.submit(sc.status)
+                    f_s_missing  = pool.submit(sc.wanted_missing_count)
+                    f_s_series   = pool.submit(sc.series)
 
                 lib_data   = f_items.result()
                 media_rows = f_media.result()
@@ -4035,6 +4161,14 @@ class PlexShell(cmd.Cmd):
                 else:
                     radarr_ok = False
                     radarr_movies = radarr_profiles = []
+                if sonarr_configured:
+                    sonarr_ok      = bool(f_s_status.result())
+                    sonarr_missing = f_s_missing.result() if sonarr_ok else 0
+                    sonarr_series  = f_s_series.result()  if sonarr_ok else []
+                else:
+                    sonarr_ok = False
+                    sonarr_missing = 0
+                    sonarr_series  = []
 
         # ── Plex aggregates ───────────────────────────────────────────────────
         lib_size: dict[str, int] = defaultdict(int)
@@ -4166,11 +4300,384 @@ class PlexShell(cmd.Cmd):
                     "none",          f"{upgrade_candidates} movie(s)", "→ radarr_upgrade"),
             ]
 
+        # ── Sonarr section ────────────────────────────────────────────────────
+        if not sonarr_configured:
+            lines.append("\n  [dim]Sonarr not configured — run sonarr_status to set up.[/dim]")
+        elif not sonarr_ok:
+            lines.append("\n  [red]✗[/red]  [dim]Sonarr: could not connect[/dim]")
+        else:
+            # Sync: Sonarr has downloaded files but Plex doesn't have the show
+            plex_show_set = self._plex_show_set()
+            sonarr_not_plex = sum(
+                1 for s in sonarr_series
+                if (s.get("statistics") or {}).get("episodeFileCount", 0) > 0
+                and not self._in_plex_show(s.get("title", ""), plex_show_set)
+            )
+            lines += [
+                "",
+                chk(sonarr_missing == 0,    "Sonarr monitored episodes missing",
+                    "none",         f"{sonarr_missing} episode(s)", "→ sonarr_missing"),
+                chk(sonarr_not_plex == 0,   "Sonarr downloads not indexed in Plex",
+                    "all indexed",  f"{sonarr_not_plex} show(s)",   "→ sonarr_sync"),
+            ]
+
         console.print(Panel(
             "\n".join(lines),
             title="[bold white]Health Checks[/bold white]",
             border_style="cyan",
         ))
+
+    # ── Sonarr commands ───────────────────────────────────────────────────────
+
+    def do_sonarr_status(self, _):
+        """sonarr_status — Sonarr connection info, quality profiles, and root folders"""
+        sc = self._get_sonarr_client()
+        if not sc: return
+        with console.status("Fetching Sonarr info..."):
+            info     = sc.status()
+            profiles = sc.quality_profiles()
+            folders  = sc.root_folders()
+        console.print(Panel(
+            f"[bold cyan]Version:[/bold cyan]  {info.get('version','—')}\n"
+            f"[bold cyan]URL:[/bold cyan]      {sc.base_url}\n"
+            f"[bold cyan]OS:[/bold cyan]       {info.get('osName','—')} {info.get('osVersion','—')}",
+            title="[bold white]Sonarr[/bold white]", border_style="green"))
+        pt = Table(title="Quality Profiles", box=box.ROUNDED)
+        pt.add_column("ID", style="dim", width=6); pt.add_column("Name", style="bold cyan")
+        for p in profiles: pt.add_row(str(p.get("id", "")), p.get("name", ""))
+        console.print(pt)
+        ft = Table(title="Root Folders", box=box.ROUNDED)
+        ft.add_column("Path", style="bold white", min_width=28)
+        ft.add_column("Free Space", justify="right", width=12)
+        for f in folders: ft.add_row(f.get("path", ""), format_size(f.get("freeSpace")))
+        console.print(ft)
+
+    def do_sonarr_sync(self, _arg: str):
+        """sonarr_sync — find Sonarr downloads missing from Plex, and Plex shows not in Sonarr"""
+        sc = self._get_sonarr_client()
+        if not sc: return
+
+        with console.status("Loading Sonarr and Plex libraries..."):
+            all_series   = sc.series()
+            plex_show_set = self._plex_show_set()
+
+            plex_shows: list[dict] = []
+            for lib in self.client.libraries():
+                if lib.get("type") != "show": continue
+                for item in self.client.library_contents(lib.get("key", "")):
+                    plex_shows.append({
+                        "title":   item.get("title", ""),
+                        "year":    item.get("year", 0),
+                        "library": lib.get("title", ""),
+                    })
+
+        # Section 1: Sonarr has downloaded files but Plex hasn't indexed the show
+        sonarr_not_plex = sorted(
+            [s for s in all_series
+             if (s.get("statistics") or {}).get("episodeFileCount", 0) > 0
+             and not self._in_plex_show(s.get("title", ""), plex_show_set)],
+            key=lambda x: x.get("title", ""),
+        )
+
+        # Section 2: Plex shows not monitored by Sonarr
+        sonarr_titles: set[str] = {s.get("title", "").lower().strip() for s in all_series}
+
+        def _in_sonarr(title: str) -> bool:
+            t = title.lower().strip()
+            if t in sonarr_titles: return True
+            for st in sonarr_titles:
+                if SequenceMatcher(None, t, st).ratio() >= 0.88:
+                    return True
+            return False
+
+        plex_not_sonarr = sorted(
+            [ps for ps in plex_shows if not _in_sonarr(ps["title"])],
+            key=lambda x: x.get("title", ""),
+        )
+
+        console.print()
+        if sonarr_not_plex:
+            t1 = Table(
+                title=f"[yellow]Downloaded in Sonarr — not indexed in Plex[/yellow]  ({len(sonarr_not_plex)})",
+                box=box.ROUNDED,
+            )
+            t1.add_column("Title",    style="bold white", min_width=30)
+            t1.add_column("Year",     width=6, justify="right")
+            t1.add_column("Episodes", width=10, justify="right")
+            t1.add_column("Status",   width=12, style="dim")
+            for s in sonarr_not_plex:
+                stats = s.get("statistics") or {}
+                t1.add_row(s.get("title", ""), str(s.get("year", "")),
+                           f"{stats.get('episodeFileCount',0)}/{stats.get('totalEpisodeCount',0)}",
+                           s.get("status", ""))
+            console.print(t1)
+            console.print("[dim]Tip: trigger a Plex library scan — the files may just need indexing.[/dim]\n")
+        else:
+            console.print("[green]✓ All Sonarr downloads are indexed in Plex.[/green]\n")
+
+        if plex_not_sonarr:
+            t2 = Table(
+                title=f"[yellow]In Plex — not monitored by Sonarr[/yellow]  ({len(plex_not_sonarr)})",
+                box=box.ROUNDED,
+            )
+            t2.add_column("Title",   style="bold white", min_width=30)
+            t2.add_column("Year",    width=6, justify="right")
+            t2.add_column("Library", width=18, style="dim")
+            for ps in plex_not_sonarr:
+                t2.add_row(ps["title"], str(ps["year"]), ps["library"])
+            console.print(t2)
+            console.print("[dim]Tip: use sonarr_add to start monitoring these shows.[/dim]")
+        else:
+            console.print("[green]✓ All Plex shows are monitored by Sonarr.[/green]")
+
+    def do_sonarr_missing(self, _arg: str):
+        """sonarr_missing — shows with monitored but missing episodes; select to trigger search"""
+        sc = self._get_sonarr_client()
+        if not sc: return
+
+        with console.status("Fetching missing episodes from Sonarr..."):
+            records = sc.wanted_missing()
+        if not records:
+            console.print("[green]No monitored missing episodes.[/green]"); return
+
+        # Group by series
+        by_series: dict[int, dict] = {}
+        for ep in records:
+            s   = ep.get("series") or {}
+            sid = ep.get("seriesId", 0)
+            if sid not in by_series:
+                by_series[sid] = {
+                    "id":     sid,
+                    "title":  s.get("title", ""),
+                    "year":   s.get("year", 0),
+                    "status": s.get("status", ""),
+                    "count":  0,
+                }
+            by_series[sid]["count"] += 1
+
+        shows = sorted(by_series.values(), key=lambda x: (-x["count"], x["title"]))
+
+        t = Table(title=f"Shows with Missing Episodes  ({len(shows)} shows, {len(records)} episodes)",
+                  box=box.ROUNDED)
+        t.add_column("#",       style="dim",        width=4,  justify="right")
+        t.add_column("Title",   style="bold white",  min_width=30)
+        t.add_column("Year",    width=6,             justify="right")
+        t.add_column("Missing", width=9,             justify="right", style="yellow")
+        t.add_column("Status",  width=12,            style="dim")
+        for i, s in enumerate(shows, 1):
+            t.add_row(str(i), s["title"], str(s["year"]), str(s["count"]), s["status"])
+        console.print(t)
+
+        try:
+            import questionary
+            console.print(f"\n[dim]↑↓ scroll · Space toggle · a select all · Enter confirm · Ctrl-C cancel[/dim]\n")
+            choices = [
+                questionary.Choice(
+                    title=f"{s['title']} ({s['year']})  [{s['count']} missing]",
+                    value=s,
+                )
+                for s in shows
+            ]
+            selected = questionary.checkbox(
+                "Select shows to search for missing episodes:", choices=choices, instruction=" ",
+            ).ask()
+        except ImportError:
+            sel_input = Prompt.ask(
+                f"Enter numbers to search (e.g. [bold]1 3 5-10[/bold]), or blank for all {len(shows)}",
+                default="",
+            ).strip()
+            if sel_input:
+                nums: set[int] = set()
+                for part in sel_input.split():
+                    if "-" in part:
+                        try:
+                            a, b = part.split("-", 1)
+                            nums.update(range(int(a), int(b) + 1))
+                        except ValueError: pass
+                    else:
+                        try: nums.add(int(part))
+                        except ValueError: pass
+                selected = [shows[n - 1] for n in sorted(nums) if 1 <= n <= len(shows)]
+            else:
+                selected = shows
+
+        if not selected:
+            console.print("[dim]Nothing selected.[/dim]"); return
+        for s in selected:
+            sc.search_series(s["id"])
+        console.print(f"[green]Search triggered[/green] for {len(selected)} show(s).")
+        console.print("[dim]Sonarr is searching for missing episodes in the background.[/dim]")
+
+    def do_sonarr_upgrade(self, _arg: str):
+        """sonarr_upgrade — shows with episodes below quality cutoff; select to trigger re-search"""
+        sc = self._get_sonarr_client()
+        if not sc: return
+
+        with console.status("Fetching below-cutoff episodes from Sonarr..."):
+            records = sc.wanted_cutoff()
+        if not records:
+            console.print("[green]All downloaded episodes meet their quality profile cutoff.[/green]"); return
+
+        by_series: dict[int, dict] = {}
+        for ep in records:
+            s   = ep.get("series") or {}
+            sid = ep.get("seriesId", 0)
+            if sid not in by_series:
+                by_series[sid] = {
+                    "id":     sid,
+                    "title":  s.get("title", ""),
+                    "year":   s.get("year", 0),
+                    "status": s.get("status", ""),
+                    "count":  0,
+                }
+            by_series[sid]["count"] += 1
+
+        shows = sorted(by_series.values(), key=lambda x: (-x["count"], x["title"]))
+
+        t = Table(title=f"Shows with Episodes Below Quality Cutoff  ({len(shows)} shows, {len(records)} episodes)",
+                  box=box.ROUNDED)
+        t.add_column("#",       style="dim",        width=4,  justify="right")
+        t.add_column("Title",   style="bold white",  min_width=30)
+        t.add_column("Year",    width=6,             justify="right")
+        t.add_column("Below cutoff", width=13,      justify="right", style="yellow")
+        t.add_column("Status",  width=12,            style="dim")
+        for i, s in enumerate(shows, 1):
+            t.add_row(str(i), s["title"], str(s["year"]), str(s["count"]), s["status"])
+        console.print(t)
+
+        try:
+            import questionary
+            console.print(f"\n[dim]↑↓ scroll · Space toggle · a select all · Enter confirm · Ctrl-C cancel[/dim]\n")
+            choices = [
+                questionary.Choice(
+                    title=f"{s['title']} ({s['year']})  [{s['count']} episode(s) below cutoff]",
+                    value=s,
+                )
+                for s in shows
+            ]
+            selected = questionary.checkbox(
+                "Select shows to trigger upgrade search:", choices=choices, instruction=" ",
+            ).ask()
+        except ImportError:
+            sel_input = Prompt.ask(
+                f"Enter numbers to search (e.g. [bold]1 3 5-10[/bold]), or blank for all {len(shows)}",
+                default="",
+            ).strip()
+            if sel_input:
+                nums: set[int] = set()
+                for part in sel_input.split():
+                    if "-" in part:
+                        try:
+                            a, b = part.split("-", 1)
+                            nums.update(range(int(a), int(b) + 1))
+                        except ValueError: pass
+                    else:
+                        try: nums.add(int(part))
+                        except ValueError: pass
+                selected = [shows[n - 1] for n in sorted(nums) if 1 <= n <= len(shows)]
+            else:
+                selected = shows
+
+        if not selected:
+            console.print("[dim]Nothing selected.[/dim]"); return
+        for s in selected:
+            sc.search_series(s["id"])
+        console.print(f"[green]Upgrade search triggered[/green] for {len(selected)} show(s).")
+        console.print("[dim]Sonarr will replace episodes when better versions are found.[/dim]")
+
+    def do_sonarr_add(self, arg: str):
+        """sonarr_add <show name> — search for a TV show and add it to Sonarr"""
+        name = arg.strip()
+        if not name:
+            console.print("[yellow]Usage: sonarr_add <show name>[/yellow]"); return
+
+        sc = self._get_sonarr_client()
+        if not sc: return
+
+        with console.status(f"Searching Sonarr for [cyan]{name}[/cyan]..."):
+            results  = sc.series_lookup(name)
+            existing = {s.get("tvdbId") for s in sc.series() if s.get("tvdbId")}
+
+        if not results:
+            console.print(f"[yellow]No results found for:[/yellow] {name}"); return
+
+        # Split into already-added and new
+        new_shows = [r for r in results if r.get("tvdbId") not in existing]
+        if not new_shows:
+            console.print(f"[green]All matches are already in Sonarr.[/green]"); return
+
+        t = Table(title=f"Search results for '{name}'  ({len(new_shows)} new)", box=box.ROUNDED)
+        t.add_column("#",        style="dim",        width=4,  justify="right")
+        t.add_column("Title",    style="bold white",  min_width=28)
+        t.add_column("Year",     width=6,             justify="right")
+        t.add_column("Network",  width=16,            style="dim")
+        t.add_column("Seasons",  width=9,             justify="right")
+        t.add_column("Status",   width=12,            style="dim")
+        for i, r in enumerate(new_shows, 1):
+            t.add_row(str(i), r.get("title", ""), str(r.get("year", "")),
+                      r.get("network", "—"),
+                      str(len(r.get("seasons", []))),
+                      r.get("status", ""))
+        console.print(t)
+
+        if len(new_shows) == 1:
+            show = new_shows[0]
+            console.print(f"[dim]Auto-selected: {show.get('title')} ({show.get('year')})[/dim]")
+        else:
+            choice = Prompt.ask("Select #", choices=[str(i) for i in range(1, len(new_shows) + 1)])
+            show = new_shows[int(choice) - 1]
+
+        with console.status("Loading Sonarr profiles..."):
+            profiles = sc.quality_profiles()
+            folders  = sc.root_folders()
+        if not profiles or not folders:
+            console.print("[red]Cannot add show — check Sonarr quality profiles and root folders.[/red]"); return
+
+        if len(profiles) == 1:
+            profile_id = profiles[0]["id"]
+            console.print(f"[dim]Quality profile: {profiles[0]['name']}[/dim]")
+        else:
+            pt = Table(title="Quality Profiles", box=box.ROUNDED)
+            pt.add_column("ID", style="dim", width=6); pt.add_column("Name", style="bold cyan")
+            for p in profiles: pt.add_row(str(p["id"]), p["name"])
+            console.print(pt)
+            profile_id = int(Prompt.ask("Select profile ID",
+                                        choices=[str(p["id"]) for p in profiles],
+                                        default=str(profiles[0]["id"])))
+
+        if len(folders) == 1:
+            root_folder = folders[0]["path"]
+        else:
+            ft = Table(title="Root Folders", box=box.ROUNDED)
+            ft.add_column("ID", style="dim", width=6); ft.add_column("Path", style="bold white")
+            for f in folders: ft.add_row(str(f["id"]), f["path"])
+            console.print(ft)
+            folder_map  = {str(f["id"]): f["path"] for f in folders}
+            root_folder = folder_map[Prompt.ask("Select root folder ID",
+                                                choices=list(folder_map),
+                                                default=list(folder_map)[0])]
+
+        search_on_add = Prompt.ask(
+            "Search for missing episodes immediately?", choices=["y", "n"], default="y"
+        ) == "y"
+
+        with console.status(f"Adding [cyan]{show.get('title')}[/cyan] to Sonarr..."):
+            result = sc.add_series(
+                tvdb_id=show.get("tvdbId", 0),
+                title=show.get("title", ""),
+                year=show.get("year", 0),
+                quality_profile_id=profile_id,
+                root_folder_path=root_folder,
+                seasons=show.get("seasons", []),
+                search_on_add=search_on_add,
+            )
+
+        if result.get("id"):
+            console.print(f"[green]Added:[/green] {show.get('title')} ({show.get('year')})")
+            if search_on_add:
+                console.print("[dim]Sonarr is searching for episodes in the background.[/dim]")
+        else:
+            console.print(f"[red]Failed to add show.[/red] Response: {result}")
 
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
@@ -4475,6 +4982,10 @@ class PlexShell(cmd.Cmd):
         if text.startswith("-"):
             return self._c_flags(text, ["--profile"])
         return []
+
+    # sonarr_status, sonarr_sync, sonarr_missing, sonarr_upgrade take no args
+    complete_sonarr_status = complete_sonarr_sync = complete_sonarr_missing = \
+        complete_sonarr_upgrade = lambda self, text, *_: []
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
