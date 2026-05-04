@@ -641,15 +641,30 @@ class TMDBClient:
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
 _DEFAULT_TMDB_LISTS: dict[str, int] = {
+    # Rankings & critics
+    "imdb_top_250":         10265,   # IMDb Top 250 (community-maintained snapshot)
+    "bfi_top_100":          6221,    # BFI / Sight & Sound Top 100 Greatest Films
+    "rotten_tomatoes_100":  3697,    # Rotten Tomatoes Top 100 Movies of All Time
+    "nyt_21st_century":     8648998, # New York Times — 100 Best Movies of the 21st Century
+    # Academy Awards
     "afi_top_100":          145406,  # AFI 100 Greatest American Films (2007 ed.)
     "oscar_best_picture":   28,      # Academy Award Best Picture winners
     "oscar_foreign_film":   264,     # Academy Award Best Foreign Language Film
+    # Film festivals
     "cannes_palme_dor":     229,     # Cannes Film Festival — Palme d'Or winners
+    "berlin_golden_bear":   267,     # Berlin International Film Festival — Golden Bear
+    "sundance_grand_jury":  44681,   # Sundance Film Festival — Grand Jury Prize
+    # TV awards
     "golden_globe_drama":   2469,    # Golden Globe Best Motion Picture — Drama
+    "golden_globe_foreign": 237,     # Golden Globe Best Foreign Language Film
     "bafta_best_film":      3681,    # BAFTA Best Film winners
-    "bfi_top_100":          6221,    # BFI (Sight & Sound) Top 100 Greatest Films
-    "rotten_tomatoes_100":  3697,    # Rotten Tomatoes Top 100 Movies of All Time
-    "imdb_top_250":         10265,   # IMDb Top 250 (community-maintained snapshot)
+    # AFI genre lists
+    "afi_thrillers":        43,      # AFI 100 Most Thrilling American Films
+    "afi_comedies":         3682,    # AFI 100 Years … 100 Laughs
+    # Studio collections
+    "studio_ghibli":        9078,    # Studio Ghibli — all theatrical features
+    "pixar":                3700,    # Pixar Animation Studios — theatrical features
+    "disney_animation":     5905,    # Walt Disney Animation Studios
 }
 
 def load_lists() -> dict[str, int]:
