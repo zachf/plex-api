@@ -922,6 +922,8 @@ _HELP_SECTIONS = [
         ("playlist_remove", "<playlist_id> <item_id>",           "Remove an item from a playlist"),
         ("collections",     "[library_id]",                      "List collections (all or by library)"),
         ("collection",      "<key>",                             "Show items in a collection"),
+        ("playlist_build",  "<name> [--genre g] [--director d] [--actor a] [--year y] [--decade Xd] [--studio s] [--contentrating r] [--unwatched] [--rating n] [--library id] [--limit n]",
+                                                                 "Build a playlist from combined filters"),
     ]),
     ("Sonarr", [
         ("sonarr_status",  "",           "Sonarr connection info, quality profiles, root folders"),
@@ -3612,6 +3614,164 @@ class PlexShell(cmd.Cmd):
         if ok:
             console.print(f"[green]Item {parts[1]} removed from playlist {parts[0]}.[/green]")
 
+    def do_playlist_build(self, arg: str):
+        """playlist_build <name> [filters] — build a Plex playlist from combined filters"""
+        try:
+            tokens = shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            tokens = arg.strip().split()
+
+        if not tokens:
+            console.print(
+                "[yellow]Usage: playlist_build <name> [filters][/yellow]\n"
+                "[dim]Filters (all optional, combined with AND):[/dim]\n"
+                "[dim]  --genre <g>          e.g. Comedy, Horror, Drama[/dim]\n"
+                "[dim]  --director <name>    e.g. \"Stanley Kubrick\"[/dim]\n"
+                "[dim]  --actor <name>       e.g. \"Tom Hanks\"[/dim]\n"
+                "[dim]  --year <y>           exact release year[/dim]\n"
+                "[dim]  --decade <Xd>        e.g. 1990s or 90s[/dim]\n"
+                "[dim]  --studio <s>         studio name[/dim]\n"
+                "[dim]  --contentrating <r>  e.g. R, PG-13, TV-MA[/dim]\n"
+                "[dim]  --unwatched          only items with no plays[/dim]\n"
+                "[dim]  --rating <n>         minimum audience rating (0-10)[/dim]\n"
+                "[dim]  --library <id>       restrict to one library[/dim]\n"
+                "[dim]  --limit <n>          cap number of results[/dim]\n"
+                "[dim]Examples:[/dim]\n"
+                "[dim]  playlist_build \"Unseen Kubrick\" --director \"Stanley Kubrick\" --unwatched[/dim]\n"
+                "[dim]  playlist_build \"90s Comedies\" --genre Comedy --decade 1990s[/dim]\n"
+                "[dim]  playlist_build \"Top Horror\" --genre Horror --rating 7.5 --limit 25[/dim]"
+            )
+            return
+
+        # Name = everything before the first --flag
+        name_parts, i = [], 0
+        while i < len(tokens) and not tokens[i].startswith("--"):
+            name_parts.append(tokens[i]); i += 1
+        playlist_name = " ".join(name_parts)
+        if not playlist_name:
+            console.print("[red]Playlist name required (must precede any flags).[/red]"); return
+
+        VALUE_FLAGS = {"--genre", "--director", "--actor", "--year", "--decade",
+                       "--studio", "--contentrating", "--library", "--rating", "--limit"}
+        server_filters: dict   = {}
+        unwatched              = False
+        min_rating: float | None = None
+        library_id: str | None   = None
+        limit: int | None        = None
+
+        flag_tokens, j = tokens[i:], 0
+        while j < len(flag_tokens):
+            flag = flag_tokens[j]
+            val  = flag_tokens[j + 1] if flag in VALUE_FLAGS and j + 1 < len(flag_tokens) else None
+
+            if   flag == "--genre"         and val: server_filters["genre"]         = val;  j += 2
+            elif flag == "--director"      and val: server_filters["director"]      = val;  j += 2
+            elif flag == "--actor"         and val: server_filters["actor"]         = val;  j += 2
+            elif flag == "--studio"        and val: server_filters["studio"]        = val;  j += 2
+            elif flag == "--year"          and val: server_filters["year"]          = val;  j += 2
+            elif flag == "--contentrating" and val: server_filters["contentRating"] = val;  j += 2
+            elif flag == "--decade"        and val:
+                m = re.match(r"^(\d{4})s?$", val)
+                if m:
+                    server_filters["decade"] = str(int(m.group(1)) // 10 * 10)
+                else:
+                    m2 = re.match(r"^(\d{2})s$", val)
+                    if m2:
+                        n = int(m2.group(1))
+                        server_filters["decade"] = str(1900 + n if n >= 20 else 2000 + n)
+                    else:
+                        console.print(f"[yellow]Cannot parse decade '{val}' — use e.g. 1990s or 90s.[/yellow]")
+                j += 2
+            elif flag == "--unwatched": unwatched = True; j += 1
+            elif flag == "--rating" and val:
+                try: min_rating = float(val)
+                except ValueError: console.print(f"[yellow]--rating must be a number.[/yellow]")
+                j += 2
+            elif flag == "--library" and val: library_id = val; j += 2
+            elif flag == "--limit"   and val:
+                try: limit = int(val)
+                except ValueError: console.print(f"[yellow]--limit must be an integer.[/yellow]")
+                j += 2
+            else: j += 1
+
+        if not server_filters and not unwatched and min_rating is None:
+            console.print("[yellow]At least one filter flag is required.[/yellow]"); return
+
+        if library_id:
+            libs = [{"key": library_id, "title": f"Library {library_id}"}]
+        else:
+            libs = [l for l in self.client.libraries() if l.get("type") in ("movie", "show")]
+
+        with console.status(f"Searching {len(libs)} librar{'y' if len(libs)==1 else 'ies'}..."):
+            results: list[dict] = []
+            for lib in libs:
+                results.extend(self.client.section_search(lib.get("key", ""), **server_filters))
+
+        # Client-side filters
+        if unwatched:
+            results = [r for r in results if not (r.get("viewCount") or 0)]
+        if min_rating is not None:
+            results = [r for r in results if (r.get("audienceRating") or 0) >= min_rating]
+
+        # Deduplicate
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for r in results:
+            k = r.get("ratingKey", "")
+            if k and k not in seen:
+                seen.add(k); deduped.append(r)
+        results = deduped[:limit] if limit else deduped
+
+        if not results:
+            console.print("[yellow]No items match the given filters.[/yellow]"); return
+
+        # Preview
+        t = Table(
+            title=f"Preview: [cyan]{playlist_name}[/cyan]  ({len(results)} items)",
+            box=box.ROUNDED,
+        )
+        t.add_column("Title",  style="bold white", min_width=30)
+        t.add_column("Year",   width=6,  justify="right")
+        t.add_column("Rating", width=8,  justify="right", style="dim")
+        for r in results[:25]:
+            rating = r.get("audienceRating")
+            t.add_row(full_title(r), str(r.get("year") or ""),
+                      f"{rating:.1f}" if rating else "—")
+        if len(results) > 25:
+            t.add_row(f"[dim]… and {len(results) - 25} more[/dim]", "", "")
+        console.print(t)
+
+        if Prompt.ask(
+            f"Create playlist [cyan]'{playlist_name}'[/cyan] with {len(results)} item(s)?",
+            choices=["y", "n"], default="y",
+        ) != "y":
+            console.print("[dim]Cancelled.[/dim]"); return
+
+        # Create with first item, then add the rest
+        with console.status(f"Creating playlist [cyan]{playlist_name}[/cyan]..."):
+            pl = self.client.create_playlist(playlist_name, results[0].get("ratingKey", ""))
+        if not pl:
+            console.print("[red]Failed to create playlist.[/red]"); return
+
+        pl_key = pl.get("ratingKey", "")
+        added, failed = 1, 0
+        with console.status("Adding items...") as status:
+            for n, item in enumerate(results[1:], 2):
+                item_key = item.get("ratingKey", "")
+                if not item_key: continue
+                if self.client.playlist_add_item(pl_key, item_key): added += 1
+                else: failed += 1
+                if n % 10 == 0:
+                    status.update(f"Adding items… {n}/{len(results)}")
+
+        desc = ", ".join(f"{k}={v}" for k, v in server_filters.items())
+        if unwatched:   desc += (", " if desc else "") + "unwatched"
+        if min_rating:  desc += (", " if desc else "") + f"rating≥{min_rating}"
+        console.print(f"[green]'{playlist_name}'[/green] created — {added} item(s)."
+                      + (f"  [red]{failed} failed.[/red]" if failed else ""))
+        console.print(f"[dim]Filters: {desc}[/dim]")
+        console.print(f"[dim]View with: [bold]playlist {pl_key}[/bold][/dim]")
+
     def do_collections(self, arg: str):
         section_id = arg.strip() or None
         with console.status("Fetching collections..."):
@@ -4994,6 +5154,17 @@ class PlexShell(cmd.Cmd):
             return [n for n in self._cached_radarr_lists() if n.startswith(text)]
         if text.startswith("-"):
             return self._c_flags(text, ["--dry-run", "--profile"])
+        return []
+
+    _PB_FLAGS = ["--genre", "--director", "--actor", "--year", "--decade", "--studio",
+                 "--contentrating", "--unwatched", "--rating", "--library", "--limit"]
+
+    def complete_playlist_build(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library": return self._c_libs(text)
+        if prev in ("--genre", "--director", "--actor", "--year", "--decade",
+                    "--studio", "--contentrating", "--rating", "--limit"): return []
+        if text.startswith("-"): return self._c_flags(text, self._PB_FLAGS)
         return []
 
     def complete_radarr_pick(self, text, line, begidx, endidx):
