@@ -679,6 +679,11 @@ _DEFAULT_TMDB_LISTS: dict[str, int] = {
     "studio_ghibli":        9078,    # Studio Ghibli — all theatrical features
     "pixar":                3700,    # Pixar Animation Studios — theatrical features
     "disney_animation":     5905,    # Walt Disney Animation Studios
+    "a24":                  8270212, # A24 Films — full studio filmography
+    "criterion":            8551925, # The Complete Criterion Collection (~1,350 titles)
+    # Franchise universes (maintained by Travis Bell, TMDB founder)
+    "marvel":               1,       # Marvel Cinematic Universe
+    "dc":                   3,       # DC Comics Universe
 }
 
 def load_lists() -> dict[str, int]:

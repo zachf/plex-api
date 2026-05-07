@@ -301,6 +301,10 @@ Lists are stored in `~/.plex_cli_lists.json` and can be extended with `radarr_li
 | `studio_ghibli` | Studio Ghibli |
 | `pixar` | Pixar |
 | `disney_animation` | Disney Animation |
+| `a24` | A24 Films |
+| `criterion` | The Complete Criterion Collection (~1,350 titles) |
+| `marvel` | Marvel Cinematic Universe (maintained by Travis Bell, TMDB founder) |
+| `dc` | DC Comics Universe (maintained by Travis Bell, TMDB founder) |
 
 ### Maintenance
 
