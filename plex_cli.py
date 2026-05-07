@@ -641,6 +641,17 @@ class TMDBClient:
             key=lambda x: x["year"],
         )
 
+    def collection(self, collection_id: int) -> dict:
+        """Fetch a TMDB franchise/collection → {name, parts: [{tmdb_id, title, year}]}"""
+        data = self._get(f"/collection/{collection_id}")
+        parts = sorted(
+            [{"tmdb_id": m["id"], "title": m["title"],
+              "year": int((m.get("release_date") or "0")[:4] or 0)}
+             for m in data.get("parts", [])],
+            key=lambda x: x["year"],
+        )
+        return {"name": data.get("name", ""), "parts": parts}
+
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
 _DEFAULT_TMDB_LISTS: dict[str, int] = {
@@ -947,11 +958,13 @@ _HELP_SECTIONS = [
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
         ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
         ("radarr_upgrade", "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
-        ("radarr_sync",    "",                                                "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
+        ("radarr_sync",        "",         "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
+        ("radarr_collections", "[--import]", "TMDB franchise completion: show what's missing per series; --import adds them"),
     ]),
     ("Maintenance", [
-        ("plex_metadata",   "[--library <name>] [--fix] [--episodes]",
+        ("plex_metadata",    "[--library <name>] [--fix] [--episodes]",
                                                                  "Audit library for missing metadata fields; --fix triggers Plex refresh"),
+        ("plex_duplicates",  "[--library <name>]",               "Find duplicate movies; shows resolution, size, and reclaimable space"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -3889,6 +3902,90 @@ class PlexShell(cmd.Cmd):
             if not include_episodes:
                 console.print("[dim]Run with [bold]--episodes[/bold] to also audit episode-level metadata (slow on large libraries).[/dim]")
 
+    def do_plex_duplicates(self, arg: str):
+        """plex_duplicates [--library <name>] — find duplicate movies across Plex libraries"""
+        tokens = arg.strip().split() if arg.strip() else []
+
+        lib_filter = None
+        if "--library" in tokens:
+            idx = tokens.index("--library")
+            if idx + 1 < len(tokens):
+                lib_filter = tokens[idx + 1]
+
+        libs = self.client.libraries()
+        if lib_filter:
+            libs = [l for l in libs if l.get("key") == lib_filter
+                    or l.get("title", "").lower() == lib_filter.lower()]
+        libs = [l for l in libs if l.get("type") == "movie"]
+
+        if not libs:
+            console.print("[yellow]No movie libraries found.[/yellow]"); return
+
+        from collections import defaultdict
+        groups: dict[tuple, list] = defaultdict(list)
+
+        with console.status("Scanning movie libraries...") as status:
+            for lib in libs:
+                lib_key  = lib.get("key", "")
+                lib_name = lib.get("title", lib_key)
+                status.update(f"Scanning [bold]{lib_name}[/bold]…")
+                for item in self.client.library_contents(lib_key):
+                    title = (item.get("title") or "").lower().strip()
+                    year  = item.get("year") or 0
+                    item["_library"] = lib_name
+                    groups[(title, year)].append(item)
+
+        def _item_size(item: dict) -> int:
+            return sum(p.get("size", 0) or 0
+                       for m in (item.get("Media") or [])
+                       for p in (m.get("Part") or []))
+
+        duplicates = []
+        for items in groups.values():
+            if len(items) > 1:
+                duplicates.append(items)
+            elif len(items[0].get("Media") or []) > 1:
+                duplicates.append(items)
+
+        if not duplicates:
+            console.print("[green]No duplicates found.[/green]"); return
+
+        duplicates.sort(key=lambda items: -sum(_item_size(i) for i in items))
+
+        total_wasted = 0
+        for items in duplicates:
+            title = items[0].get("title", "?")
+            year  = items[0].get("year", 0)
+
+            t = Table(title=f"[yellow]{title}[/yellow] ({year})", box=box.SIMPLE_HEAD)
+            t.add_column("Library",    style="dim",  width=20)
+            t.add_column("Resolution", width=12)
+            t.add_column("Codec",      width=8,  style="dim")
+            t.add_column("Size",       width=10, justify="right")
+            t.add_column("Added",      width=17, style="dim")
+
+            sizes = []
+            for item in items:
+                lib_name = item.get("_library", "?")
+                for media in (item.get("Media") or []):
+                    res_raw = media.get("videoResolution", "")
+                    res = f"{res_raw}p" if res_raw and str(res_raw).isdigit() else (res_raw or "?")
+                    codec     = media.get("videoCodec", "?")
+                    part_size = sum((p.get("size") or 0) for p in (media.get("Part") or []))
+                    sizes.append(part_size)
+                    t.add_row(lib_name, res, codec,
+                              format_size(part_size) if part_size else "?",
+                              format_ts(item.get("addedAt")))
+
+            if len(sizes) > 1:
+                total_wasted += sum(sizes) - max(sizes)
+            console.print(t)
+
+        if total_wasted:
+            console.print(f"\n[yellow]Potential reclaimable space:[/yellow] {format_size(total_wasted)} "
+                          f"[dim](keeping the largest copy of each duplicate)[/dim]")
+        console.print(f"[dim]{len(duplicates)} duplicate group(s) found.[/dim]")
+
     def do_collections(self, arg: str):
         section_id = arg.strip() or None
         with console.status("Fetching collections..."):
@@ -5172,6 +5269,92 @@ class PlexShell(cmd.Cmd):
         else:
             console.print("[green]✓ All Plex movies are monitored by Radarr.[/green]")
 
+    def do_radarr_collections(self, arg: str):
+        """radarr_collections [--import] — TMDB franchise completion; --import adds missing to Radarr"""
+        tokens    = arg.strip().split() if arg.strip() else []
+        do_import = "--import" in tokens
+
+        rc = self._get_radarr_client()
+        if not rc: return
+        tc = self._get_tmdb_client()
+        if not tc: return
+
+        with console.status("Loading Radarr library..."):
+            radarr_movies = rc.movies()
+
+        radarr_by_tmdb: dict[int, dict] = {m.get("tmdbId"): m for m in radarr_movies if m.get("tmdbId")}
+
+        from collections import defaultdict
+        by_coll: dict[int, dict] = {}
+        for m in radarr_movies:
+            coll    = m.get("collection") or {}
+            coll_id = coll.get("tmdbId")
+            if not coll_id: continue
+            if coll_id not in by_coll:
+                by_coll[coll_id] = {"name": coll.get("title", "?"), "have": set()}
+            by_coll[coll_id]["have"].add(m.get("tmdbId"))
+
+        if not by_coll:
+            console.print("[yellow]No movies with TMDB collection data found in Radarr.[/yellow]")
+            console.print("[dim]Tip: Radarr populates collection data from TMDB — try refreshing movie metadata in Radarr.[/dim]")
+            return
+
+        plex_set     = self._plex_movie_set()
+        results      = []
+        all_missing: list[dict] = []
+
+        with console.status("Fetching collection details from TMDB...") as status:
+            for coll_id, info in sorted(by_coll.items(), key=lambda x: x[1]["name"]):
+                status.update(f"Fetching [bold]{info['name']}[/bold]…")
+                coll_data = tc.collection(coll_id)
+                parts     = coll_data.get("parts", [])
+                missing   = [p for p in parts if p["tmdb_id"] not in radarr_by_tmdb]
+                results.append({
+                    "name":    coll_data.get("name") or info["name"],
+                    "total":   len(parts),
+                    "have":    len(parts) - len(missing),
+                    "missing": missing,
+                })
+                all_missing.extend(missing)
+
+        results.sort(key=lambda x: (-len(x["missing"]), x["name"]))
+
+        t = Table(title=f"Franchise Completion ({len(results)} collections)", box=box.ROUNDED)
+        t.add_column("Collection", style="bold cyan", min_width=28)
+        t.add_column("Have",  width=5, justify="right")
+        t.add_column("Total", width=5, justify="right", style="dim")
+        t.add_column("Missing", style="yellow", min_width=35)
+
+        for r in results:
+            clr         = "green" if not r["missing"] else "yellow"
+            have_str    = f"[{clr}]{r['have']}[/{clr}]"
+            missing_str = (", ".join(f"{m['title']} ({m['year']})" for m in r["missing"])
+                           if r["missing"] else "[green]complete[/green]")
+            t.add_row(r["name"], have_str, str(r["total"]), missing_str)
+
+        console.print(t)
+
+        total_missing = sum(len(r["missing"]) for r in results)
+        incomplete    = sum(1 for r in results if r["missing"])
+        if total_missing:
+            console.print(f"\n[yellow]{total_missing} film(s) missing[/yellow] across {incomplete} incomplete franchise(s).")
+            if not do_import:
+                console.print("[dim]Run with [bold]--import[/bold] to add all missing to Radarr.[/dim]")
+        else:
+            console.print("[green]All franchises complete.[/green]")
+
+        if do_import and all_missing:
+            seen: set[int] = set()
+            unique: list[dict] = []
+            for m in all_missing:
+                if m["tmdb_id"] not in seen and m["tmdb_id"] not in radarr_by_tmdb:
+                    seen.add(m["tmdb_id"])
+                    unique.append(m)
+            if unique:
+                self._radarr_import_workflow(unique, rc, dry_run=False, profile_id=None, search=False)
+            else:
+                console.print("[green]Nothing new to import.[/green]")
+
     # ── Tab completion ────────────────────────────────────────────────────────
 
     def _cached_libs(self) -> list[dict]:
@@ -5275,12 +5458,24 @@ class PlexShell(cmd.Cmd):
 
     _PB_FLAGS = ["--genre", "--director", "--actor", "--year", "--decade", "--studio",
                  "--contentrating", "--unwatched", "--rating", "--library", "--limit"]
-    _PM_FLAGS = ["--library", "--fix", "--episodes"]
+    _PM_FLAGS  = ["--library", "--fix", "--episodes"]
+    _PD_FLAGS  = ["--library"]
+    _RC_FLAGS  = ["--import"]
 
     def complete_plex_metadata(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)
         if prev == "--library": return self._c_libs(text)
         if text.startswith("-"): return self._c_flags(text, self._PM_FLAGS)
+        return []
+
+    def complete_plex_duplicates(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library": return self._c_libs(text)
+        if text.startswith("-"): return self._c_flags(text, self._PD_FLAGS)
+        return []
+
+    def complete_radarr_collections(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._RC_FLAGS)
         return []
 
     def complete_playlist_build(self, text, line, begidx, endidx):
