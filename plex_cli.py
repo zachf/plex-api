@@ -307,6 +307,9 @@ class PlexClient:
     def set_rating(self, rating_key: str, val: float) -> bool:
         return self.put(f"/library/metadata/{rating_key}", **{"userRating.value": val, "userRating.locked": 1})
 
+    def refresh_metadata(self, rating_key: str) -> bool:
+        return self._request("PUT", f"/library/metadata/{rating_key}/refresh") is not None
+
     def clients(self) -> list:
         discovered = {
             c["machineIdentifier"]: c
@@ -945,6 +948,10 @@ _HELP_SECTIONS = [
         ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
         ("radarr_upgrade", "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
         ("radarr_sync",    "",                                                "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
+    ]),
+    ("Maintenance", [
+        ("plex_metadata",   "[--library <name>] [--fix] [--episodes]",
+                                                                 "Audit library for missing metadata fields; --fix triggers Plex refresh"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -3772,6 +3779,116 @@ class PlexShell(cmd.Cmd):
         console.print(f"[dim]Filters: {desc}[/dim]")
         console.print(f"[dim]View with: [bold]playlist {pl_key}[/bold][/dim]")
 
+    def do_plex_metadata(self, arg: str):
+        """plex_metadata [--library <name>] [--fix] [--episodes] — audit library for missing metadata"""
+        tokens = arg.strip().split() if arg.strip() else []
+        fix              = "--fix" in tokens
+        include_episodes = "--episodes" in tokens
+
+        lib_filter = None
+        if "--library" in tokens:
+            idx = tokens.index("--library")
+            if idx + 1 < len(tokens):
+                lib_filter = tokens[idx + 1]
+
+        MOVIE_FIELDS = [
+            ("thumb",                 "Poster"),
+            ("summary",               "Summary"),
+            ("Genre",                 "Genres"),
+            ("contentRating",         "Content Rating"),
+            ("Director",              "Director"),
+            ("Role",                  "Cast"),
+            ("originallyAvailableAt", "Release Date"),
+            ("audienceRating",        "Rating"),
+        ]
+        SHOW_FIELDS = [
+            ("thumb",                 "Poster"),
+            ("summary",               "Summary"),
+            ("Genre",                 "Genres"),
+            ("contentRating",         "Content Rating"),
+            ("Role",                  "Cast"),
+            ("originallyAvailableAt", "Release Date"),
+        ]
+        EP_FIELDS = [("thumb", "Poster"), ("summary", "Summary")]
+
+        def _missing(item: dict, fields: list) -> list[str]:
+            out = []
+            for field, label in fields:
+                val = item.get(field)
+                if val is None or val == "" or val == []:
+                    out.append(label)
+            return out
+
+        libs = self.client.libraries()
+        if lib_filter:
+            libs = [l for l in libs if l.get("key") == lib_filter
+                    or l.get("title", "").lower() == lib_filter.lower()]
+        libs = [l for l in libs if l.get("type") in ("movie", "show")]
+
+        if not libs:
+            console.print("[yellow]No matching libraries found.[/yellow]"); return
+
+        flagged: list[tuple[str, str, int, list[str], str]] = []
+
+        with console.status("Scanning libraries...") as status:
+            for lib in libs:
+                lib_key  = lib.get("key", "")
+                lib_name = lib.get("title", lib_key)
+                lib_type = lib.get("type", "movie")
+                fields   = MOVIE_FIELDS if lib_type == "movie" else SHOW_FIELDS
+
+                status.update(f"Scanning [bold]{lib_name}[/bold]…")
+                for item in self.client.library_contents(lib_key):
+                    missing = _missing(item, fields)
+                    if missing:
+                        flagged.append((
+                            lib_type,
+                            item.get("title", "?"),
+                            item.get("year") or 0,
+                            missing,
+                            item.get("ratingKey", ""),
+                        ))
+
+                if include_episodes and lib_type == "show":
+                    status.update(f"Scanning episodes in [bold]{lib_name}[/bold]…")
+                    for ep in self.client.library_episodes(lib_key):
+                        missing = _missing(ep, EP_FIELDS)
+                        if missing:
+                            show   = ep.get("grandparentTitle", "?")
+                            season = ep.get("parentIndex")
+                            ep_num = ep.get("index")
+                            if isinstance(season, int) and isinstance(ep_num, int):
+                                label = f"{show} S{season:02d}E{ep_num:02d}"
+                            else:
+                                label = f"{show} — {ep.get('title', '?')}"
+                            flagged.append(("episode", label, 0, missing, ep.get("ratingKey", "")))
+
+        if not flagged:
+            console.print("[green]No metadata issues found.[/green]"); return
+
+        flagged.sort(key=lambda x: -len(x[3]))
+
+        t = Table(title=f"Metadata Issues ({len(flagged)} items)", box=box.ROUNDED)
+        t.add_column("Type",    width=8, style="dim")
+        t.add_column("Title",   style="bold cyan", min_width=30)
+        t.add_column("Year",    width=6, justify="right", style="dim")
+        t.add_column("Missing", style="yellow")
+        for item_type, title, year, missing, _ in flagged:
+            t.add_row(item_type, title, str(year) if year else "", ", ".join(missing))
+        console.print(t)
+
+        if fix:
+            keys = [rk for _, _, _, _, rk in flagged if rk]
+            with console.status(f"Refreshing metadata for {len(keys)} item(s)…"):
+                for rk in keys:
+                    self.client.refresh_metadata(rk)
+            console.print(f"[green]Triggered metadata refresh for {len(keys)} item(s).[/green]")
+            console.print("[dim]Plex will re-fetch metadata in the background.[/dim]")
+        else:
+            console.print(f"[dim]Run with [bold]--fix[/bold] to trigger Plex metadata refresh on all flagged items.[/dim]")
+            if not include_episodes:
+                console.print("[dim]Run with [bold]--episodes[/bold] to also audit episode-level metadata (slow on large libraries).[/dim]")
+
     def do_collections(self, arg: str):
         section_id = arg.strip() or None
         with console.status("Fetching collections..."):
@@ -5158,6 +5275,13 @@ class PlexShell(cmd.Cmd):
 
     _PB_FLAGS = ["--genre", "--director", "--actor", "--year", "--decade", "--studio",
                  "--contentrating", "--unwatched", "--rating", "--library", "--limit"]
+    _PM_FLAGS = ["--library", "--fix", "--episodes"]
+
+    def complete_plex_metadata(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library": return self._c_libs(text)
+        if text.startswith("-"): return self._c_flags(text, self._PM_FLAGS)
+        return []
 
     def complete_playlist_build(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)
