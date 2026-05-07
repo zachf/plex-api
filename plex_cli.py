@@ -520,6 +520,10 @@ class RadarrClient:
         """Trigger an immediate search for movies already in Radarr by their Radarr IDs."""
         return self.post("/command", {"name": "MoviesSearch", "movieIds": movie_ids})
 
+    def calendar(self, start: str, end: str) -> list:
+        r = self.get("/calendar", start=start, end=end)
+        return r if isinstance(r, list) else []
+
 # ── Sonarr client ─────────────────────────────────────────────────────────────
 
 class SonarrClient:
@@ -963,8 +967,9 @@ _HELP_SECTIONS = [
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
         ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
         ("radarr_upgrade", "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
-        ("radarr_sync",        "",         "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
+        ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
         ("radarr_collections", "[--import]", "TMDB franchise completion: show what's missing per series; --import adds them"),
+        ("radarr_calendar",    "[--days N]", "Upcoming movie releases for monitored titles (default 30 days)"),
     ]),
     ("Maintenance", [
         ("plex_metadata",    "[--library <name>] [--fix] [--episodes]",
@@ -5274,6 +5279,67 @@ class PlexShell(cmd.Cmd):
         else:
             console.print("[green]✓ All Plex movies are monitored by Radarr.[/green]")
 
+    def do_radarr_calendar(self, arg: str):
+        """radarr_calendar [--days N] — upcoming movie releases monitored by Radarr (default 30 days)"""
+        tokens = arg.strip().split() if arg.strip() else []
+        days = 30
+        if "--days" in tokens:
+            idx = tokens.index("--days")
+            if idx + 1 < len(tokens):
+                try: days = int(tokens[idx + 1])
+                except ValueError: pass
+
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        from datetime import date, timedelta
+        today = date.today()
+        end   = today + timedelta(days=days)
+
+        with console.status(f"Fetching Radarr calendar ({today} → {end})..."):
+            movies = rc.calendar(today.isoformat(), end.isoformat())
+
+        if not movies:
+            console.print(f"[yellow]No releases in the next {days} day(s).[/yellow]"); return
+
+        def _earliest(m: dict) -> str:
+            dates = [d for d in [m.get("inCinemas"), m.get("physicalRelease"), m.get("digitalRelease")] if d]
+            return min(dates) if dates else "9999"
+
+        def _fmt_date(s: str | None) -> str:
+            if not s: return "—"
+            try: return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+            except Exception: return s[:10]
+
+        movies.sort(key=_earliest)
+
+        t = Table(title=f"Upcoming Releases — next {days} day(s)  ({today} → {end})", box=box.ROUNDED)
+        t.add_column("Title",    style="bold cyan", min_width=28)
+        t.add_column("Year",     width=6,  justify="right", style="dim")
+        t.add_column("Cinemas",  width=12)
+        t.add_column("Physical", width=12)
+        t.add_column("Digital",  width=12)
+        t.add_column("Status",   width=13)
+
+        for m in movies:
+            if m.get("hasFile"):
+                status = "[green]Downloaded[/green]"
+            elif m.get("monitored"):
+                status = "[yellow]Monitored[/yellow]"
+            else:
+                status = "[dim]Unmonitored[/dim]"
+            t.add_row(
+                m.get("title", "?"),
+                str(m.get("year", "")),
+                _fmt_date(m.get("inCinemas")),
+                _fmt_date(m.get("physicalRelease")),
+                _fmt_date(m.get("digitalRelease")),
+                status,
+            )
+
+        console.print(t)
+        console.print(f"[dim]{len(movies)} release(s) found.[/dim]")
+
     def do_radarr_collections(self, arg: str):
         """radarr_collections [--import] — TMDB franchise completion; --import adds missing to Radarr"""
         tokens    = arg.strip().split() if arg.strip() else []
@@ -5481,6 +5547,10 @@ class PlexShell(cmd.Cmd):
 
     def complete_radarr_collections(self, text, line, begidx, endidx):
         if text.startswith("-"): return self._c_flags(text, self._RC_FLAGS)
+        return []
+
+    def complete_radarr_calendar(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, ["--days"])
         return []
 
     def complete_playlist_build(self, text, line, begidx, endidx):
