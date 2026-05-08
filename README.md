@@ -35,6 +35,7 @@ and saved to the same file.
 
 | Key | Source | Default |
 |---|---|---|
+| `plex_url` | Prompted or `PLEX_URL` env var | `http://localhost:32400` |
 | `plex_token` | Prompted or `PLEX_TOKEN` env var | — |
 | `radarr_url` | Prompted or `RADARR_URL` env var | `http://localhost:7878` |
 | `radarr_api_key` | Prompted or `RADARR_API_KEY` env var | — |
@@ -45,8 +46,6 @@ and saved to the same file.
 To find your Plex token: Plex Web → any item → Get Info → View XML → look for `X-Plex-Token` in the URL.
 
 TMDB API key: register free at [themoviedb.org](https://www.themoviedb.org/) → Settings → API.
-
-The server URL is hardcoded at the top of `plex_cli.py` (`BASE_URL`). Change it to match your setup.
 
 ## Usage
 

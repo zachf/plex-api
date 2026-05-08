@@ -37,7 +37,6 @@ if hasattr(sys.stderr, "reconfigure"):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BASE_URL = "http://opus2.local:32400"
 CONFIG_FILE = Path.home() / ".plex_cli.json"
 LISTS_FILE  = Path.home() / ".plex_cli_lists.json"
 PLEX_HEADERS = {
@@ -204,22 +203,23 @@ def get_media_rows(item: dict, library: str = "") -> list:
 # ── API client ────────────────────────────────────────────────────────────────
 
 class PlexClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, base_url: str):
         self.token = token
+        self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update(PLEX_HEADERS)
         self.session.params = {"X-Plex-Token": token}  # type: ignore
 
     def _request(self, method: str, path: str, silent: bool = False, **params):
         """Generic request; returns requests.Response or None on error."""
-        url = f"{BASE_URL}{path}"
+        url = f"{self.base_url}{path}"
         try:
             r = self.session.request(method, url, params=params, timeout=15)
             r.raise_for_status()
             return r
         except requests.exceptions.ConnectionError:
             if not silent:
-                console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+                console.print(f"[red]Cannot reach {self.base_url}[/red]")
         except requests.exceptions.HTTPError as e:
             if not silent:
                 console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
@@ -253,7 +253,7 @@ class PlexClient:
 
     def get_text(self, path: str, silent: bool = False, **params) -> str | None:
         """Fetch a plain-text endpoint, bypassing the JSON Accept header."""
-        url = f"{BASE_URL}{path}"
+        url = f"{self.base_url}{path}"
         headers = {"Accept": "text/plain, */*"}
         try:
             r = self.session.get(url, params=params, headers=headers, timeout=15)
@@ -261,7 +261,7 @@ class PlexClient:
             return r.text
         except requests.exceptions.ConnectionError:
             if not silent:
-                console.print(f"[red]Cannot reach {BASE_URL}[/red]")
+                console.print(f"[red]Cannot reach {self.base_url}[/red]")
             return None
         except requests.exceptions.HTTPError as e:
             if not silent:
@@ -307,6 +307,14 @@ class PlexClient:
     def set_rating(self, rating_key: str, val: float) -> bool:
         return self.put(f"/library/metadata/{rating_key}", **{"userRating.value": val, "userRating.locked": 1})
 
+    def scrobble(self, rating_key: str) -> bool:
+        return self._request("GET", "/:/scrobble",
+                             key=rating_key, identifier="com.plexapp.plugins.library") is not None
+
+    def unscrobble(self, rating_key: str) -> bool:
+        return self._request("GET", "/:/unscrobble",
+                             key=rating_key, identifier="com.plexapp.plugins.library") is not None
+
     def refresh_metadata(self, rating_key: str) -> bool:
         return self._request("PUT", f"/library/metadata/{rating_key}/refresh") is not None
 
@@ -335,7 +343,7 @@ class PlexClient:
         if client_address and client_port:
             attempts.append((f"http://{client_address}:{client_port}/player/playback/{command}", {}))
         if machine_id:
-            attempts.append((f"{BASE_URL}/player/playback/{command}",
+            attempts.append((f"{self.base_url}/player/playback/{command}",
                              {"X-Plex-Target-Client-Identifier": machine_id}))
         last_err = ""
         for url, extra_headers in attempts:
@@ -353,7 +361,7 @@ class PlexClient:
     def play_media(self, machine_id: str, rating_key: str,
                    client_address: str = "", client_port: int = 0) -> bool:
         info = self.server_info()
-        host = BASE_URL.split("://")[-1]
+        host = self.base_url.split("://")[-1]
         return self.player_command(
             "playMedia", machine_id, client_address, client_port,
             key=f"/library/metadata/{rating_key}", offset=0,
@@ -393,7 +401,22 @@ class PlexClient:
     def metadata(self, key: str) -> dict:
         items = self._mc(f"/library/metadata/{key}")
         return items[0] if items else {}
-    def on_deck(self) -> list:             return self._mc("/library/onDeck")
+    def on_deck(self) -> list:
+        all_items: list = []
+        start, page = 0, 50
+        while True:
+            data  = self.get("/library/onDeck",
+                             **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": page})
+            mc    = data.get("MediaContainer", {})
+            batch = mc.get("Metadata", [])
+            all_items.extend(batch)
+            total = mc.get("totalSize") or mc.get("size") or 0
+            if total and start + len(batch) >= int(total):
+                break
+            if len(batch) < page:  # last page — got fewer items than requested
+                break
+            start += page
+        return all_items
     def children(self, key: str) -> list:  return self._mc(f"/library/metadata/{key}/children")
     def duplicates(self, sid: str) -> list: return self._mc(f"/library/sections/{sid}/duplicates")
     def extras(self, key: str) -> list:    return self._mc(f"/library/metadata/{key}/extras")
@@ -827,6 +850,7 @@ _HELP_SECTIONS = [
         ("sessions",        "",                                  "Active playback sessions"),
         ("recent",          "[count]",                           "Recently added content"),
         ("ondeck",          "",                                  "Continue watching"),
+        ("ondeck_clear",    "",                                  "Interactively remove items from On Deck (mark watched or reset progress)"),
         ("children",        "<key>",                             "Seasons / episodes for a show"),
         ("url",             "<key>",                             "Print stream URL for an item"),
         ("token",           "<token>",                           "Set or update your Plex token"),
@@ -1304,7 +1328,7 @@ class PlexShell(cmd.Cmd):
             f"[bold cyan]Version:[/bold cyan] {info.get('version', '—')}\n"
             f"[bold cyan]Platform:[/bold cyan] {info.get('platform', '—')} {info.get('platformVersion', '')}\n"
             f"[bold cyan]My Plex:[/bold cyan] {'[green]yes[/green]' if info.get('myPlex') else '[dim]no[/dim]'}\n"
-            f"[bold cyan]URL:[/bold cyan] {BASE_URL}",
+            f"[bold cyan]URL:[/bold cyan] {self.client.base_url}",
             title="[bold white]Plex Media Server[/bold white]", border_style="green"))
 
     def do_libraries(self, _):
@@ -1386,6 +1410,54 @@ class PlexShell(cmd.Cmd):
             items = self.client.on_deck()
         print_media_table(items, "On Deck")
 
+    def do_ondeck_clear(self, _):
+        """ondeck_clear — interactively remove items from On Deck (mark watched or reset progress)"""
+        try:
+            import questionary
+        except ImportError:
+            console.print("[red]questionary not installed.[/red] Run: pip install questionary"); return
+
+        with console.status("Fetching On Deck..."):
+            items = self.client.on_deck()
+
+        if not items:
+            console.print("[green]On Deck is empty.[/green]"); return
+
+        def _label(item: dict) -> str:
+            pct = int(item.get("viewOffset", 0) / (item.get("duration") or 1) * 100)
+            show = item.get("grandparentTitle", "")
+            title = item.get("title", "?")
+            full = f"{show} — {title}" if show else title
+            return f"{full}  [{pct}%]"
+
+        choices = [questionary.Choice(_label(i), value=i) for i in items]
+        selected = questionary.checkbox("Select items to remove from On Deck:", choices=choices).ask()
+        if not selected:
+            console.print("[dim]Nothing selected.[/dim]"); return
+
+        action = questionary.select(
+            "Action for selected items:",
+            choices=["Mark as watched", "Reset progress (as if never started)"],
+        ).ask()
+        if not action:
+            return
+
+        ok = err = 0
+        for item in selected:
+            rk = item.get("ratingKey", "")
+            if not rk:
+                err += 1; continue
+            if action.startswith("Mark"):
+                success = self.client.scrobble(rk)
+            else:
+                success = self.client.unscrobble(rk)
+            if success: ok += 1
+            else: err += 1
+
+        verb = "marked watched" if action.startswith("Mark") else "reset"
+        console.print(f"[green]{ok} item(s) {verb}.[/green]"
+                      + (f"  [red]{err} failed.[/red]" if err else ""))
+
     def do_children(self, arg: str):
         if not arg.strip():
             console.print("[yellow]Usage: children <key>[/yellow]")
@@ -1398,7 +1470,7 @@ class PlexShell(cmd.Cmd):
         if not arg.strip():
             console.print("[yellow]Usage: url <key>[/yellow]")
             return
-        console.print(f"[cyan]{BASE_URL}/library/metadata/{arg.strip()}/stream?X-Plex-Token={self.client.token}[/cyan]")
+        console.print(f"[cyan]{self.client.base_url}/library/metadata/{arg.strip()}/stream?X-Plex-Token={self.client.token}[/cyan]")
 
     def do_token(self, arg: str):
         if not arg.strip():
@@ -5625,6 +5697,25 @@ class PlexShell(cmd.Cmd):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def get_base_url() -> str:
+    cfg = load_config()
+    if cfg.get("plex_url"):
+        return cfg["plex_url"]
+    url = os.environ.get("PLEX_URL", "")
+    if url:
+        return url
+    console.print(Panel(
+        "No Plex server URL found.\n\n"
+        "Example: [bold]http://192.168.1.100:32400[/bold] or [bold]http://myserver.local:32400[/bold]",
+        title="[yellow]Setup Required[/yellow]", border_style="yellow"))
+    url = Prompt.ask("[yellow]Enter your Plex server URL[/yellow]", default="http://localhost:32400")
+    url = url.rstrip("/")
+    if url:
+        cfg["plex_url"] = url
+        save_config(cfg)
+        console.print(f"[green]URL saved to {CONFIG_FILE}[/green]")
+    return url
+
 def get_token() -> str:
     cfg = load_config()
     if cfg.get("token"):
@@ -5647,15 +5738,19 @@ def get_token() -> str:
 def main():
     one_shot = sys.argv[1:]   # command + args passed on the CLI, if any
 
+    base_url = get_base_url()
+    if not base_url:
+        console.print("[red]No server URL provided. Exiting.[/red]"); sys.exit(1)
+
     if not one_shot:
         console.print(Panel("[bold white]Plex Media Server CLI[/bold white]\n"
-                            f"[dim]Connecting to {BASE_URL}[/dim]", border_style="cyan", expand=False))
+                            f"[dim]Connecting to {base_url}[/dim]", border_style="cyan", expand=False))
 
     token = get_token()
     if not token:
         console.print("[red]No token provided. Exiting.[/red]"); sys.exit(1)
 
-    client = PlexClient(token)
+    client = PlexClient(token, base_url)
     with console.status("Connecting..."):
         info = client.server_info()
 
@@ -5664,7 +5759,7 @@ def main():
             console.print(f"[green]Connected to[/green] [bold]{info.get('friendlyName','Plex Server')}[/bold] "
                           f"[dim]v{info.get('version','')}[/dim]")
         else:
-            console.print(f"[yellow]Could not reach {BASE_URL} — commands may fail.[/yellow]")
+            console.print(f"[yellow]Could not reach {base_url} — commands may fail.[/yellow]")
         console.print("[dim]Type [bold]help[/bold] for available commands.[/dim]\n")
 
     shell = PlexShell(client)
