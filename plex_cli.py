@@ -13,7 +13,7 @@ import shlex
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 try:
@@ -409,14 +409,21 @@ class PlexClient:
                              **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": page})
             mc    = data.get("MediaContainer", {})
             batch = mc.get("Metadata", [])
+            if not batch:
+                break
             all_items.extend(batch)
             total = mc.get("totalSize") or mc.get("size") or 0
             if total and start + len(batch) >= int(total):
                 break
-            if len(batch) < page:  # last page — got fewer items than requested
+            if len(batch) < page:
                 break
             start += page
         return all_items
+    def hubs(self, section_id: str = "", count: int = 10) -> list:
+        if section_id:
+            return self._mc(f"/hubs/sections/{section_id}", "Hub", count=count)
+        return self._mc("/hubs", "Hub", count=count)
+
     def children(self, key: str) -> list:  return self._mc(f"/library/metadata/{key}/children")
     def duplicates(self, sid: str) -> list: return self._mc(f"/library/sections/{sid}/duplicates")
     def extras(self, key: str) -> list:    return self._mc(f"/library/metadata/{key}/extras")
@@ -851,6 +858,7 @@ _HELP_SECTIONS = [
         ("recent",          "[count]",                           "Recently added content"),
         ("ondeck",          "",                                  "Continue watching"),
         ("ondeck_clear",    "",                                  "Interactively remove items from On Deck (mark watched or reset progress)"),
+        ("hubs",            "[--library <name>] [--count N]",    "Home screen hubs: continue watching, recently added, top rated, etc."),
         ("children",        "<key>",                             "Seasons / episodes for a show"),
         ("url",             "<key>",                             "Print stream URL for an item"),
         ("token",           "<token>",                           "Set or update your Plex token"),
@@ -1435,9 +1443,10 @@ class PlexShell(cmd.Cmd):
         if not selected:
             console.print("[dim]Nothing selected.[/dim]"); return
 
+        MARK_WATCHED = "Mark as watched"
         action = questionary.select(
             "Action for selected items:",
-            choices=["Mark as watched", "Reset progress (as if never started)"],
+            choices=[MARK_WATCHED, "Reset progress (as if never started)"],
         ).ask()
         if not action:
             return
@@ -1447,16 +1456,75 @@ class PlexShell(cmd.Cmd):
             rk = item.get("ratingKey", "")
             if not rk:
                 err += 1; continue
-            if action.startswith("Mark"):
-                success = self.client.scrobble(rk)
-            else:
-                success = self.client.unscrobble(rk)
+            success = self.client.scrobble(rk) if action == MARK_WATCHED else self.client.unscrobble(rk)
             if success: ok += 1
             else: err += 1
 
-        verb = "marked watched" if action.startswith("Mark") else "reset"
+        verb = "marked watched" if action == MARK_WATCHED else "reset"
         console.print(f"[green]{ok} item(s) {verb}.[/green]"
                       + (f"  [red]{err} failed.[/red]" if err else ""))
+
+    def do_hubs(self, arg: str):
+        """hubs [--library <name>] [--count N] — home screen hubs: continue watching, recently added, top rated, etc."""
+        tokens = arg.strip().split() if arg.strip() else []
+
+        section_id = ""
+        if "--library" in tokens:
+            idx = tokens.index("--library")
+            if idx + 1 < len(tokens):
+                lib_filter = tokens[idx + 1]
+                for lib in self._cached_libs():
+                    if lib.get("key") == lib_filter or lib.get("title", "").lower() == lib_filter.lower():
+                        section_id = lib.get("key", "")
+                        break
+                if not section_id:
+                    console.print(f"[yellow]Library '{lib_filter}' not found.[/yellow]"); return
+
+        count = 10
+        if "--count" in tokens:
+            idx = tokens.index("--count")
+            if idx + 1 < len(tokens):
+                try: count = int(tokens[idx + 1])
+                except ValueError: pass
+
+        with console.status("Fetching hubs..."):
+            hubs_list = self.client.hubs(section_id, count)
+
+        if not hubs_list:
+            console.print("[yellow]No hubs returned.[/yellow]"); return
+
+        any_shown = False
+        for hub in hubs_list:
+            items = hub.get("Metadata") or []
+            if not items:
+                continue
+
+            hub_title = hub.get("title", "Hub")
+            more      = str(hub.get("more", "")).lower() in ("1", "true")
+
+            t = Table(
+                title=f"[bold]{hub_title}[/bold]" + ("  [dim]+more[/dim]" if more else ""),
+                box=box.SIMPLE_HEAD,
+            )
+            t.add_column("Title",  style="bold cyan", min_width=30)
+            t.add_column("Year",   width=6,  justify="right", style="dim")
+            t.add_column("Type",   width=9,  style="dim")
+            t.add_column("Rating", width=7,  justify="right", style="dim")
+
+            for item in items:
+                parent = item.get("grandparentTitle") or item.get("parentTitle") or ""
+                title  = item.get("title", "?")
+                label  = f"{parent} — {title}" if parent else title
+                yr     = str(item.get("year") or item.get("parentYear") or "")
+                itype  = item.get("type", "")
+                rat    = str(round(float(item["audienceRating"]), 1)) if item.get("audienceRating") else "—"
+                t.add_row(label, yr, itype, rat)
+
+            console.print(t)
+            any_shown = True
+
+        if not any_shown:
+            console.print("[yellow]All hubs are empty.[/yellow]")
 
     def do_children(self, arg: str):
         if not arg.strip():
@@ -4003,7 +4071,6 @@ class PlexShell(cmd.Cmd):
         if not libs:
             console.print("[yellow]No movie libraries found.[/yellow]"); return
 
-        from collections import defaultdict
         groups: dict[tuple, list] = defaultdict(list)
 
         with console.status("Scanning movie libraries...") as status:
@@ -4017,25 +4084,24 @@ class PlexShell(cmd.Cmd):
                     item["_library"] = lib_name
                     groups[(title, year)].append(item)
 
-        def _item_size(item: dict) -> int:
-            return sum(p.get("size", 0) or 0
-                       for m in (item.get("Media") or [])
-                       for p in (m.get("Part") or []))
-
-        duplicates = []
+        # Build duplicate groups; attach pre-computed per-media sizes to avoid recomputing during sort
+        duplicates: list[tuple[list, list[int]]] = []
         for items in groups.values():
-            if len(items) > 1:
-                duplicates.append(items)
-            elif len(items[0].get("Media") or []) > 1:
-                duplicates.append(items)
+            sizes: list[int] = [
+                sum((p.get("size") or 0) for p in (m.get("Part") or []))
+                for item in items
+                for m in (item.get("Media") or [])
+            ]
+            if len(items) > 1 or len(items[0].get("Media") or []) > 1:
+                duplicates.append((items, sizes))
 
         if not duplicates:
             console.print("[green]No duplicates found.[/green]"); return
 
-        duplicates.sort(key=lambda items: -sum(_item_size(i) for i in items))
+        duplicates.sort(key=lambda g: -sum(g[1]))
 
         total_wasted = 0
-        for items in duplicates:
+        for items, sizes in duplicates:
             title = items[0].get("title", "?")
             year  = items[0].get("year", 0)
 
@@ -4046,15 +4112,14 @@ class PlexShell(cmd.Cmd):
             t.add_column("Size",       width=10, justify="right")
             t.add_column("Added",      width=17, style="dim")
 
-            sizes = []
+            size_iter = iter(sizes)
             for item in items:
                 lib_name = item.get("_library", "?")
                 for media in (item.get("Media") or []):
-                    res_raw = media.get("videoResolution", "")
-                    res = f"{res_raw}p" if res_raw and str(res_raw).isdigit() else (res_raw or "?")
+                    res_raw   = media.get("videoResolution", "")
+                    res       = f"{res_raw}p" if res_raw and str(res_raw).isdigit() else (res_raw or "?")
                     codec     = media.get("videoCodec", "?")
-                    part_size = sum((p.get("size") or 0) for p in (media.get("Part") or []))
-                    sizes.append(part_size)
+                    part_size = next(size_iter, 0)
                     t.add_row(lib_name, res, codec,
                               format_size(part_size) if part_size else "?",
                               format_ts(item.get("addedAt")))
@@ -4062,6 +4127,7 @@ class PlexShell(cmd.Cmd):
             if len(sizes) > 1:
                 total_wasted += sum(sizes) - max(sizes)
             console.print(t)
+
 
         if total_wasted:
             console.print(f"\n[yellow]Potential reclaimable space:[/yellow] {format_size(total_wasted)} "
@@ -5298,8 +5364,7 @@ class PlexShell(cmd.Cmd):
 
         # ── Section 2: In Plex but not monitored by Radarr ───────────────────
         # Build year-bucketed lookup for efficient fuzzy matching
-        from collections import defaultdict as _dd
-        radarr_by_year: dict[int, set[str]] = _dd(set)
+        radarr_by_year: dict[int, set[str]] = defaultdict(set)
         for m in radarr_movies:
             radarr_by_year[m.get("year", 0)].add(m.get("title", "").lower().strip())
 
@@ -5364,7 +5429,6 @@ class PlexShell(cmd.Cmd):
         rc = self._get_radarr_client()
         if not rc: return
 
-        from datetime import date, timedelta
         today = date.today()
         end   = today + timedelta(days=days)
 
@@ -5427,7 +5491,6 @@ class PlexShell(cmd.Cmd):
 
         radarr_by_tmdb: dict[int, dict] = {m.get("tmdbId"): m for m in radarr_movies if m.get("tmdbId")}
 
-        from collections import defaultdict
         by_coll: dict[int, dict] = {}
         for m in radarr_movies:
             coll    = m.get("collection") or {}
@@ -5442,8 +5505,7 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Tip: Radarr populates collection data from TMDB — try refreshing movie metadata in Radarr.[/dim]")
             return
 
-        plex_set     = self._plex_movie_set()
-        results      = []
+        results:     list[dict] = []
         all_missing: list[dict] = []
 
         with console.status("Fetching collection details from TMDB...") as status:
@@ -5625,6 +5687,12 @@ class PlexShell(cmd.Cmd):
         if text.startswith("-"): return self._c_flags(text, ["--days"])
         return []
 
+    def complete_hubs(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library": return self._c_libs(text)
+        if text.startswith("-"): return self._c_flags(text, ["--library", "--count"])
+        return []
+
     def complete_playlist_build(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)
         if prev == "--library": return self._c_libs(text)
@@ -5697,8 +5765,7 @@ class PlexShell(cmd.Cmd):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def get_base_url() -> str:
-    cfg = load_config()
+def get_base_url(cfg: dict) -> str:
     if cfg.get("plex_url"):
         return cfg["plex_url"]
     url = os.environ.get("PLEX_URL", "")
@@ -5716,8 +5783,7 @@ def get_base_url() -> str:
         console.print(f"[green]URL saved to {CONFIG_FILE}[/green]")
     return url
 
-def get_token() -> str:
-    cfg = load_config()
+def get_token(cfg: dict) -> str:
     if cfg.get("token"):
         return cfg["token"]
     token = os.environ.get("PLEX_TOKEN", "")
@@ -5738,7 +5804,8 @@ def get_token() -> str:
 def main():
     one_shot = sys.argv[1:]   # command + args passed on the CLI, if any
 
-    base_url = get_base_url()
+    cfg      = load_config()
+    base_url = get_base_url(cfg)
     if not base_url:
         console.print("[red]No server URL provided. Exiting.[/red]"); sys.exit(1)
 
@@ -5746,7 +5813,7 @@ def main():
         console.print(Panel("[bold white]Plex Media Server CLI[/bold white]\n"
                             f"[dim]Connecting to {base_url}[/dim]", border_style="cyan", expand=False))
 
-    token = get_token()
+    token = get_token(cfg)
     if not token:
         console.print("[red]No token provided. Exiting.[/red]"); sys.exit(1)
 
