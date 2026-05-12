@@ -32,3 +32,4 @@ plex_export_*.json
 .DS_Store
 Thumbs.db
 .claude/settings.json
+.claude/settings.local.json
