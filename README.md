@@ -42,6 +42,8 @@ and saved to the same file.
 | `sonarr_url` | Prompted or `SONARR_URL` env var | `http://localhost:8989` |
 | `sonarr_api_key` | Prompted or `SONARR_API_KEY` env var | — |
 | `tmdb_api_key` | Prompted or `TMDB_API_KEY` env var | — |
+| `tautulli_url` | Prompted or `TAUTULLI_URL` env var | `http://localhost:8181` |
+| `tautulli_api_key` | Prompted or `TAUTULLI_API_KEY` env var | — |
 
 To find your Plex token: Plex Web → any item → Get Info → View XML → look for `X-Plex-Token` in the URL.
 

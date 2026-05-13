@@ -205,7 +205,7 @@ def get_media_rows(item: dict, library: str = "") -> list:
 class PlexClient:
     def __init__(self, token: str, base_url: str):
         self.token = token
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url if "://" in base_url else f"http://{base_url}").rstrip("/")
         self.session = requests.Session()
         self.session.headers.update(PLEX_HEADERS)
         self.session.params = {"X-Plex-Token": token}  # type: ignore
@@ -502,7 +502,7 @@ class PlexClient:
 
 class RadarrClient:
     def __init__(self, base_url: str, api_key: str):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url if "://" in base_url else f"http://{base_url}").rstrip("/")
         self.session  = requests.Session()
         self.session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
 
@@ -558,7 +558,7 @@ class RadarrClient:
 
 class SonarrClient:
     def __init__(self, base_url: str, api_key: str):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url if "://" in base_url else f"http://{base_url}").rstrip("/")
         self.session  = requests.Session()
         self.session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
 
@@ -624,6 +624,42 @@ class SonarrClient:
 
     def search_series(self, series_id: int) -> dict:
         return self.post("/command", {"name": "SeriesSearch", "seriesId": series_id})
+
+# ── Tautulli client ───────────────────────────────────────────────────────────
+
+class TautulliClient:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = (base_url if "://" in base_url else f"http://{base_url}").rstrip("/")
+        self.api_key  = api_key
+        self.session  = requests.Session()
+
+    def _cmd(self, cmd: str, **params) -> dict:
+        try:
+            r = self.session.get(
+                f"{self.base_url}/api/v2",
+                params={"apikey": self.api_key, "cmd": cmd, **params},
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json().get("response", {})
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot reach Tautulli at {self.base_url}[/red]"); return {}
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]Tautulli HTTP {e.response.status_code}:[/red] {cmd}"); return {}
+
+    def server_info(self) -> dict:
+        return self._cmd("get_server_info").get("data", {})
+    def home_stats(self, time_range: int = 30, count: int = 10) -> list:
+        return self._cmd("get_home_stats", time_range=time_range, count=count).get("data", [])
+    def plays_by_date(self, time_range: int = 30) -> dict:
+        return self._cmd("get_plays_by_date", time_range=time_range).get("data", {})
+    def users(self) -> list:
+        return self._cmd("get_users").get("data", [])
+    def history(self, length: int = 25, user: str = "") -> list:
+        params: dict = {"start": 0, "length": length, "order_column": "date", "order_dir": "desc"}
+        if user:
+            params["search"] = user
+        return self._cmd("get_history", **params).get("data", {}).get("data", [])
 
 # ── TMDB client ───────────────────────────────────────────────────────────────
 
@@ -987,6 +1023,13 @@ _HELP_SECTIONS = [
         ("sonarr_upgrade", "",           "Shows with episodes below quality cutoff; select to trigger re-search"),
         ("sonarr_add",     "<name>",     "Search for a TV show and add it to Sonarr"),
     ]),
+    ("Tautulli", [
+        ("tautulli_status",  "",                              "Tautulli connection info"),
+        ("tautulli_history", "[--user <name>] [--count N]",  "Rich play history: stream type, duration, platform"),
+        ("tautulli_stats",   "[--days N]",                   "Top movies, shows, and users (default 30 days)"),
+        ("tautulli_plays",   "[--days N]",                   "Plays per day as a bar chart (default 30 days)"),
+        ("tautulli_users",   "",                              "All users ranked by total plays and watch time"),
+    ]),
     ("Radarr", [
         ("radarr_status",   "",                                                "Radarr connection info, quality profiles, root folders"),
         ("radarr_lists",       "",                                             "Show available named TMDB lists"),
@@ -1156,6 +1199,27 @@ class PlexShell(cmd.Cmd):
         if not info:
             return None
         return rc
+
+    def _get_tautulli_client(self) -> "TautulliClient | None":
+        cfg = load_config()
+        url = cfg.get("tautulli_url", "") or os.environ.get("TAUTULLI_URL", "")
+        key = cfg.get("tautulli_api_key", "") or os.environ.get("TAUTULLI_API_KEY", "")
+        if not url or not key:
+            console.print(Panel(
+                "Tautulli URL and API key are required.\n\n"
+                "Find your API key: Tautulli → Settings → Web Interface → API Key",
+                title="[yellow]Tautulli Setup[/yellow]", border_style="yellow"))
+            url = Prompt.ask("[yellow]Tautulli URL[/yellow]", default="http://localhost:8181")
+            key = Prompt.ask("[yellow]Tautulli API Key[/yellow]")
+            if not url or not key:
+                console.print("[red]Tautulli URL and API key are required.[/red]"); return None
+            cfg["tautulli_url"] = url; cfg["tautulli_api_key"] = key; save_config(cfg)
+        tc = TautulliClient(url, key)
+        with console.status("Connecting to Tautulli..."):
+            info = tc.server_info()
+        if not info:
+            return None
+        return tc
 
     def _get_sonarr_client(self) -> "SonarrClient | None":
         cfg = load_config()
@@ -5222,6 +5286,198 @@ class PlexShell(cmd.Cmd):
         else:
             console.print(f"[red]Failed to add show.[/red] Response: {result}")
 
+    # ── Tautulli commands ─────────────────────────────────────────────────────
+
+    def do_tautulli_status(self, _):
+        """tautulli_status — Tautulli connection info"""
+        tc = self._get_tautulli_client()
+        if not tc: return
+        with console.status("Fetching Tautulli info..."):
+            info = tc.server_info()
+        if not info:
+            console.print("[yellow]No server info returned.[/yellow]"); return
+        console.print(Panel(
+            f"[bold cyan]Plex Server:[/bold cyan]   {info.get('pms_name', '—')}\n"
+            f"[bold cyan]Plex Version:[/bold cyan]  {info.get('pms_version', '—')}\n"
+            f"[bold cyan]Tautulli URL:[/bold cyan]  {tc.base_url}",
+            title="[bold white]Tautulli[/bold white]", border_style="green"))
+
+    def do_tautulli_history(self, arg: str):
+        """tautulli_history [--user <name>] [--count N] — rich play history with stream type and duration"""
+        tokens = arg.strip().split() if arg.strip() else []
+        count = 25
+        if "--count" in tokens:
+            idx = tokens.index("--count")
+            if idx + 1 < len(tokens):
+                try: count = int(tokens[idx + 1])
+                except ValueError: pass
+        user = ""
+        if "--user" in tokens:
+            idx = tokens.index("--user")
+            if idx + 1 < len(tokens):
+                user = tokens[idx + 1]
+
+        tc = self._get_tautulli_client()
+        if not tc: return
+        with console.status("Fetching play history..."):
+            records = tc.history(length=count, user=user)
+
+        if not records:
+            console.print("[yellow]No history found.[/yellow]"); return
+
+        _STREAM_COLOR = {"direct play": "green", "copy": "yellow", "transcode": "red"}
+
+        heading = f"Play History — last {count}" + (f"  (user: {user})" if user else "")
+        t = Table(title=heading, box=box.ROUNDED)
+        t.add_column("Date",     width=11, style="dim")
+        t.add_column("User",     width=14, style="cyan")
+        t.add_column("Title",    style="bold white", min_width=28)
+        t.add_column("Type",     width=8,  style="dim")
+        t.add_column("Watched",  width=9,  justify="right")
+        t.add_column("Duration", width=9,  justify="right", style="dim")
+        t.add_column("Platform", width=12, style="dim")
+        t.add_column("Stream",   width=13)
+
+        for r in records:
+            dec  = (r.get("transcode_decision") or "direct play").lower()
+            clr  = _STREAM_COLOR.get(dec, "dim")
+            t.add_row(
+                (format_ts(r.get("date")) or "")[:10],
+                r.get("friendly_name") or r.get("user") or "—",
+                r.get("full_title") or r.get("title") or "—",
+                r.get("media_type", ""),
+                f"{r.get('percent_complete', 0)}%" if r.get("percent_complete") else "—",
+                format_duration((r.get("duration") or 0) * 1000),
+                r.get("platform") or "—",
+                f"[{clr}]{dec}[/{clr}]",
+            )
+        console.print(t)
+
+    def do_tautulli_stats(self, arg: str):
+        """tautulli_stats [--days N] — top movies, shows, and users over the last N days (default 30)"""
+        tokens = arg.strip().split() if arg.strip() else []
+        days = 30
+        if "--days" in tokens:
+            idx = tokens.index("--days")
+            if idx + 1 < len(tokens):
+                try: days = int(tokens[idx + 1])
+                except ValueError: pass
+
+        tc = self._get_tautulli_client()
+        if not tc: return
+        with console.status(f"Fetching stats (last {days} days)..."):
+            stats = tc.home_stats(time_range=days, count=10)
+
+        if not stats:
+            console.print("[yellow]No stats returned.[/yellow]"); return
+
+        by_id = {s.get("stat_id"): s.get("rows", []) for s in stats}
+
+        def _media_table(heading: str, rows: list, label: str) -> None:
+            if not rows: return
+            t = Table(title=heading, box=box.ROUNDED)
+            t.add_column("#",          width=3,  justify="right", style="dim")
+            t.add_column(label,        style="bold cyan", min_width=28)
+            t.add_column("Plays",      width=7,  justify="right")
+            t.add_column("Users",      width=7,  justify="right", style="dim")
+            t.add_column("Watch Time", width=11, justify="right", style="dim")
+            for i, row in enumerate(rows, 1):
+                t.add_row(str(i), row.get("title", "?"),
+                          str(row.get("total_plays", "")),
+                          str(row.get("users_watched", "")),
+                          format_duration((row.get("total_duration") or 0) * 1000))
+            console.print(t)
+
+        _media_table(f"Top Movies — last {days} days",   by_id.get("top_movies", []), "Movie")
+        _media_table(f"Top TV Shows — last {days} days", by_id.get("top_tv", []),     "Show")
+
+        user_rows = by_id.get("top_users", [])
+        if user_rows:
+            t = Table(title=f"Top Users — last {days} days", box=box.ROUNDED)
+            t.add_column("#",          width=3,  justify="right", style="dim")
+            t.add_column("User",       style="bold cyan", min_width=18)
+            t.add_column("Plays",      width=7,  justify="right")
+            t.add_column("Watch Time", width=11, justify="right", style="dim")
+            t.add_column("Last Seen",  width=11, style="dim")
+            for i, row in enumerate(user_rows, 1):
+                last = (format_ts(row.get("last_play")) or "")[:10]
+                t.add_row(str(i),
+                          row.get("friendly_name") or row.get("user", "?"),
+                          str(row.get("total_plays", "")),
+                          format_duration((row.get("total_duration") or 0) * 1000),
+                          last)
+            console.print(t)
+
+    def do_tautulli_plays(self, arg: str):
+        """tautulli_plays [--days N] — plays per day as a bar chart (default 30 days)"""
+        tokens = arg.strip().split() if arg.strip() else []
+        days = 30
+        if "--days" in tokens:
+            idx = tokens.index("--days")
+            if idx + 1 < len(tokens):
+                try: days = int(tokens[idx + 1])
+                except ValueError: pass
+
+        tc = self._get_tautulli_client()
+        if not tc: return
+        with console.status(f"Fetching play data (last {days} days)..."):
+            data = tc.plays_by_date(time_range=days)
+
+        categories = data.get("categories", [])
+        series     = data.get("series", [])
+        if not categories or not series:
+            console.print("[yellow]No play data returned.[/yellow]"); return
+
+        totals    = [sum(s["data"][i] for s in series if i < len(s.get("data", [])))
+                     for i in range(len(categories))]
+        max_plays = max(totals) if any(totals) else 1
+        BAR_WIDTH = 28
+
+        t = Table(title=f"Plays per Day — last {days} days", box=box.SIMPLE_HEAD)
+        t.add_column("Date", width=12, style="dim")
+        for s in series:
+            t.add_column(s.get("name", ""), width=7, justify="right", style="dim")
+        t.add_column("Total", width=6, justify="right")
+        t.add_column("", min_width=BAR_WIDTH)
+
+        for i, cat in enumerate(categories):
+            day_vals = [s["data"][i] if i < len(s.get("data", [])) else 0 for s in series]
+            total    = totals[i]
+            bar      = "█" * int(total / max_plays * BAR_WIDTH) if total else ""
+            t.add_row(cat, *[str(v) for v in day_vals], str(total),
+                      f"[cyan]{bar}[/cyan]" if bar else "")
+        console.print(t)
+
+    def do_tautulli_users(self, _):
+        """tautulli_users — all users ranked by total plays and watch time"""
+        tc = self._get_tautulli_client()
+        if not tc: return
+        with console.status("Fetching users..."):
+            users = tc.users()
+
+        if not users:
+            console.print("[yellow]No users found.[/yellow]"); return
+
+        users = [u for u in users if u.get("username") not in ("", "Local")]
+        users.sort(key=lambda u: u.get("total_plays") or 0, reverse=True)
+
+        t = Table(title=f"Users ({len(users)})", box=box.ROUNDED)
+        t.add_column("User",        style="bold cyan", min_width=18)
+        t.add_column("Plays",       width=7,  justify="right")
+        t.add_column("Watch Time",  width=11, justify="right")
+        t.add_column("Last Seen",   width=11, style="dim")
+        t.add_column("Last Played", style="dim", min_width=25)
+
+        for u in users:
+            t.add_row(
+                u.get("friendly_name") or u.get("username") or "?",
+                str(u.get("total_plays") or 0),
+                format_duration((u.get("total_duration") or 0) * 1000),
+                (format_ts(u.get("last_seen")) or "")[:10],
+                u.get("last_played") or "—",
+            )
+        console.print(t)
+
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
         rc = self._get_radarr_client()
@@ -5712,6 +5968,22 @@ class PlexShell(cmd.Cmd):
     # sonarr_status, sonarr_sync, sonarr_missing, sonarr_upgrade take no args
     complete_sonarr_status = complete_sonarr_sync = complete_sonarr_missing = \
         complete_sonarr_upgrade = lambda self, text, *_: []
+
+    # tautulli_status and tautulli_users take no args
+    complete_tautulli_status = complete_tautulli_users = lambda self, text, *_: []
+
+    _TH_FLAGS  = ["--user", "--count"]
+    _TSD_FLAGS = ["--days"]
+
+    def complete_tautulli_history(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._TH_FLAGS)
+        return []
+
+    def complete_tautulli_stats(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._TSD_FLAGS)
+        return []
+
+    complete_tautulli_plays = complete_tautulli_stats
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
