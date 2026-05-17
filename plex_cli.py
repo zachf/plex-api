@@ -722,6 +722,34 @@ class TMDBClient:
         )
         return {"name": data.get("name", ""), "parts": parts}
 
+    def genre_ids(self) -> dict[str, int]:
+        """Fetch TMDB movie genre name → ID mapping."""
+        return {g["name"]: g["id"]
+                for g in self._get("/genre/movie/list").get("genres", [])}
+
+    def discover_movies(self, genre_filter: str, min_votes: int = 1000,
+                        min_rating: float = 6.5, pages: int = 8) -> list[dict]:
+        """Discover movies by pipe-separated genre IDs (OR logic), sorted by popularity."""
+        results = []
+        for page in range(1, pages + 1):
+            data = self._get("/discover/movie", **{
+                "with_genres":       genre_filter,
+                "sort_by":           "popularity.desc",
+                "vote_count.gte":    min_votes,
+                "vote_average.gte":  min_rating,
+                "language":          "en-US",
+                "page":              page,
+            })
+            for m in data.get("results", []):
+                results.append({
+                    "tmdb_id":  m["id"],
+                    "title":    m.get("title", "?"),
+                    "year":     int((m.get("release_date") or "0")[:4] or 0),
+                    "rating":   round(float(m.get("vote_average") or 0), 1),
+                    "overview": m.get("overview", ""),
+                })
+        return results
+
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
 _DEFAULT_TMDB_LISTS: dict[str, int] = {
@@ -881,7 +909,8 @@ def _distribution_table(title: str, counts: Counter, cap: int = 0):
 
 _HELP_SECTIONS = [
     ("Dashboard", [
-        ("health",          "",                                  "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
+        ("health",                "",                                "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
+        ("smart_recommendations", "[--count N] [--min-rating R]",   "Personalized movie picks from Tautulli history × TMDB (filters against Plex + Radarr)"),
     ]),
     ("Basic", [
         ("status",          "",                                  "Server info and version"),
@@ -5478,6 +5507,120 @@ class PlexShell(cmd.Cmd):
             )
         console.print(t)
 
+    def do_smart_recommendations(self, arg: str):
+        """smart_recommendations [--count N] [--min-rating R] — personalized picks from Tautulli watch history × TMDB"""
+        tokens = arg.strip().split() if arg.strip() else []
+        count = 20
+        if "--count" in tokens:
+            idx = tokens.index("--count")
+            if idx + 1 < len(tokens):
+                try: count = int(tokens[idx + 1])
+                except ValueError: pass
+        min_rating = 6.5
+        if "--min-rating" in tokens:
+            idx = tokens.index("--min-rating")
+            if idx + 1 < len(tokens):
+                try: min_rating = float(tokens[idx + 1])
+                except ValueError: pass
+
+        tc   = self._get_tautulli_client()
+        if not tc: return
+        tmdb = self._get_tmdb_client()
+        if not tmdb: return
+
+        # ── Step 1: play history (movies only) ──────────────────────────────
+        with console.status("Fetching play history from Tautulli..."):
+            records = tc.history(length=500)
+
+        movie_plays: Counter = Counter()
+        for r in records:
+            if r.get("media_type") == "movie" and r.get("rating_key"):
+                movie_plays[str(r["rating_key"])] += 1
+
+        if not movie_plays:
+            console.print("[yellow]No movie play history found in Tautulli.[/yellow]"); return
+
+        # ── Step 2: build genre profile from Plex metadata ──────────────────
+        with console.status("Building genre profile from Plex library..."):
+            genre_scores: Counter = Counter()
+            for lib in self.client.libraries():
+                if lib.get("type") != "movie": continue
+                for item in self.client.library_contents(lib.get("key", "")):
+                    rk = str(item.get("ratingKey", ""))
+                    if rk not in movie_plays: continue
+                    plays = movie_plays[rk]
+                    for g in (item.get("Genre") or []):
+                        tag = g.get("tag", "")
+                        if tag:
+                            genre_scores[tag] += plays
+
+        if not genre_scores:
+            console.print("[yellow]Could not match play history to Plex library items.[/yellow]")
+            console.print("[dim]Ensure Tautulli is connected to the same Plex server.[/dim]"); return
+
+        top_genres = [g for g, _ in genre_scores.most_common(5)]
+        console.print(f"[dim]Genre profile:[/dim] {', '.join(top_genres)}")
+
+        # ── Step 3: map genre names → TMDB IDs ──────────────────────────────
+        with console.status("Fetching TMDB genre map..."):
+            genre_map = tmdb.genre_ids()
+
+        tmdb_genre_ids = [genre_map[g] for g in top_genres if g in genre_map]
+        if not tmdb_genre_ids:
+            console.print("[yellow]Could not map genres to TMDB IDs.[/yellow]"); return
+
+        # ── Step 4: discover via TMDB — query each top genre separately ──────
+        # Querying genres individually (not combined) gives a much wider candidate
+        # pool for large libraries that already own the most popular cross-genre films.
+        id_to_name = {v: k for k, v in genre_map.items()}
+        seen_ids: set[int] = set()
+        candidates: list[dict] = []
+        for gid in tmdb_genre_ids[:3]:
+            with console.status(f"Fetching TMDB {id_to_name.get(gid, gid)} films..."):
+                for m in tmdb.discover_movies(str(gid), min_rating=min_rating):
+                    if m["tmdb_id"] not in seen_ids:
+                        seen_ids.add(m["tmdb_id"])
+                        candidates.append(m)
+
+        # ── Step 5: filter against Plex (and Radarr if configured) ──────────
+        with console.status("Cross-referencing your library..."):
+            plex_set = self._plex_movie_set()
+
+        cfg = load_config()
+        radarr_tmdb_ids: set = set()
+        r_url = cfg.get("radarr_url") or os.environ.get("RADARR_URL", "")
+        r_key = cfg.get("radarr_api_key") or os.environ.get("RADARR_API_KEY", "")
+        if r_url and r_key:
+            with console.status("Cross-referencing Radarr..."):
+                radarr_tmdb_ids = {m.get("tmdbId") for m in RadarrClient(r_url, r_key).movies()}
+
+        results: list[dict] = []
+        for m in sorted(candidates, key=lambda x: -x["rating"]):
+            if self._in_plex(m["title"], m["year"], plex_set): continue
+            if m["tmdb_id"] in radarr_tmdb_ids: continue
+            results.append(m)
+            if len(results) >= count: break
+
+        if not results:
+            console.print("[green]No new recommendations — your library already has everything in these genres![/green]"); return
+
+        t = Table(title=f"Recommended for You  ({len(results)} films)", box=box.ROUNDED)
+        t.add_column("#",        width=3,  justify="right", style="dim")
+        t.add_column("Title",    style="bold cyan", min_width=28)
+        t.add_column("Year",     width=6,  justify="right", style="dim")
+        t.add_column("Rating",   width=7,  justify="right")
+        t.add_column("Overview", style="dim", min_width=40)
+
+        for i, m in enumerate(results, 1):
+            overview = m.get("overview", "")
+            if len(overview) > 80:
+                overview = overview[:79] + "…"
+            t.add_row(str(i), m["title"], str(m["year"]) if m["year"] else "—",
+                      str(m["rating"]), overview)
+        console.print(t)
+        console.print(f"\n[dim]Genres: {', '.join(top_genres[:3])} · "
+                      f"min rating {min_rating} · {len(movie_plays)} movies in history[/dim]")
+
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
         rc = self._get_radarr_client()
@@ -5984,6 +6127,12 @@ class PlexShell(cmd.Cmd):
         return []
 
     complete_tautulli_plays = complete_tautulli_stats
+
+    _SR_FLAGS = ["--count", "--min-rating"]
+
+    def complete_smart_recommendations(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._SR_FLAGS)
+        return []
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
