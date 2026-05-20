@@ -705,7 +705,8 @@ class TMDBClient:
         data = self._get(f"/person/{person_id}/movie_credits")
         return sorted(
             [{"tmdb_id": m["id"], "title": m["title"],
-              "year": int((m.get("release_date") or "0")[:4] or 0)}
+              "year":   int((m.get("release_date") or "0")[:4] or 0),
+              "rating": round(float(m.get("vote_average") or 0), 1)}
              for m in data.get("crew", [])
              if m.get("job") == "Director" and m.get("release_date")],
             key=lambda x: x["year"],
@@ -749,6 +750,17 @@ class TMDBClient:
                     "overview": m.get("overview", ""),
                 })
         return results
+
+    def trending(self, time_window: str = "week") -> list[dict]:
+        """Fetch trending movies for 'day' or 'week'."""
+        data = self._get(f"/trending/movie/{time_window}")
+        return [{"tmdb_id":    m["id"],
+                 "title":      m.get("title", "?"),
+                 "year":       int((m.get("release_date") or "0")[:4] or 0),
+                 "rating":     round(float(m.get("vote_average") or 0), 1),
+                 "overview":   m.get("overview", ""),
+                 "popularity": m.get("popularity", 0)}
+                for m in data.get("results", [])]
 
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
@@ -911,6 +923,8 @@ _HELP_SECTIONS = [
     ("Dashboard", [
         ("health",                "",                                "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
         ("smart_recommendations", "[--count N] [--min-rating R]",   "Personalized movie picks from Tautulli history × TMDB (filters against Plex + Radarr)"),
+        ("trending_in_library",   "[--window day|week]",            "TMDB trending movies split by owned / not owned (default: week)"),
+        ("director_deep_dive",    "<name>",                         "Full filmography: Plex ownership, Tautulli watch status, Radarr presence"),
     ]),
     ("Basic", [
         ("status",          "",                                  "Server info and version"),
@@ -5621,6 +5635,161 @@ class PlexShell(cmd.Cmd):
         console.print(f"\n[dim]Genres: {', '.join(top_genres[:3])} · "
                       f"min rating {min_rating} · {len(movie_plays)} movies in history[/dim]")
 
+    def do_trending_in_library(self, arg: str):
+        """trending_in_library [--window day|week] — TMDB trending movies split by in/out of your library"""
+        tokens = arg.strip().split() if arg.strip() else []
+        window = "week"
+        if "--window" in tokens:
+            idx = tokens.index("--window")
+            if idx + 1 < len(tokens) and tokens[idx + 1] in ("day", "week"):
+                window = tokens[idx + 1]
+
+        tmdb = self._get_tmdb_client()
+        if not tmdb: return
+
+        with console.status(f"Fetching TMDB trending ({window})..."):
+            movies = tmdb.trending(window)
+        with console.status("Cross-referencing Plex library..."):
+            plex_set = self._plex_movie_set()
+
+        in_lib     = [m for m in movies if     self._in_plex(m["title"], m["year"], plex_set)]
+        not_in_lib = [m for m in movies if not self._in_plex(m["title"], m["year"], plex_set)]
+
+        label = "this week" if window == "week" else "today"
+
+        def _table(title: str, rows: list, name_style: str) -> None:
+            if not rows: return
+            t = Table(title=title, box=box.ROUNDED)
+            t.add_column("#",        width=3,  justify="right", style="dim")
+            t.add_column("Title",    style=name_style, min_width=28)
+            t.add_column("Year",     width=6,  justify="right", style="dim")
+            t.add_column("Rating",   width=7,  justify="right")
+            t.add_column("Overview", style="dim", min_width=35)
+            for i, m in enumerate(rows, 1):
+                ov = m.get("overview", "")
+                if len(ov) > 72: ov = ov[:71] + "…"
+                t.add_row(str(i), m["title"], str(m["year"]) if m["year"] else "—",
+                          str(m["rating"]), ov)
+            console.print(t)
+
+        _table(f"Trending {label} — [green]in your library[/green]  ({len(in_lib)})",
+               in_lib, "bold green")
+        _table(f"Trending {label} — [yellow]not in your library[/yellow]  ({len(not_in_lib)})",
+               not_in_lib, "bold yellow")
+        if not_in_lib:
+            console.print("[dim]Use [bold]radarr_import[/bold] or [bold]radarr_director[/bold] to add any of these.[/dim]")
+
+    def do_director_deep_dive(self, arg: str):
+        """director_deep_dive <name> — full filmography: owned in Plex, watched, in Radarr, missing"""
+        name = arg.strip()
+        if not name:
+            console.print("[yellow]Usage: director_deep_dive <name>[/yellow]"); return
+
+        tmdb = self._get_tmdb_client()
+        if not tmdb: return
+
+        with console.status(f"Searching TMDB for '{name}'..."):
+            candidates = tmdb.search_person(name)
+        if not candidates:
+            console.print(f"[yellow]No TMDB results for '{name}'.[/yellow]"); return
+
+        best = min(candidates[:8],
+                   key=lambda p: -SequenceMatcher(None, name.lower(), (p.get("name") or "").lower()).ratio())
+        if len(candidates) == 1:
+            person = candidates[0]
+            console.print(f"[dim]Found: {person.get('name')}[/dim]")
+        else:
+            try:
+                import questionary
+                choices = [
+                    questionary.Choice(
+                        f"{p.get('name')} — {', '.join(k.get('title') or k.get('name','') for k in p.get('known_for', [])[:2]) or '?'}",
+                        value=p,
+                    )
+                    for p in candidates[:8]
+                ]
+                person = questionary.select("Select director:", choices=choices).ask()
+                if not person: return
+            except Exception:
+                person = best
+                console.print(f"[dim]Using best match: {person.get('name')}[/dim]")
+
+        with console.status(f"Fetching {person['name']} filmography..."):
+            films = tmdb.director_filmography(person["id"])
+        if not films:
+            console.print(f"[yellow]No directed films found for {person.get('name')}.[/yellow]"); return
+
+        with console.status("Loading Plex library..."):
+            plex_set = self._plex_movie_set()
+
+        # Silent Radarr check
+        cfg = load_config()
+        radarr_ids: set = set()
+        r_url = cfg.get("radarr_url") or os.environ.get("RADARR_URL", "")
+        r_key = cfg.get("radarr_api_key") or os.environ.get("RADARR_API_KEY", "")
+        if r_url and r_key:
+            with console.status("Loading Radarr..."):
+                radarr_ids = {m.get("tmdbId") for m in RadarrClient(r_url, r_key).movies()}
+
+        # Silent Tautulli check
+        watched: set[tuple[str, int]] = set()
+        t_url = cfg.get("tautulli_url") or os.environ.get("TAUTULLI_URL", "")
+        t_key = cfg.get("tautulli_api_key") or os.environ.get("TAUTULLI_API_KEY", "")
+        if t_url and t_key:
+            with console.status("Loading Tautulli watch history..."):
+                for r in TautulliClient(t_url, t_key).history(length=1000):
+                    if r.get("media_type") == "movie":
+                        title = (r.get("full_title") or r.get("title") or "").lower().strip()
+                        if title:
+                            watched.add((title, int(r.get("year") or 0)))
+
+        def _was_watched(title: str, year: int) -> bool:
+            t = title.lower().strip()
+            if (t, year) in watched: return True
+            return any(abs(wy - year) <= 1 and SequenceMatcher(None, t, wt).ratio() >= 0.88
+                       for wt, wy in watched)
+
+        t = Table(
+            title=f"[bold white]{person['name']}[/bold white] — {len(films)} directed films",
+            box=box.ROUNDED,
+        )
+        t.add_column("Year",   width=6,  justify="right", style="dim")
+        t.add_column("Title",  style="bold cyan", min_width=30)
+        t.add_column("Rating", width=7,  justify="right", style="dim")
+        t.add_column("Plex",   width=6,  justify="center")
+        if watched:
+            t.add_column("Watched", width=8, justify="center")
+        if radarr_ids:
+            t.add_column("Radarr", width=7, justify="center")
+
+        in_plex = watched_count = in_radarr = 0
+        for f in reversed(films):  # newest first
+            has_plex   = self._in_plex(f["title"], f["year"], plex_set)
+            has_radarr = f["tmdb_id"] in radarr_ids
+            seen       = _was_watched(f["title"], f["year"]) if watched else False
+            if has_plex:   in_plex      += 1
+            if seen:       watched_count += 1
+            if has_radarr: in_radarr    += 1
+            row = [
+                str(f["year"]) if f["year"] else "—",
+                f["title"],
+                f"{f['rating']:.1f}" if f.get("rating") else "—",
+                "[green]✓[/green]" if has_plex else "[dim]—[/dim]",
+            ]
+            if watched:
+                row.append("[green]✓[/green]" if seen else "[dim]—[/dim]")
+            if radarr_ids:
+                row.append("[blue]✓[/blue]" if has_radarr else "[dim]—[/dim]")
+            t.add_row(*row)
+
+        console.print(t)
+        summary = [f"[green]{in_plex}/{len(films)} in Plex[/green]"]
+        if watched:
+            summary.append(f"[cyan]{watched_count}/{len(films)} watched[/cyan]")
+        if radarr_ids:
+            summary.append(f"[blue]{in_radarr}/{len(films)} in Radarr[/blue]")
+        console.print("  ·  ".join(summary))
+
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
         rc = self._get_radarr_client()
@@ -6133,6 +6302,14 @@ class PlexShell(cmd.Cmd):
     def complete_smart_recommendations(self, text, line, begidx, endidx):
         if text.startswith("-"): return self._c_flags(text, self._SR_FLAGS)
         return []
+
+    def complete_trending_in_library(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--window": return [w for w in ("day", "week") if w.startswith(text)]
+        if text.startswith("-"): return self._c_flags(text, ["--window"])
+        return []
+
+    # director_deep_dive takes a free-text name — no useful tab completion
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
