@@ -946,8 +946,8 @@ _HELP_SECTIONS = [
         ("smart_recommendations", "[--count N] [--min-rating R]",   "Personalized movie picks from Tautulli history × TMDB (filters against Plex + Radarr)"),
         ("trending_in_library",   "[--window day|week]",            "TMDB trending movies split by owned / not owned (default: week)"),
         ("tmdb_movie",            "<title>",                        "Search TMDB by title and display full details (rating, cast, crew, budget, Plex/Radarr status)"),
-        ("director_deep_dive",    "<name>",                         "Full filmography: Plex ownership, Tautulli watch status, Radarr presence"),
-        ("actor_deep_dive",       "<name>",                         "Acting credits with character names: Plex ownership, Tautulli watch status, Radarr presence"),
+        ("director_deep_dive",    "<name> [--sort-rating]",         "Full filmography: Plex ownership, Tautulli watch status, Radarr presence"),
+        ("actor_deep_dive",       "<name> [--sort-rating]",         "Acting credits with character names: Plex ownership, Tautulli watch status, Radarr presence"),
     ]),
     ("Basic", [
         ("status",          "",                                  "Server info and version"),
@@ -5834,10 +5834,12 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Use [bold]radarr_import[/bold] or [bold]radarr_director[/bold] to add any of these.[/dim]")
 
     def do_director_deep_dive(self, arg: str):
-        """director_deep_dive <name> — full filmography: owned in Plex, watched, in Radarr, missing"""
-        name = arg.strip()
+        """director_deep_dive <name> [--sort-rating] — full filmography: owned in Plex, watched, in Radarr, missing"""
+        tokens = arg.strip().split()
+        sort_by_rating = "--sort-rating" in tokens
+        name = " ".join(t for t in tokens if t != "--sort-rating").strip()
         if not name:
-            console.print("[yellow]Usage: director_deep_dive <name>[/yellow]"); return
+            console.print("[yellow]Usage: director_deep_dive <name> [--sort-rating][/yellow]"); return
 
         tmdb = self._get_tmdb_client()
         if not tmdb: return
@@ -5916,8 +5918,9 @@ class PlexShell(cmd.Cmd):
         if radarr_ids:
             t.add_column("Radarr", width=7, justify="center")
 
+        ordered = sorted(films, key=lambda f: -(f.get("rating") or 0)) if sort_by_rating else reversed(films)
         in_plex = watched_count = in_radarr = 0
-        for f in reversed(films):  # newest first
+        for f in ordered:
             has_plex   = self._in_plex(f["title"], f["year"], plex_set)
             has_radarr = f["tmdb_id"] in radarr_ids
             seen       = _was_watched(f["title"], f["year"]) if watched else False
@@ -5945,10 +5948,12 @@ class PlexShell(cmd.Cmd):
         console.print("  ·  ".join(summary))
 
     def do_actor_deep_dive(self, arg: str):
-        """actor_deep_dive <name> — filmography as actor: owned in Plex, watched, in Radarr"""
-        name = arg.strip()
+        """actor_deep_dive <name> [--sort-rating] — filmography as actor: owned in Plex, watched, in Radarr"""
+        tokens = arg.strip().split()
+        sort_by_rating = "--sort-rating" in tokens
+        name = " ".join(t for t in tokens if t != "--sort-rating").strip()
         if not name:
-            console.print("[yellow]Usage: actor_deep_dive <name>[/yellow]"); return
+            console.print("[yellow]Usage: actor_deep_dive <name> [--sort-rating][/yellow]"); return
 
         tmdb = self._get_tmdb_client()
         if not tmdb: return
@@ -6026,8 +6031,9 @@ class PlexShell(cmd.Cmd):
         if radarr_ids:
             t.add_column("Radarr", width=7, justify="center")
 
+        ordered = sorted(films, key=lambda f: -(f.get("rating") or 0)) if sort_by_rating else reversed(films)
         in_plex = watched_count = in_radarr = 0
-        for f in reversed(films):  # newest first
+        for f in ordered:
             has_plex   = self._in_plex(f["title"], f["year"], plex_set)
             has_radarr = f["tmdb_id"] in radarr_ids
             seen       = _was_watched(f["title"], f["year"]) if watched else False
