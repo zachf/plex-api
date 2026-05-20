@@ -712,7 +712,7 @@ class TMDBClient:
             key=lambda x: x["year"],
         )
 
-    def actor_filmography(self, person_id: int) -> list[dict]:
+    def actor_filmography(self, person_id: int, include_self: bool = False) -> list[dict]:
         data = self._get(f"/person/{person_id}/movie_credits")
         return sorted(
             [{"tmdb_id": m["id"], "title": m["title"],
@@ -720,7 +720,8 @@ class TMDBClient:
               "rating":    round(float(m.get("vote_average") or 0), 1),
               "character": m.get("character") or ""}
              for m in data.get("cast", [])
-             if m.get("release_date") and m.get("title")],
+             if m.get("release_date") and m.get("title")
+             and (include_self or (m.get("character") or "").strip().lower() != "self")],
             key=lambda x: x["year"],
         )
 
@@ -773,6 +774,14 @@ class TMDBClient:
                  "overview":   m.get("overview", ""),
                  "popularity": m.get("popularity", 0)}
                 for m in data.get("results", [])]
+
+    def search_movie(self, query: str) -> list[dict]:
+        """Search TMDB for movies by title → list of result dicts."""
+        return self._get("/search/movie", query=query).get("results", [])
+
+    def movie_detail(self, tmdb_id: int) -> dict:
+        """Fetch full movie detail including credits and keywords."""
+        return self._get(f"/movie/{tmdb_id}", append_to_response="credits,keywords")
 
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
@@ -936,6 +945,7 @@ _HELP_SECTIONS = [
         ("health",                "",                                "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
         ("smart_recommendations", "[--count N] [--min-rating R]",   "Personalized movie picks from Tautulli history × TMDB (filters against Plex + Radarr)"),
         ("trending_in_library",   "[--window day|week]",            "TMDB trending movies split by owned / not owned (default: week)"),
+        ("tmdb_movie",            "<title>",                        "Search TMDB by title and display full details (rating, cast, crew, budget, Plex/Radarr status)"),
         ("director_deep_dive",    "<name>",                         "Full filmography: Plex ownership, Tautulli watch status, Radarr presence"),
         ("actor_deep_dive",       "<name>",                         "Acting credits with character names: Plex ownership, Tautulli watch status, Radarr presence"),
     ]),
@@ -5647,6 +5657,137 @@ class PlexShell(cmd.Cmd):
         console.print(t)
         console.print(f"\n[dim]Genres: {', '.join(top_genres[:3])} · "
                       f"min rating {min_rating} · {len(movie_plays)} movies in history[/dim]")
+
+    def do_tmdb_movie(self, arg: str):
+        """tmdb_movie <title> — search TMDB for a movie and display full details"""
+        query = arg.strip()
+        if not query:
+            console.print("[yellow]Usage: tmdb_movie <title>[/yellow]"); return
+
+        tmdb = self._get_tmdb_client()
+        if not tmdb: return
+
+        with console.status(f"Searching TMDB for '{query}'..."):
+            results = tmdb.search_movie(query)
+        if not results:
+            console.print(f"[yellow]No TMDB results for '{query}'.[/yellow]"); return
+
+        # Pick result
+        if len(results) == 1:
+            chosen = results[0]
+        else:
+            try:
+                import questionary
+                choices = [
+                    questionary.Choice(
+                        f"{m.get('title')} ({(m.get('release_date') or '?')[:4]}) — {(m.get('overview') or '')[:60]}",
+                        value=m,
+                    )
+                    for m in results[:10]
+                ]
+                chosen = questionary.select("Select movie:", choices=choices).ask()
+                if not chosen: return
+            except Exception:
+                best = min(results[:10],
+                           key=lambda m: -SequenceMatcher(None, query.lower(),
+                                                          (m.get("title") or "").lower()).ratio())
+                chosen = best
+                console.print(f"[dim]Using best match: {chosen.get('title')}[/dim]")
+
+        with console.status("Fetching full details..."):
+            d = tmdb.movie_detail(chosen["id"])
+        if not d:
+            console.print("[red]Could not fetch movie details.[/red]"); return
+
+        year    = (d.get("release_date") or "")[:4]
+        runtime = d.get("runtime") or 0
+        budget  = d.get("budget") or 0
+        revenue = d.get("revenue") or 0
+        genres  = ", ".join(g["name"] for g in d.get("genres", []))
+        langs   = ", ".join(l.get("english_name", l.get("name", ""))
+                            for l in d.get("spoken_languages", []))
+        countries = ", ".join(c.get("name", "") for c in d.get("production_countries", []))
+        studios = ", ".join(c["name"] for c in d.get("production_companies", [])[:4])
+        keywords = ", ".join(k["name"] for k in
+                             (d.get("keywords") or {}).get("keywords", [])[:12])
+
+        crew    = (d.get("credits") or {}).get("crew", [])
+        cast    = (d.get("credits") or {}).get("cast", [])
+        directors = ", ".join(p["name"] for p in crew if p.get("job") == "Director")
+        writers   = ", ".join({p["name"] for p in crew
+                               if p.get("department") == "Writing"}
+                              )[:120]
+        top_cast  = ", ".join(f"{p['name']} as {p.get('character','?')}"
+                              for p in cast[:6])
+
+        # Header panel
+        rating     = d.get("vote_average") or 0
+        vote_count = d.get("vote_count") or 0
+        tagline    = d.get("tagline") or ""
+        overview   = d.get("overview") or ""
+
+        header = f"[bold white]{d.get('title', '?')}[/bold white]"
+        if d.get("original_title") and d["original_title"] != d.get("title"):
+            header += f"  [dim]({d['original_title']})[/dim]"
+        if year:
+            header += f"  [dim]{year}[/dim]"
+        if runtime:
+            header += f"  [dim]· {runtime} min[/dim]"
+        if rating:
+            header += f"  [yellow]★ {rating:.1f}[/yellow][dim]/{vote_count:,} votes[/dim]"
+
+        console.print(Panel(header, box=box.ROUNDED))
+        if tagline:
+            console.print(f"  [italic dim]{tagline}[/italic dim]")
+        if overview:
+            console.print(f"\n  {overview}\n")
+
+        # Details table
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column("Field", style="bold dim", width=16)
+        t.add_column("Value")
+
+        def _row(label, val):
+            if val:
+                t.add_row(label, str(val))
+
+        _row("TMDB ID",    str(d.get("id", "")))
+        _row("IMDB ID",    d.get("imdb_id") or "")
+        _row("Status",     d.get("status") or "")
+        _row("Genres",     genres)
+        _row("Languages",  langs)
+        _row("Countries",  countries)
+        _row("Director",   directors)
+        _row("Writers",    writers)
+        _row("Cast",       top_cast)
+        _row("Studios",    studios)
+        if budget:
+            _row("Budget",  f"${budget:,.0f}")
+        if revenue:
+            _row("Revenue", f"${revenue:,.0f}")
+        _row("Keywords",   keywords)
+
+        # Collection membership
+        col = d.get("belongs_to_collection")
+        if col:
+            _row("Collection", col.get("name", ""))
+
+        console.print(t)
+
+        # Cross-reference silent checks
+        cfg = load_config()
+        notes = []
+        plex_set = self._plex_movie_set()
+        if self._in_plex(d.get("title", ""), int(year) if year else 0, plex_set):
+            notes.append("[green]✓ In your Plex library[/green]")
+        r_url = cfg.get("radarr_url") or os.environ.get("RADARR_URL", "")
+        r_key = cfg.get("radarr_api_key") or os.environ.get("RADARR_API_KEY", "")
+        if r_url and r_key:
+            radarr_ids = {m.get("tmdbId") for m in RadarrClient(r_url, r_key).movies()}
+            if d.get("id") in radarr_ids:
+                notes.append("[blue]✓ In Radarr[/blue]")
+        if notes:
+            console.print("  " + "  ·  ".join(notes))
 
     def do_trending_in_library(self, arg: str):
         """trending_in_library [--window day|week] — TMDB trending movies split by in/out of your library"""

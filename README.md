@@ -219,6 +219,7 @@ Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
 |---|---|---|
 | `smart_recommendations` | `[--count N] [--min-rating R]` | Personalized picks: builds a genre profile from your Tautulli history, queries TMDB for popular matching films, filters out anything already in Plex or Radarr |
 | `trending_in_library` | `[--window day\|week]` | TMDB trending movies split into owned vs. not-yet-owned (default: week) |
+| `tmdb_movie` | `<title>` | Search TMDB by title and display full details: overview, rating, cast, director, studios, budget/revenue, keywords, plus Plex and Radarr status |
 | `director_deep_dive` | `<name>` | Full directed filmography with Plex ownership, Tautulli watch status, and Radarr presence per title |
 | `actor_deep_dive` | `<name>` | Acting credits with character names, Plex ownership, Tautulli watch status, and Radarr presence |
 
