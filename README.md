@@ -211,6 +211,17 @@ python plex_cli.py <command> [args]
 | `size_by_codec` | `[library_id]` | Total and average file size by video codec |
 | `channel_dist` | `[library_id]` | Audio channel layout distribution |
 
+### Cross-API Intelligence
+
+Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
+
+| Command | Args | Description |
+|---|---|---|
+| `smart_recommendations` | `[--count N] [--min-rating R]` | Personalized picks: builds a genre profile from your Tautulli history, queries TMDB for popular matching films, filters out anything already in Plex or Radarr |
+| `trending_in_library` | `[--window day\|week]` | TMDB trending movies split into owned vs. not-yet-owned (default: week) |
+| `director_deep_dive` | `<name>` | Full directed filmography with Plex ownership, Tautulli watch status, and Radarr presence per title |
+| `actor_deep_dive` | `<name>` | Acting credits with character names, Plex ownership, Tautulli watch status, and Radarr presence |
+
 ### Item Extras
 
 | Command | Args | Description |

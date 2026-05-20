@@ -712,6 +712,18 @@ class TMDBClient:
             key=lambda x: x["year"],
         )
 
+    def actor_filmography(self, person_id: int) -> list[dict]:
+        data = self._get(f"/person/{person_id}/movie_credits")
+        return sorted(
+            [{"tmdb_id": m["id"], "title": m["title"],
+              "year":      int((m.get("release_date") or "0")[:4] or 0),
+              "rating":    round(float(m.get("vote_average") or 0), 1),
+              "character": m.get("character") or ""}
+             for m in data.get("cast", [])
+             if m.get("release_date") and m.get("title")],
+            key=lambda x: x["year"],
+        )
+
     def collection(self, collection_id: int) -> dict:
         """Fetch a TMDB franchise/collection → {name, parts: [{tmdb_id, title, year}]}"""
         data = self._get(f"/collection/{collection_id}")
@@ -925,6 +937,7 @@ _HELP_SECTIONS = [
         ("smart_recommendations", "[--count N] [--min-rating R]",   "Personalized movie picks from Tautulli history × TMDB (filters against Plex + Radarr)"),
         ("trending_in_library",   "[--window day|week]",            "TMDB trending movies split by owned / not owned (default: week)"),
         ("director_deep_dive",    "<name>",                         "Full filmography: Plex ownership, Tautulli watch status, Radarr presence"),
+        ("actor_deep_dive",       "<name>",                         "Acting credits with character names: Plex ownership, Tautulli watch status, Radarr presence"),
     ]),
     ("Basic", [
         ("status",          "",                                  "Server info and version"),
@@ -5790,6 +5803,117 @@ class PlexShell(cmd.Cmd):
             summary.append(f"[blue]{in_radarr}/{len(films)} in Radarr[/blue]")
         console.print("  ·  ".join(summary))
 
+    def do_actor_deep_dive(self, arg: str):
+        """actor_deep_dive <name> — filmography as actor: owned in Plex, watched, in Radarr"""
+        name = arg.strip()
+        if not name:
+            console.print("[yellow]Usage: actor_deep_dive <name>[/yellow]"); return
+
+        tmdb = self._get_tmdb_client()
+        if not tmdb: return
+
+        with console.status(f"Searching TMDB for '{name}'..."):
+            candidates = tmdb.search_person(name)
+        if not candidates:
+            console.print(f"[yellow]No TMDB results for '{name}'.[/yellow]"); return
+
+        best = min(candidates[:8],
+                   key=lambda p: -SequenceMatcher(None, name.lower(), (p.get("name") or "").lower()).ratio())
+        if len(candidates) == 1:
+            person = candidates[0]
+            console.print(f"[dim]Found: {person.get('name')}[/dim]")
+        else:
+            try:
+                import questionary
+                choices = [
+                    questionary.Choice(
+                        f"{p.get('name')} — {', '.join(k.get('title') or k.get('name','') for k in p.get('known_for', [])[:2]) or '?'}",
+                        value=p,
+                    )
+                    for p in candidates[:8]
+                ]
+                person = questionary.select("Select actor:", choices=choices).ask()
+                if not person: return
+            except Exception:
+                person = best
+                console.print(f"[dim]Using best match: {person.get('name')}[/dim]")
+
+        with console.status(f"Fetching {person['name']} filmography..."):
+            films = tmdb.actor_filmography(person["id"])
+        if not films:
+            console.print(f"[yellow]No acting credits found for {person.get('name')}.[/yellow]"); return
+
+        with console.status("Loading Plex library..."):
+            plex_set = self._plex_movie_set()
+
+        cfg = load_config()
+        radarr_ids: set = set()
+        r_url = cfg.get("radarr_url") or os.environ.get("RADARR_URL", "")
+        r_key = cfg.get("radarr_api_key") or os.environ.get("RADARR_API_KEY", "")
+        if r_url and r_key:
+            with console.status("Loading Radarr..."):
+                radarr_ids = {m.get("tmdbId") for m in RadarrClient(r_url, r_key).movies()}
+
+        watched: set[tuple[str, int]] = set()
+        t_url = cfg.get("tautulli_url") or os.environ.get("TAUTULLI_URL", "")
+        t_key = cfg.get("tautulli_api_key") or os.environ.get("TAUTULLI_API_KEY", "")
+        if t_url and t_key:
+            with console.status("Loading Tautulli watch history..."):
+                for r in TautulliClient(t_url, t_key).history(length=1000):
+                    if r.get("media_type") == "movie":
+                        title = (r.get("full_title") or r.get("title") or "").lower().strip()
+                        if title:
+                            watched.add((title, int(r.get("year") or 0)))
+
+        def _was_watched(title: str, year: int) -> bool:
+            t = title.lower().strip()
+            if (t, year) in watched: return True
+            return any(abs(wy - year) <= 1 and SequenceMatcher(None, t, wt).ratio() >= 0.88
+                       for wt, wy in watched)
+
+        t = Table(
+            title=f"[bold white]{person['name']}[/bold white] — {len(films)} acting credits",
+            box=box.ROUNDED,
+        )
+        t.add_column("Year",      width=6,  justify="right", style="dim")
+        t.add_column("Title",     style="bold cyan", min_width=28)
+        t.add_column("Character", style="italic", min_width=20)
+        t.add_column("Rating",    width=7,  justify="right", style="dim")
+        t.add_column("Plex",      width=6,  justify="center")
+        if watched:
+            t.add_column("Watched", width=8, justify="center")
+        if radarr_ids:
+            t.add_column("Radarr", width=7, justify="center")
+
+        in_plex = watched_count = in_radarr = 0
+        for f in reversed(films):  # newest first
+            has_plex   = self._in_plex(f["title"], f["year"], plex_set)
+            has_radarr = f["tmdb_id"] in radarr_ids
+            seen       = _was_watched(f["title"], f["year"]) if watched else False
+            if has_plex:   in_plex      += 1
+            if seen:       watched_count += 1
+            if has_radarr: in_radarr    += 1
+            row = [
+                str(f["year"]) if f["year"] else "—",
+                f["title"],
+                f["character"] or "—",
+                f"{f['rating']:.1f}" if f.get("rating") else "—",
+                "[green]✓[/green]" if has_plex else "[dim]—[/dim]",
+            ]
+            if watched:
+                row.append("[green]✓[/green]" if seen else "[dim]—[/dim]")
+            if radarr_ids:
+                row.append("[blue]✓[/blue]" if has_radarr else "[dim]—[/dim]")
+            t.add_row(*row)
+
+        console.print(t)
+        summary = [f"[green]{in_plex}/{len(films)} in Plex[/green]"]
+        if watched:
+            summary.append(f"[cyan]{watched_count}/{len(films)} watched[/cyan]")
+        if radarr_ids:
+            summary.append(f"[blue]{in_radarr}/{len(films)} in Radarr[/blue]")
+        console.print("  ·  ".join(summary))
+
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
         rc = self._get_radarr_client()
@@ -6309,7 +6433,7 @@ class PlexShell(cmd.Cmd):
         if text.startswith("-"): return self._c_flags(text, ["--window"])
         return []
 
-    # director_deep_dive takes a free-text name — no useful tab completion
+    # director_deep_dive / actor_deep_dive take a free-text name — no useful tab completion
 
     def complete_refresh(self, text, line, begidx, *_):
         tokens = line[:begidx].split()
