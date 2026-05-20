@@ -721,7 +721,7 @@ class TMDBClient:
               "character": m.get("character") or ""}
              for m in data.get("cast", [])
              if m.get("release_date") and m.get("title")
-             and (include_self or (m.get("character") or "").strip().lower() != "self")],
+             and (include_self or "self" not in (m.get("character") or "").lower())],
             key=lambda x: x["year"],
         )
 
