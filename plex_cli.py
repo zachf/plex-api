@@ -4312,13 +4312,30 @@ class PlexShell(cmd.Cmd):
         console.print(ft)
 
     def do_radarr_lists(self, _):
-        """radarr_lists — show available named TMDB lists"""
+        """radarr_lists — show available named TMDB lists with movie counts"""
         lists = load_lists()
+
+        # Silently fetch counts from TMDB if credentials are available
+        counts: dict[int, str] = {}
+        cfg = load_config()
+        tmdb_key = cfg.get("tmdb_api_key") or os.environ.get("TMDB_API_KEY", "")
+        if tmdb_key:
+            tc = TMDBClient(tmdb_key)
+            with console.status("Fetching list counts from TMDB..."):
+                for list_id in lists.values():
+                    info = tc.list_info(list_id)
+                    counts[list_id] = str(info.get("item_count", "—")) if info else "—"
+
         t = Table(title=f"Available Lists ({len(lists)})", box=box.ROUNDED)
         t.add_column("Name",         style="bold cyan", min_width=22)
         t.add_column("TMDB List ID", style="dim",       width=14, justify="right")
+        if counts:
+            t.add_column("Movies", width=8, justify="right")
         for n, list_id in sorted(lists.items()):
-            t.add_row(n, str(list_id))
+            row = [n, str(list_id)]
+            if counts:
+                row.append(counts.get(list_id, "—"))
+            t.add_row(*row)
         console.print(t)
         console.print(f"[dim]Config: {LISTS_FILE}[/dim]")
         console.print("[dim]Use [bold]radarr_list <name>[/bold] to preview, "
