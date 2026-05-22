@@ -546,6 +546,16 @@ class RadarrClient:
             "monitored": monitored, "addOptions": {"searchForMovie": search_on_add},
         })
 
+    def put(self, path: str, payload: dict) -> dict:
+        r = self._request("PUT", path, json=payload)
+        if r is None: return {}
+        try: return r.json()
+        except Exception: return {}
+
+    def update_movie(self, movie: dict) -> dict:
+        """PUT the full movie object back to Radarr (used to change quality profile etc.)."""
+        return self.put(f"/movie/{movie['id']}", movie)
+
     def search_movies(self, movie_ids: list[int]) -> dict:
         """Trigger an immediate search for movies already in Radarr by their Radarr IDs."""
         return self.post("/command", {"name": "MoviesSearch", "movieIds": movie_ids})
@@ -1107,7 +1117,8 @@ _HELP_SECTIONS = [
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
         ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
-        ("radarr_upgrade", "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
+        ("radarr_upgrade",    "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
+        ("radarr_upgrade_4k", "<title> [--search]",                             "Switch a movie's quality profile to 4K and optionally trigger a search"),
         ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
         ("radarr_collections", "[--import]", "TMDB franchise completion: show what's missing per series; --import adds them"),
         ("radarr_calendar",    "[--days N]", "Upcoming movie releases for monitored titles (default 30 days)"),
@@ -6077,6 +6088,108 @@ class PlexShell(cmd.Cmd):
         if radarr_ids:
             summary.append(f"[blue]{in_radarr}/{len(films)} in Radarr[/blue]")
         console.print("  ·  ".join(summary))
+
+    def do_radarr_upgrade_4k(self, arg: str):
+        """radarr_upgrade_4k <title> [--search] — switch a movie's quality profile to 4K and optionally trigger a search"""
+        tokens = arg.strip().split()
+        search_now = "--search" in tokens
+        query = " ".join(t for t in tokens if t != "--search").strip()
+        if not query:
+            console.print("[yellow]Usage: radarr_upgrade_4k <title> [--search][/yellow]"); return
+
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        with console.status("Loading Radarr library..."):
+            all_movies = rc.movies()
+            profiles   = rc.quality_profiles()
+
+        # Find 4K-capable profiles (name contains "4k", "2160", or "uhd", case-insensitive)
+        hd_profiles = [p for p in profiles
+                       if any(k in p.get("name", "").lower() for k in ("4k", "2160", "uhd"))]
+        if not hd_profiles:
+            console.print("[red]No 4K quality profiles found in Radarr.[/red]")
+            console.print("[dim]Available profiles: " +
+                          ", ".join(p["name"] for p in profiles) + "[/dim]")
+            return
+
+        # Fuzzy-match movie by title
+        matches = sorted(
+            all_movies,
+            key=lambda m: -SequenceMatcher(None, query.lower(),
+                                           (m.get("title") or "").lower()).ratio(),
+        )
+        # Keep candidates with a reasonable match score
+        candidates = [m for m in matches
+                      if SequenceMatcher(None, query.lower(),
+                                        (m.get("title") or "").lower()).ratio() >= 0.4][:10]
+        if not candidates:
+            console.print(f"[yellow]No Radarr movies matching '{query}'.[/yellow]"); return
+
+        if len(candidates) == 1:
+            movie = candidates[0]
+            console.print(f"[dim]Found: {movie['title']} ({movie.get('year', '?')})[/dim]")
+        else:
+            try:
+                import questionary
+                choices = [
+                    questionary.Choice(
+                        f"{m['title']} ({m.get('year','?')}) — "
+                        f"{next((p['name'] for p in profiles if p['id'] == m.get('qualityProfileId')), '?')}",
+                        value=m,
+                    )
+                    for m in candidates
+                ]
+                movie = questionary.select("Select movie:", choices=choices).ask()
+                if not movie: return
+            except Exception:
+                movie = candidates[0]
+                console.print(f"[dim]Using best match: {movie['title']}[/dim]")
+
+        # Resolve current profile name
+        profile_map = {p["id"]: p["name"] for p in profiles}
+        current_profile = profile_map.get(movie.get("qualityProfileId"), "?")
+
+        # Pick 4K profile
+        if len(hd_profiles) == 1:
+            target_profile = hd_profiles[0]
+        else:
+            try:
+                import questionary
+                choices = [questionary.Choice(p["name"], value=p) for p in hd_profiles]
+                target_profile = questionary.select("Select 4K profile:", choices=choices).ask()
+                if not target_profile: return
+            except Exception:
+                target_profile = hd_profiles[0]
+                console.print(f"[dim]Using profile: {target_profile['name']}[/dim]")
+
+        if target_profile["id"] == movie.get("qualityProfileId"):
+            console.print(f"[yellow]{movie['title']} is already on profile "
+                          f"'{target_profile['name']}'.[/yellow]"); return
+
+        console.print(
+            f"[bold]{movie['title']}[/bold] ({movie.get('year','?')})\n"
+            f"  [dim]{current_profile}[/dim] → [green]{target_profile['name']}[/green]"
+        )
+        if Prompt.ask("Apply?", choices=["y", "n"], default="n") != "y":
+            console.print("[dim]Cancelled.[/dim]"); return
+
+        updated = dict(movie)
+        updated["qualityProfileId"] = target_profile["id"]
+        with console.status("Updating..."):
+            result = rc.update_movie(updated)
+
+        if result.get("id"):
+            console.print(f"[green]Updated.[/green] Quality profile set to "
+                          f"[bold]{target_profile['name']}[/bold].")
+            if search_now:
+                with console.status("Triggering search..."):
+                    rc.search_movies([movie["id"]])
+                console.print("[green]Search triggered.[/green]")
+            else:
+                console.print("[dim]Run with [bold]--search[/bold] to trigger an immediate download search.[/dim]")
+        else:
+            console.print("[red]Update failed — Radarr returned an unexpected response.[/red]")
 
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
