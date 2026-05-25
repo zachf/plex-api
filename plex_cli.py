@@ -88,7 +88,7 @@ def year(item: dict) -> str:
 
 def rating(item: dict) -> str:
     r = item.get("rating") or item.get("audienceRating")
-    return f"{r:.1f}" if r else "—"
+    return f"{r:.1f}" if r is not None else "—"
 
 def full_title(item: dict) -> str:
     """Compose grandparent — parent — title for display."""
@@ -883,7 +883,7 @@ def build_sessions_table(sessions: list) -> Table:
         state = s.get("Player", {}).get("state", "unknown")
         offset = s.get("viewOffset", 0)
         dur = s.get("duration", 0) or 1
-        pct = int(offset / dur * 100)
+        pct = max(0, min(100, int(offset / dur * 100)))
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
         color = {"playing": "green", "paused": "yellow", "buffering": "magenta"}.get(state, "white")
         parent = s.get("grandparentTitle", "")
@@ -2594,6 +2594,8 @@ class PlexShell(cmd.Cmd):
 
     def do_alert(self, arg: str):
         interval = int(arg.strip()) if arg.strip().isdigit() else 10
+        if interval < 1:
+            interval = 1
         console.print(f"[dim]Monitoring for transcodes every {interval}s — Ctrl+C to stop[/dim]")
         known: set = set()
         try:
@@ -2713,7 +2715,7 @@ class PlexShell(cmd.Cmd):
         t.add_column("Subtitle", style="dim", min_width=24); t.add_column("Progress", width=22)
         t.add_column("Cancel", width=8)
         for a in activities:
-            pct = int(a.get("progress",0))
+            pct = max(0, min(100, int(a.get("progress",0))))
             t.add_row(a.get("type",""), a.get("title",""), a.get("subtitle",""),
                       f"[cyan]{'█'*(pct//5)}{'░'*(20-pct//5)}[/cyan] {pct}%",
                       "yes" if a.get("cancellable") else "—")
