@@ -96,7 +96,6 @@ python plex_cli.py <command> [args]
 
 | Command | Args | Description |
 |---|---|---|
-| `dupes` | | Items Plex flagged as duplicate files |
 | `dupetitles` | | Items sharing the same title and year |
 | `duplicates_smart` | `[--tolerance s] [--match-name] [--library name]` | Fuzzy duplicate detection |
 | `missing` | | Items with incomplete metadata |

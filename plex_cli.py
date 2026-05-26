@@ -980,7 +980,6 @@ _HELP_SECTIONS = [
         ("token",           "<token>",                           "Set or update your Plex token"),
     ]),
     ("Library health", [
-        ("dupes",           "",                                  "Items Plex flagged as duplicate files"),
         ("dupetitles",      "",                                  "Items sharing the same title and year"),
         ("duplicates_smart","[--tolerance s] [--match-name] [--library name]","--match-name alone: title-only search; --tolerance: duration grouping (±30s default)"),
         ("missing",         "",                                  "Items with incomplete metadata"),
@@ -1901,32 +1900,6 @@ class PlexShell(cmd.Cmd):
             console.print(t)
         if not found_any:
             console.print("[green]No duplicate titles found.[/green]")
-
-    def do_dupes(self, _):
-        libs = self.client.libraries()
-        if not libs:
-            return
-        found_any = False
-        with console.status("Scanning for duplicates..."):
-            for lib in libs:
-                lid, lib_title = lib.get("key",""), lib.get("title","")
-                dupes = self.client.duplicates(lid)
-                if not dupes:
-                    continue
-                found_any = True
-                t = Table(title=f"Duplicates in '{lib_title}'", box=box.ROUNDED)
-                t.add_column("Key", style="dim", width=7)
-                t.add_column("Title", style="bold white", min_width=28)
-                t.add_column("Year", width=6)
-                t.add_column("Files", justify="right", width=6)
-                t.add_column("Total Size", justify="right", width=12)
-                for item in dupes:
-                    sz = sum(p.get("size",0) for m in item.get("Media",[]) for p in m.get("Part",[]))
-                    fc = sum(len(m.get("Part",[])) for m in item.get("Media",[]))
-                    t.add_row(item.get("ratingKey",""), item.get("title",""), year(item), str(fc), format_size(sz))
-                console.print(t)
-        if not found_any:
-            console.print("[green]No duplicates found.[/green]")
 
     def do_missing(self, _):
         with console.status("Scanning all libraries..."):
