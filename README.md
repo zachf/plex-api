@@ -72,6 +72,9 @@ python plex_cli.py <command> [args]
 | Command | Description |
 |---|---|
 | `health` | One-page summary: library stats, zero-duration items, stale shows, Radarr sync and upgrade gaps |
+| `watch_next` | Ranked picks from On Deck, unwatched ratings, recency, runtime, and genre filters |
+| `quality_upgrade_plan` | Prioritize Radarr/Sonarr quality upgrades using Plex watch stats |
+| `premiere_watchlist` | Radarr release calendar with Plex indexed/missing status |
 
 ### Basic
 
@@ -217,6 +220,10 @@ Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
 
 | Command | Args | Description |
 |---|---|---|
+| `watch_next` | `[--count N] [--library id] [--runtime min] [--genre g] [--type movie\|episode]` | Ranked Plex picks from On Deck, unwatched ratings, recency, and filters |
+| `quality_upgrade_plan` | `[--limit N] [--movies\|--shows]` | Prioritize Radarr/Sonarr cutoff upgrades using Plex play stats |
+| `premiere_watchlist` | `[--days N] [--past N] [--missing-only]` | Radarr release calendar cross-checked against Plex indexing |
+| `collection_gaps` | `[--import] [--dry-run] [--limit N]` | TMDB franchise gaps across Plex and Radarr; optionally add Radarr gaps |
 | `smart_recommendations` | `[--count N] [--min-rating R]` | Personalized picks: builds a genre profile from your Tautulli history, queries TMDB for popular matching films, filters out anything already in Plex or Radarr |
 | `trending_in_library` | `[--window day\|week]` | TMDB trending movies split into owned vs. not-yet-owned (default: week) |
 | `tmdb_movie` | `<title>` | Search TMDB by title and display full details: overview, rating, cast, director, studios, budget/revenue, keywords, plus Plex and Radarr status |
@@ -249,6 +256,7 @@ Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
 | `playlist_remove` | `<playlist_id> <item_id>` | Remove an item from a playlist |
 | `collections` | `[library_id]` | List collections |
 | `collection` | `<key>` | Show items in a collection |
+| `collection_gaps` | `[--import] [--dry-run] [--limit N]` | TMDB franchise gaps across Plex and Radarr; optionally import Radarr gaps |
 | `playlist_build` | `<name> [--genre g] [--director d] [--actor a] [--year y] [--decade Xd] [--studio s] [--contentrating r] [--unwatched] [--rating n] [--library id] [--limit n]` | Build a playlist from combined filters |
 
 `playlist_build` examples:

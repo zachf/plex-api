@@ -953,6 +953,10 @@ def _distribution_table(title: str, counts: Counter, cap: int = 0):
 _HELP_SECTIONS = [
     ("Dashboard", [
         ("health",                "",                                "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
+        ("watch_next",            "[--count N] [--library id] [--runtime min] [--genre g] [--type movie|episode]",
+                                                                 "Ranked picks from On Deck, unwatched ratings, recency, and runtime filters"),
+        ("quality_upgrade_plan",  "[--limit N] [--movies|--shows]", "Prioritize Radarr/Sonarr quality upgrades using Plex watch stats"),
+        ("premiere_watchlist",    "[--days N] [--past N] [--missing-only]", "Radarr release calendar with Plex indexed/missing status"),
         ("smart_recommendations", "[--count N] [--min-rating R]",   "Personalized movie picks from Tautulli history × TMDB (filters against Plex + Radarr)"),
         ("trending_in_library",   "[--window day|week]",            "TMDB trending movies split by owned / not owned (default: week)"),
         ("tmdb_movie",            "<title>",                        "Search TMDB by title and display full details (rating, cast, crew, budget, Plex/Radarr status)"),
@@ -1089,6 +1093,7 @@ _HELP_SECTIONS = [
         ("playlist_remove", "<playlist_id> <item_id>",           "Remove an item from a playlist"),
         ("collections",     "[library_id]",                      "List collections (all or by library)"),
         ("collection",      "<key>",                             "Show items in a collection"),
+        ("collection_gaps",  "[--import] [--dry-run] [--limit N]", "TMDB franchise gaps across Plex and Radarr; optionally import Radarr gaps"),
         ("playlist_build",  "<name> [--genre g] [--director d] [--actor a] [--year y] [--decade Xd] [--studio s] [--contentrating r] [--unwatched] [--rating n] [--library id] [--limit n]",
                                                                  "Build a playlist from combined filters"),
     ]),
@@ -1255,6 +1260,45 @@ class PlexShell(cmd.Cmd):
     def _parse_size_args(self, arg: str) -> tuple[int, str]:
         _, flags = parse_search_args(arg)
         return next((int(t) for t in arg.split() if t.isdigit()), 25), flags.get("library", "")
+
+    def _tokens(self, arg: str) -> list[str]:
+        try:
+            return shlex.split(arg.strip()) if arg.strip() else []
+        except ValueError:
+            return arg.strip().split()
+
+    def _has_flag(self, tokens: list[str], flag: str) -> bool:
+        return flag in tokens
+
+    def _flag_value(self, tokens: list[str], flag: str, default: str = "") -> str:
+        if flag not in tokens:
+            return default
+        idx = tokens.index(flag)
+        if idx + 1 >= len(tokens) or tokens[idx + 1].startswith("--"):
+            return default
+        return tokens[idx + 1]
+
+    def _int_flag(self, tokens: list[str], flag: str, default: int,
+                  minimum: int = 0) -> int:
+        raw = self._flag_value(tokens, flag, "")
+        if not raw:
+            return default
+        try:
+            return max(minimum, int(raw))
+        except ValueError:
+            return default
+
+    def _configured_radarr_client(self) -> "RadarrClient | None":
+        cfg = load_config()
+        url = cfg.get("radarr_url", "") or os.environ.get("RADARR_URL", "")
+        key = cfg.get("radarr_api_key", "") or os.environ.get("RADARR_API_KEY", "")
+        return RadarrClient(url, key) if url and key else None
+
+    def _configured_sonarr_client(self) -> "SonarrClient | None":
+        cfg = load_config()
+        url = cfg.get("sonarr_url", "") or os.environ.get("SONARR_URL", "")
+        key = cfg.get("sonarr_api_key", "") or os.environ.get("SONARR_API_KEY", "")
+        return SonarrClient(url, key) if url and key else None
 
     def _get_radarr_client(self) -> "RadarrClient | None":
         cfg = load_config()
@@ -1558,6 +1602,133 @@ class PlexShell(cmd.Cmd):
         with console.status("Fetching on deck..."):
             items = self.client.on_deck()
         print_media_table(items, "On Deck")
+
+    def do_watch_next(self, arg: str):
+        """watch_next [--count N] [--library id] [--runtime min] [--genre g] [--type movie|episode]"""
+        tokens = self._tokens(arg)
+        if self._has_flag(tokens, "--help"):
+            console.print("[yellow]Usage: watch_next [--count N] [--library id] "
+                          "[--runtime minutes] [--genre name] [--type movie|episode][/yellow]")
+            return
+        count = self._int_flag(tokens, "--count", 15, minimum=1)
+        runtime_limit = self._int_flag(tokens, "--runtime", 0, minimum=0)
+        library_filter = self._flag_value(tokens, "--library", "").lower()
+        genre_filter = self._flag_value(tokens, "--genre", "").lower()
+        type_filter = self._flag_value(tokens, "--type", "").lower()
+        if type_filter and type_filter not in ("movie", "episode"):
+            console.print("[yellow]--type must be movie or episode.[/yellow]")
+            return
+
+        def _rating_value(item: dict) -> float | None:
+            raw = item.get("audienceRating")
+            if raw is None:
+                raw = item.get("rating")
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+
+        def _has_genre(item: dict) -> bool:
+            if not genre_filter:
+                return True
+            return any(genre_filter in (g.get("tag") or "").lower()
+                       for g in item.get("Genre", []))
+
+        def _lib_matches(lib: dict) -> bool:
+            if not library_filter:
+                return True
+            return (library_filter == str(lib.get("key", "")).lower()
+                    or library_filter in (lib.get("title", "") or "").lower())
+
+        now = int(time.time())
+        cutoff_recent = now - 45 * 86400
+        candidates: dict[str, dict] = {}
+
+        with console.status("Scoring watch-next candidates..."):
+            on_deck = self.client.on_deck()
+            on_deck_keys = {str(i.get("ratingKey", "")) for i in on_deck if i.get("ratingKey")}
+            libs = [lib for lib in self.client.libraries()
+                    if lib.get("type") in ("movie", "show") and _lib_matches(lib)]
+
+            for lib in libs:
+                lib_type = lib.get("type", "")
+                if type_filter == "movie" and lib_type != "movie":
+                    continue
+                if type_filter == "episode" and lib_type != "show":
+                    continue
+                items = (self.client.library_episodes(lib.get("key", ""))
+                         if lib_type == "show" else self.client.library_contents(lib.get("key", "")))
+                for item in items:
+                    item_type = item.get("type", "")
+                    if item_type not in ("movie", "episode"):
+                        continue
+                    if type_filter and item_type != type_filter:
+                        continue
+                    duration = item.get("duration") or 0
+                    if runtime_limit and duration > runtime_limit * 60_000:
+                        continue
+                    if not _has_genre(item):
+                        continue
+
+                    rating_val = _rating_value(item)
+                    view_count = item.get("viewCount") or 0
+                    view_offset = item.get("viewOffset") or 0
+                    key = str(item.get("ratingKey", ""))
+                    is_continue = key in on_deck_keys or view_offset > 0
+                    if view_count and not is_continue:
+                        continue
+
+                    reasons = []
+                    score = (rating_val or 0) * 10
+                    if is_continue:
+                        score += 95
+                        reasons.append("continue")
+                        if duration:
+                            pct = max(0, min(100, int(view_offset / duration * 100)))
+                            score += max(0, 20 - abs(45 - pct) // 3)
+                    else:
+                        score += 30
+                        reasons.append("unwatched")
+
+                    added = item.get("addedAt") or 0
+                    if added >= cutoff_recent:
+                        score += 8
+                        reasons.append("recent")
+                    if item_type == "episode":
+                        score += 6
+                        reasons.append("episode")
+                    if rating_val is not None and rating_val >= 8:
+                        reasons.append("high rated")
+
+                    candidates[key or f"{lib.get('key','')}:{item.get('title','')}"] = {
+                        "score": score,
+                        "item": item,
+                        "library": lib.get("title", ""),
+                        "rating": rating_val,
+                        "reason": ", ".join(dict.fromkeys(reasons)),
+                    }
+
+        picks = sorted(candidates.values(), key=lambda r: (-r["score"], -(r["rating"] or 0),
+                                                           r["item"].get("title", "")))[:count]
+        if not picks:
+            console.print("[yellow]No watch-next candidates matched those filters.[/yellow]")
+            return
+
+        t = Table(title=f"Watch Next ({len(picks)} picks)", box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4, justify="right")
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=30)
+        t.add_column("Type", style="yellow", width=8)
+        t.add_column("Runtime", width=9, justify="right")
+        t.add_column("Rating", width=7, justify="right")
+        t.add_column("Why", style="cyan", min_width=16)
+        for i, row in enumerate(picks, 1):
+            item = row["item"]
+            t.add_row(str(i), str(item.get("ratingKey", "")), full_title(item),
+                      item.get("type", ""), format_duration(item.get("duration")),
+                      f"{row['rating']:.1f}" if row["rating"] is not None else "-",
+                      row["reason"])
+        console.print(t)
 
     def do_ondeck_clear(self, _):
         """ondeck_clear — interactively remove items from On Deck (mark watched or reset progress)"""
@@ -6387,6 +6558,305 @@ class PlexShell(cmd.Cmd):
         else:
             console.print("[green]✓ All Plex movies are monitored by Radarr.[/green]")
 
+    def do_quality_upgrade_plan(self, arg: str):
+        """quality_upgrade_plan [--limit N] [--movies|--shows] - prioritize Radarr/Sonarr cutoff work"""
+        tokens = self._tokens(arg)
+        limit = self._int_flag(tokens, "--limit", 25, minimum=1)
+        movies_only = self._has_flag(tokens, "--movies")
+        shows_only = self._has_flag(tokens, "--shows")
+        if movies_only and shows_only:
+            console.print("[yellow]Use only one of --movies or --shows.[/yellow]")
+            return
+
+        rc = None if shows_only else self._configured_radarr_client()
+        sc = None if movies_only else self._configured_sonarr_client()
+        if not rc and not sc:
+            console.print("[yellow]No configured Radarr or Sonarr credentials found.[/yellow]")
+            console.print("[dim]Run radarr_status or sonarr_status once to save API settings.[/dim]")
+            return
+
+        movie_stats: dict[tuple[str, int], dict] = {}
+        show_stats: dict[str, dict] = {}
+        with console.status("Indexing Plex watch and quality stats..."):
+            for lib in self.client.libraries():
+                lib_type = lib.get("type", "")
+                if lib_type == "movie" and rc:
+                    for item in self.client.library_contents(lib.get("key", "")):
+                        rows = get_media_rows(item, lib.get("title", ""))
+                        key = ((item.get("title") or "").lower().strip(), item.get("year") or 0)
+                        movie_stats[key] = {
+                            "plays": item.get("viewCount") or 0,
+                            "rating": item.get("audienceRating")
+                                      if item.get("audienceRating") is not None else item.get("rating"),
+                            "size": sum(r.get("size") or 0 for r in rows),
+                            "resolution": rows[0].get("videoResolution", "") if rows else "",
+                            "codec": rows[0].get("videoCodec", "") if rows else "",
+                        }
+                elif lib_type == "show" and sc:
+                    for show in self.client.library_contents(lib.get("key", "")):
+                        title = (show.get("title") or "").lower().strip()
+                        if title:
+                            show_stats[title] = {
+                                "watched": show.get("viewedLeafCount") or 0,
+                                "total": show.get("leafCount") or 0,
+                                "last": show.get("lastViewedAt") or 0,
+                            }
+
+        def _match_movie(title: str, yr: int) -> dict:
+            key = (title.lower().strip(), yr or 0)
+            if key in movie_stats:
+                return movie_stats[key]
+            best_score = 0.0
+            best: dict = {}
+            for (pt, py), stats in movie_stats.items():
+                if yr and py and abs(py - yr) > 1:
+                    continue
+                score = SequenceMatcher(None, title.lower().strip(), pt).ratio()
+                if score > best_score:
+                    best_score = score
+                    best = stats
+            return best if best_score >= 0.88 else {}
+
+        def _match_show(title: str) -> dict:
+            key = title.lower().strip()
+            if key in show_stats:
+                return show_stats[key]
+            best_score = 0.0
+            best: dict = {}
+            for st, stats in show_stats.items():
+                score = SequenceMatcher(None, key, st).ratio()
+                if score > best_score:
+                    best_score = score
+                    best = stats
+            return best if best_score >= 0.88 else {}
+
+        if rc:
+            with console.status("Loading Radarr quality cutoffs..."):
+                profiles_raw = rc.quality_profiles()
+                radarr_movies = rc.movies()
+
+            qual_map: dict[int, dict] = {}
+            def _extract_quals(items: list) -> None:
+                for item in items:
+                    if item.get("quality"):
+                        q = item["quality"]
+                        qual_map[q["id"]] = {
+                            "name": q.get("name", "?"),
+                            "res": q.get("resolution", 0),
+                        }
+                    _extract_quals(item.get("items", []))
+            for profile in profiles_raw:
+                _extract_quals(profile.get("items", []))
+
+            profile_map: dict[int, dict] = {}
+            for profile in profiles_raw:
+                cutoff_id = profile.get("cutoff", 0)
+                cutoff = qual_map.get(cutoff_id, {})
+                profile_map[profile["id"]] = {
+                    "name": profile.get("name", "?"),
+                    "cutoff_name": cutoff.get("name", "?"),
+                    "cutoff_res": cutoff.get("res", 0),
+                    "upgrade_allowed": profile.get("upgradeAllowed", True),
+                }
+
+            movie_plan = []
+            for movie in radarr_movies:
+                if not movie.get("hasFile"):
+                    continue
+                prof = profile_map.get(movie.get("qualityProfileId", 0), {})
+                if not prof.get("upgrade_allowed", True):
+                    continue
+                movie_file = movie.get("movieFile") or {}
+                current_quality = (movie_file.get("quality") or {}).get("quality") or {}
+                current_res = current_quality.get("resolution", 0) or 0
+                cutoff_res = prof.get("cutoff_res", 0) or 0
+                if not cutoff_res or current_res >= cutoff_res:
+                    continue
+                stats = _match_movie(movie.get("title", ""), movie.get("year") or 0)
+                plays = stats.get("plays") or 0
+                size = stats.get("size") or movie_file.get("size") or 0
+                rating_val = stats.get("rating") or 0
+                try:
+                    rating_val = float(rating_val)
+                except (TypeError, ValueError):
+                    rating_val = 0
+                size_gb = size / (1024 ** 3) if size else 0
+                score = ((cutoff_res - current_res) / 100) + plays * 4 + rating_val + min(size_gb / 8, 10)
+                movie_plan.append({
+                    "title": movie.get("title", ""),
+                    "year": movie.get("year") or 0,
+                    "current": current_quality.get("name", "?"),
+                    "target": prof.get("cutoff_name", "?"),
+                    "profile": prof.get("name", "?"),
+                    "plays": plays,
+                    "size": size,
+                    "score": score,
+                })
+
+            movie_plan.sort(key=lambda r: (-r["score"], r["title"]))
+            if movie_plan:
+                t = Table(title=f"Radarr Movie Upgrade Plan ({len(movie_plan)} below cutoff)",
+                          box=box.ROUNDED)
+                t.add_column("#", style="dim", width=4, justify="right")
+                t.add_column("Title", style="bold white", min_width=28)
+                t.add_column("Have", width=14)
+                t.add_column("Want", width=14)
+                t.add_column("Plays", width=7, justify="right", style="cyan")
+                t.add_column("Size", width=10, justify="right")
+                t.add_column("Score", width=7, justify="right", style="yellow")
+                for i, row in enumerate(movie_plan[:limit], 1):
+                    title = f"{row['title']} ({row['year']})" if row["year"] else row["title"]
+                    t.add_row(str(i), title, row["current"], row["target"],
+                              str(row["plays"]), format_size(row["size"]),
+                              f"{row['score']:.1f}")
+                console.print(t)
+            else:
+                console.print("[green]No Radarr movies are below their quality cutoff.[/green]")
+        elif not shows_only:
+            console.print("[dim]Radarr is not configured; movie upgrade plan skipped.[/dim]")
+
+        if sc:
+            with console.status("Loading Sonarr below-cutoff episodes..."):
+                records = sc.wanted_cutoff()
+            show_plan: dict[int, dict] = {}
+            for episode in records:
+                series = episode.get("series") or {}
+                sid = episode.get("seriesId") or series.get("id") or 0
+                if sid not in show_plan:
+                    stats = _match_show(series.get("title", ""))
+                    show_plan[sid] = {
+                        "title": series.get("title", ""),
+                        "year": series.get("year") or 0,
+                        "status": series.get("status", ""),
+                        "count": 0,
+                        "watched": stats.get("watched") or 0,
+                        "total": stats.get("total") or 0,
+                        "last": stats.get("last") or 0,
+                    }
+                show_plan[sid]["count"] += 1
+
+            show_rows = []
+            for row in show_plan.values():
+                total = row["total"] or 0
+                watched = row["watched"] or 0
+                recent_bonus = 20 if row["last"] and row["last"] >= int(time.time()) - 180 * 86400 else 0
+                score = row["count"] * 8 + watched * 1.5 + recent_bonus
+                row["score"] = score
+                row["progress"] = f"{watched}/{total}" if total else "-"
+                show_rows.append(row)
+            show_rows.sort(key=lambda r: (-r["score"], r["title"]))
+
+            if show_rows:
+                t = Table(title=f"Sonarr Show Upgrade Plan ({len(records)} episodes below cutoff)",
+                          box=box.ROUNDED)
+                t.add_column("#", style="dim", width=4, justify="right")
+                t.add_column("Show", style="bold white", min_width=28)
+                t.add_column("Below", width=7, justify="right", style="yellow")
+                t.add_column("Watched", width=9, justify="right", style="cyan")
+                t.add_column("Last Watched", width=17, style="dim")
+                t.add_column("Score", width=7, justify="right", style="yellow")
+                for i, row in enumerate(show_rows[:limit], 1):
+                    title = f"{row['title']} ({row['year']})" if row["year"] else row["title"]
+                    t.add_row(str(i), title, str(row["count"]), row["progress"],
+                              format_ts(row["last"]), f"{row['score']:.1f}")
+                console.print(t)
+            else:
+                console.print("[green]No Sonarr episodes are below their quality cutoff.[/green]")
+        elif not movies_only:
+            console.print("[dim]Sonarr is not configured; show upgrade plan skipped.[/dim]")
+
+        console.print("[dim]Use radarr_upgrade or sonarr_upgrade to select items and trigger searches.[/dim]")
+
+    def do_premiere_watchlist(self, arg: str):
+        """premiere_watchlist [--days N] [--past N] [--missing-only] - Radarr releases with Plex status"""
+        tokens = self._tokens(arg)
+        days = self._int_flag(tokens, "--days", 30, minimum=1)
+        past = self._int_flag(tokens, "--past", 14, minimum=0)
+        missing_only = self._has_flag(tokens, "--missing-only")
+
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        today = date.today()
+        start = today - timedelta(days=past)
+        end = today + timedelta(days=days)
+
+        def _parse_date(value: str | None) -> date | None:
+            if not value:
+                return None
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                return None
+
+        def _fmt_date(value: str | None) -> str:
+            parsed = _parse_date(value)
+            return parsed.isoformat() if parsed else "-"
+
+        with console.status(f"Building premiere watchlist ({start} to {end})..."):
+            movies = rc.calendar(start.isoformat(), end.isoformat())
+            plex_set = self._plex_movie_set()
+
+        rows = []
+        for movie in movies:
+            title = movie.get("title", "?")
+            year_val = movie.get("year") or 0
+            dates = [_parse_date(movie.get(k))
+                     for k in ("digitalRelease", "physicalRelease", "inCinemas")]
+            known_dates = [d for d in dates if d]
+            release_date = min(known_dates) if known_dates else date.max
+            released = any(d and d <= today for d in known_dates)
+            in_plex = self._in_plex(title, year_val, plex_set)
+            has_file = bool(movie.get("hasFile"))
+            monitored = bool(movie.get("monitored"))
+            if in_plex:
+                status = "[green]In Plex[/green]"
+                priority = 4
+            elif has_file:
+                status = "[yellow]Downloaded - scan Plex[/yellow]"
+                priority = 0
+            elif released and monitored:
+                status = "[red]Released - missing[/red]"
+                priority = 1
+            elif monitored:
+                status = "[cyan]Upcoming[/cyan]"
+                priority = 2
+            else:
+                status = "[dim]Unmonitored[/dim]"
+                priority = 3
+            if missing_only and priority not in (0, 1):
+                continue
+            rows.append({
+                "priority": priority,
+                "release_date": release_date,
+                "title": title,
+                "year": year_val,
+                "cinemas": _fmt_date(movie.get("inCinemas")),
+                "digital": _fmt_date(movie.get("digitalRelease")),
+                "physical": _fmt_date(movie.get("physicalRelease")),
+                "status": status,
+            })
+
+        rows.sort(key=lambda r: (r["priority"], r["release_date"], r["title"]))
+        if not rows:
+            msg = "No released-but-missing movies found." if missing_only else "No Radarr releases found."
+            console.print(f"[yellow]{msg}[/yellow]")
+            return
+
+        t = Table(title=f"Premiere Watchlist ({start} to {end})", box=box.ROUNDED)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Year", width=6, justify="right", style="dim")
+        t.add_column("Digital", width=12)
+        t.add_column("Physical", width=12)
+        t.add_column("Cinemas", width=12)
+        t.add_column("Status", min_width=20)
+        for row in rows:
+            t.add_row(row["title"], str(row["year"] or "-"), row["digital"],
+                      row["physical"], row["cinemas"], row["status"])
+        console.print(t)
+        if any(r["priority"] == 0 for r in rows):
+            console.print("[dim]Downloaded titles that are not in Plex usually need a library scan.[/dim]")
+
     def do_radarr_calendar(self, arg: str):
         """radarr_calendar [--days N] — upcoming movie releases monitored by Radarr (default 30 days)"""
         tokens = arg.strip().split() if arg.strip() else []
@@ -6531,6 +7001,113 @@ class PlexShell(cmd.Cmd):
             else:
                 console.print("[green]Nothing new to import.[/green]")
 
+    def do_collection_gaps(self, arg: str):
+        """collection_gaps [--import] [--dry-run] [--limit N] - franchise gaps across Plex and Radarr"""
+        tokens = self._tokens(arg)
+        do_import = self._has_flag(tokens, "--import")
+        dry_run = self._has_flag(tokens, "--dry-run")
+        limit = self._int_flag(tokens, "--limit", 0, minimum=0)
+
+        rc = self._get_radarr_client()
+        if not rc: return
+        tmdb = self._get_tmdb_client()
+        if not tmdb: return
+
+        with console.status("Loading Radarr and Plex movie state..."):
+            radarr_movies = rc.movies()
+            plex_set = self._plex_movie_set()
+
+        radarr_by_tmdb = {m.get("tmdbId"): m for m in radarr_movies if m.get("tmdbId")}
+        by_collection: dict[int, dict] = {}
+        for movie in radarr_movies:
+            coll = movie.get("collection") or {}
+            coll_id = coll.get("tmdbId")
+            if not coll_id:
+                continue
+            by_collection.setdefault(coll_id, {
+                "name": coll.get("title") or f"Collection {coll_id}",
+                "seed": set(),
+            })["seed"].add(movie.get("tmdbId"))
+
+        if not by_collection:
+            console.print("[yellow]No Radarr movies with TMDB collection data found.[/yellow]")
+            console.print("[dim]Refresh movie metadata in Radarr, then try again.[/dim]")
+            return
+
+        def _in_plex_part(part: dict) -> bool:
+            title = part.get("title", "")
+            yr = part.get("year") or 0
+            if self._in_plex(title, yr, plex_set):
+                return True
+            return any(title.lower().strip() == pt for pt, _ in plex_set)
+
+        def _short_list(items: list[dict], cap: int = 4) -> str:
+            if not items:
+                return "[green]complete[/green]"
+            shown = ", ".join(f"{m['title']} ({m['year'] or '-'})" for m in items[:cap])
+            if len(items) > cap:
+                shown += f", +{len(items) - cap} more"
+            return shown
+
+        rows: list[dict] = []
+        import_candidates: list[dict] = []
+        with console.status("Fetching collection details from TMDB...") as status:
+            for coll_id, info in sorted(by_collection.items(), key=lambda x: x[1]["name"]):
+                status.update(f"Fetching {info['name']}...")
+                data = tmdb.collection(coll_id)
+                parts = data.get("parts", [])
+                if not parts:
+                    continue
+                missing_plex = [p for p in parts if not _in_plex_part(p)]
+                missing_radarr = [p for p in parts if p.get("tmdb_id") not in radarr_by_tmdb]
+                rows.append({
+                    "name": data.get("name") or info["name"],
+                    "total": len(parts),
+                    "plex_have": len(parts) - len(missing_plex),
+                    "radarr_have": len(parts) - len(missing_radarr),
+                    "missing_plex": missing_plex,
+                    "missing_radarr": missing_radarr,
+                })
+                import_candidates.extend(missing_radarr)
+
+        rows.sort(key=lambda r: (-len(r["missing_plex"]), -len(r["missing_radarr"]), r["name"]))
+        if limit:
+            rows = rows[:limit]
+
+        t = Table(title=f"Collection Gaps ({len(rows)} collections shown)", box=box.ROUNDED)
+        t.add_column("Collection", style="bold cyan", min_width=26)
+        t.add_column("Plex", width=9, justify="right")
+        t.add_column("Radarr", width=9, justify="right")
+        t.add_column("Missing from Plex", style="yellow", min_width=32)
+        t.add_column("Missing from Radarr", style="magenta", min_width=28)
+        for row in rows:
+            t.add_row(
+                row["name"],
+                f"{row['plex_have']}/{row['total']}",
+                f"{row['radarr_have']}/{row['total']}",
+                _short_list(row["missing_plex"]),
+                _short_list(row["missing_radarr"]),
+            )
+        console.print(t)
+
+        unique: list[dict] = []
+        seen: set[int] = set()
+        for movie in import_candidates:
+            tmdb_id = movie.get("tmdb_id")
+            if tmdb_id and tmdb_id not in seen and tmdb_id not in radarr_by_tmdb:
+                seen.add(tmdb_id)
+                unique.append(movie)
+
+        if unique:
+            console.print(f"[yellow]{len(unique)} missing movie(s) are not monitored in Radarr.[/yellow]")
+            if do_import:
+                self._radarr_import_workflow(unique, rc, dry_run=dry_run,
+                                             profile_id=None, search=False)
+            else:
+                console.print("[dim]Run with --import to add those Radarr gaps, or --import --dry-run to preview.[/dim]")
+        else:
+            console.print("[green]No Radarr collection gaps found.[/green]")
+
     # ── Tab completion ────────────────────────────────────────────────────────
 
     def _cached_libs(self) -> list[dict]:
@@ -6637,6 +7214,10 @@ class PlexShell(cmd.Cmd):
     _PM_FLAGS  = ["--library", "--fix", "--episodes"]
     _PD_FLAGS  = ["--library"]
     _RC_FLAGS  = ["--import"]
+    _CG_FLAGS  = ["--import", "--dry-run", "--limit"]
+    _WN_FLAGS  = ["--count", "--library", "--runtime", "--genre", "--type"]
+    _QUP_FLAGS = ["--limit", "--movies", "--shows"]
+    _PW_FLAGS  = ["--days", "--past", "--missing-only"]
 
     def complete_plex_metadata(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)
@@ -6654,8 +7235,28 @@ class PlexShell(cmd.Cmd):
         if text.startswith("-"): return self._c_flags(text, self._RC_FLAGS)
         return []
 
+    def complete_collection_gaps(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._CG_FLAGS)
+        return []
+
+    def complete_quality_upgrade_plan(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._QUP_FLAGS)
+        return []
+
+    def complete_premiere_watchlist(self, text, line, begidx, endidx):
+        if text.startswith("-"): return self._c_flags(text, self._PW_FLAGS)
+        return []
+
     def complete_radarr_calendar(self, text, line, begidx, endidx):
         if text.startswith("-"): return self._c_flags(text, ["--days"])
+        return []
+
+    def complete_watch_next(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library": return self._c_libs(text)
+        if prev == "--type":
+            return [v for v in ("movie", "episode") if v.startswith(text.lower())]
+        if text.startswith("-"): return self._c_flags(text, self._WN_FLAGS)
         return []
 
     def complete_hubs(self, text, line, begidx, endidx):
