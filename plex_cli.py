@@ -3921,6 +3921,7 @@ class PlexShell(cmd.Cmd):
             return
 
         shown = candidates[:count]
+        total_size = sum(r["size"] for r in shown)
         total_saved = sum(r["saved"] for r in shown)
         title = (f"Codec Migration Plan -> {target.upper()} "
                  f"(top {len(shown)} of {len(candidates)}, min {min_size_gb:g} GB)")
@@ -3946,7 +3947,8 @@ class PlexShell(cmd.Cmd):
             )
         t.add_section()
         t.add_row("", "", "[bold]Shown total[/bold]", "", "", "",
-                  "", f"[bold]{format_size(total_saved)}[/bold]", "", "")
+                  f"[bold]{format_size(total_size)}[/bold]",
+                  f"[bold]{format_size(total_saved)}[/bold]", "", "")
         console.print(t)
         console.print("[dim]Estimates are rough: actual savings depend on encode settings, source grain, HDR, and audio copy choices.[/dim]")
 
