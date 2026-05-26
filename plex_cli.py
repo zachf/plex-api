@@ -1136,6 +1136,7 @@ _HELP_SECTIONS = [
         ("radarr_calendar",    "[--days N]", "Upcoming movie releases for monitored titles (default 30 days)"),
         ("trending_missing",   "[--window day|week] [--count N] [--import] [--dry-run] [--profile id] [--search]",
                                              "TMDB trending movies cross-referenced against Radarr and Plex; --import adds missing"),
+        ("radarr_monitored",   "[--missing] [--downloaded]",                "All monitored movies; --missing filters to undownloaded, --downloaded to files on disk"),
     ]),
     ("Maintenance", [
         ("plex_metadata",    "[--library <name>] [--fix] [--episodes]",
@@ -7429,6 +7430,61 @@ class PlexShell(cmd.Cmd):
 
         if do_import and missing_movies:
             self._radarr_import_workflow(missing_movies, rc, dry_run, profile_id, search)
+
+    def do_radarr_monitored(self, arg: str):
+        """radarr_monitored [--missing] [--downloaded]"""
+        tokens     = arg.strip().split() if arg.strip() else []
+        only_miss  = "--missing"    in tokens
+        only_dl    = "--downloaded" in tokens
+
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        with console.status("Loading Radarr library..."):
+            movies   = rc.movies()
+            profiles = {p["id"]: p["name"] for p in rc.quality_profiles()}
+
+        monitored = [m for m in movies if m.get("monitored")]
+        if only_miss:
+            monitored = [m for m in monitored if not m.get("hasFile")]
+        elif only_dl:
+            monitored = [m for m in monitored if m.get("hasFile")]
+
+        if not monitored:
+            console.print("[yellow]No matching monitored movies found.[/yellow]"); return
+
+        monitored.sort(key=lambda m: (m.get("title") or "").lower())
+
+        qualifier = " (missing)" if only_miss else " (downloaded)" if only_dl else ""
+        t = Table(title=f"Monitored in Radarr{qualifier}  ({len(monitored)})", box=box.ROUNDED)
+        t.add_column("#",        style="dim",        width=5,  justify="right")
+        t.add_column("Title",    style="bold white",  min_width=30)
+        t.add_column("Year",     width=6,             justify="right", style="dim")
+        t.add_column("Profile",  width=16,            style="cyan")
+        t.add_column("Status",   width=14,            justify="center")
+        t.add_column("Size",     width=10,            justify="right")
+
+        for i, m in enumerate(monitored, 1):
+            has_file = m.get("hasFile", False)
+            status   = "[green]Downloaded[/green]" if has_file else "[yellow]Missing[/yellow]"
+            size     = format_size(m.get("sizeOnDisk") or 0) if has_file else "—"
+            t.add_row(
+                str(i),
+                m.get("title", "?"),
+                str(m.get("year", "")),
+                profiles.get(m.get("qualityProfileId", 0), "?"),
+                status,
+                size,
+            )
+
+        total_size = sum(m.get("sizeOnDisk") or 0 for m in monitored if m.get("hasFile"))
+        downloaded = sum(1 for m in monitored if m.get("hasFile"))
+        missing    = len(monitored) - downloaded
+        t.add_section()
+        t.add_row("", f"[bold]{len(monitored)} total[/bold]", "",
+                  "", f"[green]{downloaded} dl[/green]  [yellow]{missing} missing[/yellow]",
+                  f"[bold]{format_size(total_size)}[/bold]")
+        console.print(t)
 
     def do_radarr_collections(self, arg: str):
         """radarr_collections [--import] — TMDB franchise completion; --import adds missing to Radarr"""
