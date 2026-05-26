@@ -196,6 +196,7 @@ python plex_cli.py <command> [args]
 | `subtitles` | `[library_id]` | Items missing subtitle tracks |
 | `hdr` | `[library_id]` | HDR and Dolby Vision content |
 | `audioformat` | `<format>` | Items with a specific audio format |
+| `audio_bloat_audit` | `[--library id] [--count N] [--min-size GB]` | Large files with lossless/high-channel audio ranked by estimated savings |
 | `multiversion` | `[library_id]` | Items with more than one media version |
 | `genres` | `[library_id]` | Genre distribution |
 | `studios` | `[library_id]` | Studio distribution |

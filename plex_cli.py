@@ -1059,6 +1059,8 @@ _HELP_SECTIONS = [
         ("subtitles",       "[library_id]",                      "Items missing subtitle tracks"),
         ("hdr",             "[library_id]",                      "List HDR and Dolby Vision content"),
         ("audioformat",     "<format>",                          "Items with a specific audio format"),
+        ("audio_bloat_audit","[--library id] [--count N] [--min-size GB]",
+                                                                 "Large files with lossless/high-channel audio ranked by estimated savings"),
         ("multiversion",    "[library_id]",                      "Items with more than one media version"),
         ("genres",          "[library_id]",                      "Genre distribution across libraries"),
         ("studios",         "[library_id]",                      "Studio distribution across libraries"),
@@ -3509,6 +3511,161 @@ class PlexShell(cmd.Cmd):
                       str(r.get("audioChannels") or "?"), r["videoCodec"].upper() or "—",
                       resolution_label(r["videoResolution"]))
         console.print(t)
+
+    def do_audio_bloat_audit(self, arg: str):
+        """audio_bloat_audit [--library id] [--count N] [--min-size GB]"""
+        tokens = self._tokens(arg)
+        count = self._int_flag(tokens, "--count", 25, minimum=1)
+        library_filter = self._flag_value(tokens, "--library", "").lower()
+        try:
+            min_size_gb = max(0.0, float(self._flag_value(tokens, "--min-size", "4")))
+        except ValueError:
+            min_size_gb = 4.0
+        min_size_bytes = int(min_size_gb * 1024 ** 3)
+
+        heavy_codecs = ("truehd", "dts", "dca", "dtsma", "dtshd", "dts-hd",
+                        "flac", "pcm", "lpcm", "alac")
+
+        def _lib_matches(lib: dict) -> bool:
+            if not library_filter:
+                return True
+            return (library_filter == str(lib.get("key", "")).lower()
+                    or library_filter in (lib.get("title", "") or "").lower())
+
+        def _stream_codec(stream: dict, media: dict) -> str:
+            return (stream.get("codec") or media.get("audioCodec") or "").lower()
+
+        def _stream_channels(stream: dict, media: dict) -> int:
+            raw = stream.get("channels") or media.get("audioChannels") or 0
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return 0
+
+        def _stream_bitrate(stream: dict, codec: str, channels: int) -> int:
+            raw = stream.get("bitrate")
+            try:
+                br = int(raw or 0)
+            except (TypeError, ValueError):
+                br = 0
+            if br > 0:
+                return br
+            if "truehd" in codec:
+                return 5000 if channels >= 8 else 3500
+            if codec in ("dtsma", "dtshd", "dts-hd"):
+                return 4500 if channels >= 8 else 3000
+            if codec in ("dts", "dca"):
+                return 1500
+            if codec in ("pcm", "lpcm"):
+                return 4608 if channels >= 6 else 2304
+            if codec in ("flac", "alac"):
+                return 2500 if channels >= 6 else 1200
+            return 0
+
+        def _target_bitrate(channels: int) -> int:
+            if channels >= 8:
+                return 768
+            if channels >= 6:
+                return 640
+            return 192
+
+        def _audio_streams(media: dict, part: dict) -> list[dict]:
+            streams = [s for s in part.get("Stream", [])
+                       if str(s.get("streamType")) == "2"]
+            if streams:
+                return streams
+            if media.get("audioCodec"):
+                return [{"codec": media.get("audioCodec"), "channels": media.get("audioChannels")}]
+            return []
+
+        candidates = []
+        with console.status("Auditing high-cost audio tracks..."):
+            libs = [lib for lib in self.client.libraries()
+                    if lib.get("type") in ("movie", "show") and _lib_matches(lib)]
+            for lib in libs:
+                lib_title = lib.get("title", "")
+                for item in self.client._leaf_items(lib):
+                    if item.get("type") not in ("movie", "episode"):
+                        continue
+                    duration_ms = item.get("duration") or 0
+                    for media in item.get("Media", []):
+                        duration = (media.get("duration") or duration_ms or 0) / 1000
+                        if duration <= 0:
+                            continue
+                        for part in media.get("Part", []):
+                            size = part.get("size") or 0
+                            if size < min_size_bytes:
+                                continue
+                            streams = _audio_streams(media, part)
+                            reasons = []
+                            total_audio_kbps = 0
+                            target_audio_kbps = 0
+                            for stream in streams:
+                                codec = _stream_codec(stream, media)
+                                channels = _stream_channels(stream, media)
+                                bitrate = _stream_bitrate(stream, codec, channels)
+                                is_heavy = (any(token in codec for token in heavy_codecs)
+                                            or channels >= 8 or bitrate >= 1800)
+                                if not is_heavy or bitrate <= 0:
+                                    continue
+                                target = _target_bitrate(channels)
+                                if bitrate <= target:
+                                    continue
+                                total_audio_kbps += bitrate
+                                target_audio_kbps += target
+                                label = codec.upper() if codec else "audio"
+                                ch_label = f"{channels}ch" if channels else "?ch"
+                                reasons.append(f"{label} {ch_label} {bitrate/1000:.1f} Mbps")
+                            if not reasons:
+                                continue
+                            saved = int((total_audio_kbps - target_audio_kbps) * 1000 / 8 * duration)
+                            if saved <= 0:
+                                continue
+                            saved = min(saved, size)
+                            file_share = saved / size * 100 if size else 0
+                            score = (saved / (1024 ** 3)) * 10 + file_share
+                            candidates.append({
+                                "score": score,
+                                "key": item.get("ratingKey", ""),
+                                "title": full_title(item),
+                                "library": lib_title,
+                                "size": size,
+                                "saved": saved,
+                                "share": file_share,
+                                "audio": ", ".join(reasons[:2]) + (f", +{len(reasons)-2}" if len(reasons) > 2 else ""),
+                                "resolution": resolution_label(media.get("videoResolution")),
+                            })
+
+        candidates.sort(key=lambda r: (-r["score"], -r["saved"], r["title"]))
+        if not candidates:
+            console.print("[green]No obvious audio bloat candidates found.[/green]")
+            console.print("[dim]Try lowering --min-size or checking another --library.[/dim]")
+            return
+
+        shown = candidates[:count]
+        total_size = sum(r["size"] for r in shown)
+        total_saved = sum(r["saved"] for r in shown)
+        t = Table(title=f"Audio Bloat Audit (top {len(shown)} of {len(candidates)}, min {min_size_gb:g} GB)",
+                  box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4, justify="right")
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=14)
+        t.add_column("Res", width=7, justify="right")
+        t.add_column("Size", width=10, justify="right", style="bold yellow")
+        t.add_column("Est Save", width=10, justify="right", style="green")
+        t.add_column("Share", width=7, justify="right")
+        t.add_column("Audio", min_width=24)
+        for i, row in enumerate(shown, 1):
+            t.add_row(str(i), str(row["key"]), row["title"], row["library"],
+                      row["resolution"], format_size(row["size"]),
+                      format_size(row["saved"]), f"{row['share']:.1f}%", row["audio"])
+        t.add_section()
+        t.add_row("", "", "[bold]Shown total[/bold]", "", "",
+                  f"[bold]{format_size(total_size)}[/bold]",
+                  f"[bold]{format_size(total_saved)}[/bold]", "", "")
+        console.print(t)
+        console.print("[dim]Savings are estimated from audio stream bitrates and assume replacing high-cost tracks with AAC/EAC3-sized audio.[/dim]")
 
     def do_multiversion(self, arg: str):
         section_id = arg.strip() or None
@@ -7550,6 +7707,16 @@ class PlexShell(cmd.Cmd):
         if prev == "--count":
             return []
         return self._c_flags(text, self._TV_STORAGE_FLAGS) if text.startswith("-") else []
+
+    _ABA_FLAGS = ["--library", "--count", "--min-size"]
+
+    def complete_audio_bloat_audit(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
+        if prev in ("--count", "--min-size"):
+            return []
+        return self._c_flags(text, self._ABA_FLAGS) if text.startswith("-") else []
 
     def _cached_radarr_lists(self) -> list[str]:
         if not hasattr(self, "_c_radarr_lists"):
