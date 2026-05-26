@@ -1077,6 +1077,9 @@ _HELP_SECTIONS = [
         ("size_by_codec",     "[library_id]",                    "Total and average file size grouped by video codec"),
         ("codec_migration_plan", "[--library id] [--count N] [--min-size GB] [--target hevc|av1]",
                                                                  "Legacy-codec files ranked by estimated savings and watch popularity"),
+        ("oversized",            "[--library id] [--4k GB] [--1080p GB] [--720p GB] [--sd GB] [--count N]",
+                                                                 "Files above size thresholds per resolution (4K>80 GB, 1080p>30 GB, 720p>15 GB, SD>8 GB)"),
+        ("bitrate_outliers",     "[--library id] [--count N]",   "Files with bitrate above expected max per resolution (4K>25, 1080p>12, 720p>6, SD>3 Mbps)"),
         ("channel_dist",      "[library_id]",                    "Audio channel layout distribution (stereo, 5.1, 7.1, etc.)"),
     ]),
     ("Item extras", [
@@ -3289,6 +3292,150 @@ class PlexShell(cmd.Cmd):
             for r in top:
                 t2.add_row(f"{r['bitrate']/1000:.1f} Mbps", r["title"], r["library"])
             console.print(t2)
+
+    def do_oversized(self, arg: str):
+        """oversized [--library id] [--4k GB] [--1080p GB] [--720p GB] [--sd GB] [--count N]"""
+        tokens = self._tokens(arg)
+        lib_id = self._flag_value(tokens, "--library")
+        count = self._int_flag(tokens, "--count", 50, minimum=1)
+        try:
+            thresh_4k = float(self._flag_value(tokens, "--4k", "80"))
+        except ValueError:
+            thresh_4k = 80.0
+        try:
+            thresh_1080 = float(self._flag_value(tokens, "--1080p", "30"))
+        except ValueError:
+            thresh_1080 = 30.0
+        try:
+            thresh_720 = float(self._flag_value(tokens, "--720p", "15"))
+        except ValueError:
+            thresh_720 = 15.0
+        try:
+            thresh_sd = float(self._flag_value(tokens, "--sd", "8"))
+        except ValueError:
+            thresh_sd = 8.0
+        thresholds = {
+            "4K":    int(thresh_4k   * 1024 ** 3),
+            "1080p": int(thresh_1080 * 1024 ** 3),
+            "720p":  int(thresh_720  * 1024 ** 3),
+            "SD":    int(thresh_sd   * 1024 ** 3),
+        }
+        with console.status("Scanning libraries for oversized files..."):
+            if lib_id:
+                rows = []
+                for item in self.client.library_contents(lib_id):
+                    rows.extend(get_media_rows(item, lib_id))
+            else:
+                rows = self.client.all_media_rows()
+        flagged = []
+        for r in rows:
+            size = r.get("size") or 0
+            if not size:
+                continue
+            label = resolution_label(r["videoResolution"])
+            limit = thresholds.get(label)
+            if limit and size > limit:
+                flagged.append({**r, "_label": label, "_limit": limit, "_excess": size - limit})
+        if not flagged:
+            console.print("[green]No oversized files found with current thresholds.[/green]")
+            thresh_str = "  ".join(f"{k}>{v/1024**3:.0f} GB" for k, v in thresholds.items())
+            console.print(f"[dim]Thresholds: {thresh_str}[/dim]")
+            return
+        flagged.sort(key=lambda r: r["size"], reverse=True)
+        total_found = len(flagged)
+        flagged = flagged[:count]
+        t = Table(title=f"Oversized Files — {total_found} found, showing {len(flagged)}", box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Size", justify="right", width=10, style="bold yellow")
+        t.add_column("Limit", justify="right", width=10, style="dim")
+        t.add_column("Excess", justify="right", width=10, style="red")
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Res", width=7, justify="right")
+        t.add_column("Codec", width=8)
+        for i, r in enumerate(flagged, 1):
+            t.add_row(
+                str(i),
+                format_size(r["size"]),
+                format_size(r["_limit"]),
+                format_size(r["_excess"]),
+                r["title"],
+                r["library"],
+                r["_label"],
+                (r["videoCodec"] or "—").upper(),
+            )
+        total_size = sum(r["size"] for r in flagged)
+        total_excess = sum(r["_excess"] for r in flagged)
+        t.add_section()
+        t.add_row("", f"[bold]{format_size(total_size)}[/bold]", "", f"[bold red]{format_size(total_excess)}[/bold red]",
+                  f"[dim]Total ({len(flagged)} files)[/dim]", "", "", "")
+        console.print(t)
+        thresh_str = "  ".join(f"{k}>{v/1024**3:.0f} GB" for k, v in thresholds.items())
+        console.print(f"[dim]Thresholds: {thresh_str}[/dim]")
+
+    def do_bitrate_outliers(self, arg: str):
+        """bitrate_outliers [--library id] [--count N]"""
+        tokens = self._tokens(arg)
+        lib_id = self._flag_value(tokens, "--library")
+        count = self._int_flag(tokens, "--count", 50, minimum=1)
+        # Per-resolution max-expected bitrates in kbps
+        limits = {"4K": 25000, "1080p": 12000, "720p": 6000, "SD": 3000}
+        with console.status("Scanning bitrates..."):
+            if lib_id:
+                rows = []
+                for item in self.client.library_contents(lib_id):
+                    rows.extend(get_media_rows(item, lib_id))
+            else:
+                rows = self.client.all_media_rows()
+        flagged = []
+        for r in rows:
+            br = r.get("bitrate")
+            if not br:
+                size = r.get("size") or 0
+                dur = r.get("duration") or 0
+                if size and dur:
+                    br = int(size * 8 / (dur / 1000) / 1000)
+            if not br:
+                continue
+            label = resolution_label(r["videoResolution"])
+            limit = limits.get(label)
+            if limit and br > limit:
+                flagged.append({**r, "_br": br, "_label": label, "_limit": limit,
+                                "_excess": br - limit, "_ratio": br / limit})
+        if not flagged:
+            console.print("[green]No bitrate outliers found.[/green]")
+            limits_str = "  ".join(f"{k}>{v//1000} Mbps" for k, v in limits.items())
+            console.print(f"[dim]Thresholds: {limits_str}[/dim]")
+            return
+        flagged.sort(key=lambda r: r["_ratio"], reverse=True)
+        total_found = len(flagged)
+        flagged = flagged[:count]
+        t = Table(title=f"Bitrate Outliers — {total_found} found, showing {len(flagged)}", box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Bitrate", justify="right", width=12, style="bold yellow")
+        t.add_column("Limit", justify="right", width=10, style="dim")
+        t.add_column("Excess", justify="right", width=12, style="red")
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Res", width=7, justify="right")
+        t.add_column("Codec", width=8)
+        for i, r in enumerate(flagged, 1):
+            br_mbps = r["_br"] / 1000
+            lim_mbps = r["_limit"] / 1000
+            exc_mbps = r["_excess"] / 1000
+            t.add_row(
+                str(i),
+                f"{br_mbps:.1f} Mbps",
+                f"{lim_mbps:.0f} Mbps",
+                f"+{exc_mbps:.1f} Mbps",
+                r["title"],
+                r["library"],
+                r["_label"],
+                (r["videoCodec"] or "—").upper(),
+            )
+        console.print(t)
+        limits_str = "  ".join(f"{k}>{v//1000} Mbps" for k, v in limits.items())
+        console.print(f"[dim]Thresholds: {limits_str}[/dim]")
 
     def do_subtitles(self, arg: str):
         section_id = arg.strip() or None
