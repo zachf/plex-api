@@ -1075,6 +1075,8 @@ _HELP_SECTIONS = [
         ("resolution_trend",  "[library_id]",                    "4K/1080p/720p/SD share by year items were added"),
         ("container_format",  "[library_id]",                    "Distribution of file container formats (mkv, mp4, avi, etc.)"),
         ("size_by_codec",     "[library_id]",                    "Total and average file size grouped by video codec"),
+        ("codec_migration_plan", "[--library id] [--count N] [--min-size GB] [--target hevc|av1]",
+                                                                 "Legacy-codec files ranked by estimated savings and watch popularity"),
         ("channel_dist",      "[library_id]",                    "Audio channel layout distribution (stereo, 5.1, 7.1, etc.)"),
     ]),
     ("Item extras", [
@@ -3805,6 +3807,148 @@ class PlexShell(cmd.Cmd):
         t.add_section()
         t.add_row("[bold]All[/bold]", str(len(rows)), f"[bold]{format_size(grand_total)}[/bold]", "", "")
         console.print(t)
+
+    def do_codec_migration_plan(self, arg: str):
+        """codec_migration_plan [--library id] [--count N] [--min-size GB] [--target hevc|av1]"""
+        tokens = self._tokens(arg)
+        count = self._int_flag(tokens, "--count", 25, minimum=1)
+        library_filter = self._flag_value(tokens, "--library", "").lower()
+        target = self._flag_value(tokens, "--target", "hevc").lower()
+        if target in ("h265", "h.265"):
+            target = "hevc"
+        if target not in ("hevc", "av1"):
+            console.print("[yellow]--target must be hevc or av1.[/yellow]")
+            return
+
+        try:
+            min_size_gb = max(0.0, float(self._flag_value(tokens, "--min-size", "4")))
+        except ValueError:
+            min_size_gb = 4.0
+        min_size_bytes = int(min_size_gb * 1024 ** 3)
+
+        source_savings = {
+            "h264": 0.35, "avc": 0.35,
+            "mpeg2video": 0.55, "mpeg2": 0.55, "mpeg1video": 0.55,
+            "vc1": 0.45, "mpeg4": 0.45, "xvid": 0.45, "divx": 0.45,
+        }
+        skip_codecs = {"hevc", "h265", "av1"}
+
+        def _lib_matches(lib: dict) -> bool:
+            if not library_filter:
+                return True
+            return (library_filter == str(lib.get("key", "")).lower()
+                    or library_filter in (lib.get("title", "") or "").lower())
+
+        def _rating_value(item: dict) -> float:
+            raw = item.get("audienceRating")
+            if raw is None:
+                raw = item.get("rating")
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _bitrate(media: dict, size: int, duration: int) -> int:
+            raw = media.get("bitrate")
+            if raw:
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    pass
+            if size and duration:
+                return int(size * 8 / (duration / 1000) / 1000)
+            return 0
+
+        def _high_bitrate(resolution: str, bitrate: int) -> bool:
+            label = resolution_label(resolution)
+            thresholds = {"4K": 25000, "1080p": 12000, "720p": 6000, "SD": 3000}
+            return bitrate >= thresholds.get(label, 9000)
+
+        candidates = []
+        with console.status("Scanning legacy video codecs..."):
+            libs = [lib for lib in self.client.libraries()
+                    if lib.get("type") in ("movie", "show") and _lib_matches(lib)]
+            for lib in libs:
+                lib_title = lib.get("title", "")
+                for item in self.client._leaf_items(lib):
+                    if item.get("type") not in ("movie", "episode"):
+                        continue
+                    plays = item.get("viewCount") or 0
+                    rating_val = _rating_value(item)
+                    for media in item.get("Media", []):
+                        codec = (media.get("videoCodec") or "").lower()
+                        if not codec or codec in skip_codecs or codec not in source_savings:
+                            continue
+                        duration = media.get("duration") or item.get("duration") or 0
+                        resolution = media.get("videoResolution", "")
+                        for part in media.get("Part", []):
+                            size = part.get("size") or 0
+                            if size < min_size_bytes:
+                                continue
+                            savings_ratio = source_savings[codec]
+                            if target == "av1":
+                                savings_ratio = min(0.65, savings_ratio + 0.10)
+                            est_saved = int(size * savings_ratio)
+                            bitrate = _bitrate(media, size, duration)
+                            saved_gb = est_saved / (1024 ** 3)
+                            score = saved_gb * 7 + min(plays, 20) * 3 + rating_val
+                            reasons = [f"{codec.upper()}->{target.upper()}"]
+                            if _high_bitrate(resolution, bitrate):
+                                score += 6
+                                reasons.append("high bitrate")
+                            if plays:
+                                reasons.append(f"{plays} plays")
+                            else:
+                                reasons.append("unwatched")
+                            candidates.append({
+                                "score": score,
+                                "key": item.get("ratingKey", ""),
+                                "title": full_title(item),
+                                "library": lib_title,
+                                "codec": codec.upper(),
+                                "resolution": resolution_label(resolution),
+                                "bitrate": bitrate,
+                                "size": size,
+                                "saved": est_saved,
+                                "plays": plays,
+                                "reason": ", ".join(reasons),
+                            })
+
+        candidates.sort(key=lambda r: (-r["score"], -r["saved"], r["title"]))
+        if not candidates:
+            console.print("[yellow]No migration candidates found.[/yellow]")
+            console.print("[dim]Try lowering --min-size or checking a different --library.[/dim]")
+            return
+
+        shown = candidates[:count]
+        total_saved = sum(r["saved"] for r in shown)
+        title = (f"Codec Migration Plan -> {target.upper()} "
+                 f"(top {len(shown)} of {len(candidates)}, min {min_size_gb:g} GB)")
+        t = Table(title=title, box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4, justify="right")
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Library", style="cyan", width=14)
+        t.add_column("Codec", width=7)
+        t.add_column("Res", width=7, justify="right")
+        t.add_column("Size", width=10, justify="right", style="bold yellow")
+        t.add_column("Est Save", width=10, justify="right", style="green")
+        t.add_column("Plays", width=6, justify="right")
+        t.add_column("Why", min_width=18)
+        for i, row in enumerate(shown, 1):
+            bitrate = f"{row['bitrate']//1000} Mbps" if row["bitrate"] >= 1000 else (
+                f"{row['bitrate']} kbps" if row["bitrate"] else "?")
+            t.add_row(
+                str(i), str(row["key"]), row["title"], row["library"],
+                row["codec"], row["resolution"], format_size(row["size"]),
+                format_size(row["saved"]), str(row["plays"]),
+                f"{row['reason']} ({bitrate})",
+            )
+        t.add_section()
+        t.add_row("", "", "[bold]Shown total[/bold]", "", "", "",
+                  "", f"[bold]{format_size(total_saved)}[/bold]", "", "")
+        console.print(t)
+        console.print("[dim]Estimates are rough: actual savings depend on encode settings, source grain, HDR, and audio copy choices.[/dim]")
 
     def do_channel_dist(self, arg: str):
         """channel_dist [library_id] — audio channel layout distribution (stereo, 5.1, 7.1, etc.)"""
@@ -7218,6 +7362,7 @@ class PlexShell(cmd.Cmd):
     _WN_FLAGS  = ["--count", "--library", "--runtime", "--genre", "--type"]
     _QUP_FLAGS = ["--limit", "--movies", "--shows"]
     _PW_FLAGS  = ["--days", "--past", "--missing-only"]
+    _CMP_FLAGS = ["--library", "--count", "--min-size", "--target"]
 
     def complete_plex_metadata(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)
@@ -7257,6 +7402,14 @@ class PlexShell(cmd.Cmd):
         if prev == "--type":
             return [v for v in ("movie", "episode") if v.startswith(text.lower())]
         if text.startswith("-"): return self._c_flags(text, self._WN_FLAGS)
+        return []
+
+    def complete_codec_migration_plan(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library": return self._c_libs(text)
+        if prev == "--target":
+            return [v for v in ("hevc", "av1") if v.startswith(text.lower())]
+        if text.startswith("-"): return self._c_flags(text, self._CMP_FLAGS)
         return []
 
     def complete_hubs(self, text, line, begidx, endidx):

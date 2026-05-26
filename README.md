@@ -212,6 +212,7 @@ python plex_cli.py <command> [args]
 | `resolution_trend` | `[library_id]` | 4K/1080p/720p/SD share by year added |
 | `container_format` | `[library_id]` | File container format distribution |
 | `size_by_codec` | `[library_id]` | Total and average file size by video codec |
+| `codec_migration_plan` | `[--library id] [--count N] [--min-size GB] [--target hevc\|av1]` | Legacy-codec files ranked by estimated savings and watch popularity |
 | `channel_dist` | `[library_id]` | Audio channel layout distribution |
 
 ### Cross-API Intelligence
