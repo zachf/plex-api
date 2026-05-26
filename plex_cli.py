@@ -1006,6 +1006,7 @@ _HELP_SECTIONS = [
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
         ("smallest",        "[count] [--library name]",           "Titles with the smallest file sizes"),
+        ("tv_storage",      "[--library name] [--count N]",       "Disk usage grouped by TV show"),
         ("tvlargest",       "[count] [--library name]",           "TV shows with the most total disk usage"),
         ("tvsmallest",      "[count] [--library name]",           "TV shows with the least total disk usage"),
         ("longest",         "[count] [--library name]",           "Titles with the longest runtime"),
@@ -2470,7 +2471,8 @@ class PlexShell(cmd.Cmd):
     def do_smallest(self, arg: str):
         count, lib = self._parse_size_args(arg); self._size_table(count, False, lib)
 
-    def _show_size_table(self, count: int, largest: bool, library_filter: str = ""):
+    def _show_size_table(self, count: int, largest: bool, library_filter: str = "",
+                         title: str | None = None):
         label = "Largest" if largest else "Smallest"
         with console.status("Fetching TV libraries..."):
             tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
@@ -2486,9 +2488,9 @@ class PlexShell(cmd.Cmd):
             for lib in tv_libs:
                 for ep in self.client.library_episodes(lib.get("key", "")):
                     show = ep.get("grandparentTitle") or ep.get("title", "Unknown")
-                    key = ep.get("grandparentRatingKey", "")
-                    rec = show_data.setdefault(show, {
-                        "title": show, "ratingKey": key,
+                    show_key = (lib.get("key", ""), ep.get("grandparentRatingKey") or show.lower().strip())
+                    rec = show_data.setdefault(show_key, {
+                        "title": show, "ratingKey": ep.get("grandparentRatingKey", ""),
                         "library": lib.get("title", ""), "size": 0, "episodes": 0,
                     })
                     rec["size"] += sum(
@@ -2501,8 +2503,14 @@ class PlexShell(cmd.Cmd):
             console.print("[yellow]No episode data found.[/yellow]")
             return
 
-        rows = sorted(show_data.values(), key=lambda x: x["size"], reverse=largest)[:count]
-        title = f"{label} {count} TV Shows by Disk Usage" + (f" — {library_filter}" if library_filter else "")
+        rows = sorted(show_data.values(), key=lambda x: x["size"], reverse=largest)
+        if count > 0:
+            rows = rows[:count]
+        if title is None:
+            title = (f"{label} {count} TV Shows by Disk Usage"
+                     if count > 0 else "TV Show Disk Usage")
+        if library_filter:
+            title += f" - {library_filter}"
         t = Table(title=title, box=box.ROUNDED)
         t.add_column("#", style="dim", width=4)
         t.add_column("Total Size", width=12, justify="right", style="bold yellow")
@@ -2518,6 +2526,20 @@ class PlexShell(cmd.Cmd):
         t.add_section()
         t.add_row("", f"[bold]{format_size(total)}[/bold]", f"[dim]Total ({len(rows)} shows)[/dim]", "", "", "")
         console.print(t)
+
+    def do_tv_storage(self, arg: str):
+        """tv_storage [--library name] [--count N] - disk usage grouped by TV show"""
+        tokens = self._tokens(arg)
+        count = self._int_flag(tokens, "--count", 0, minimum=0)
+        if count == 0:
+            for token in tokens:
+                if token.isdigit():
+                    count = int(token)
+                    break
+        _, flags = parse_search_args(arg)
+        library_filter = self._flag_value(tokens, "--library", flags.get("library", ""))
+        title = "TV Show Disk Usage" if count == 0 else f"TV Show Disk Usage (top {count})"
+        self._show_size_table(count, True, library_filter, title=title)
 
     def do_tvlargest(self, arg: str):
         """tvlargest [count] [--library name] — TV shows with the most total disk usage (default 25)"""
@@ -7477,6 +7499,16 @@ class PlexShell(cmd.Cmd):
         return []
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
+
+    _TV_STORAGE_FLAGS = ["--library", "--count"]
+
+    def complete_tv_storage(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
+        if prev == "--count":
+            return []
+        return self._c_flags(text, self._TV_STORAGE_FLAGS) if text.startswith("-") else []
 
     def _cached_radarr_lists(self) -> list[str]:
         if not hasattr(self, "_c_radarr_lists"):
