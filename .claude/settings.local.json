@@ -4,7 +4,12 @@
       "WebFetch(domain:mdblist.com)",
       "WebFetch(domain:api.themoviedb.org)",
       "Bash(python3)",
-      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('plex_cli.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('plex_cli.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Zach\\\\Projects\\\\plex-api\" -Recurse -Name)",
+      "Bash(grep -E \"\\\\.\\(py|txt\\)$\")",
+      "Bash(ls -la \"c:\\\\Users\\\\Zach\\\\Projects\\\\plex-api\\\\\" | head -30)",
+      "Read(//c/Users/Zach/Projects/**)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('plex_cli.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

@@ -1132,6 +1132,8 @@ _HELP_SECTIONS = [
         ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
         ("radarr_collections", "[--import]", "TMDB franchise completion: show what's missing per series; --import adds them"),
         ("radarr_calendar",    "[--days N]", "Upcoming movie releases for monitored titles (default 30 days)"),
+        ("trending_missing",   "[--window day|week] [--count N] [--import] [--dry-run] [--profile id] [--search]",
+                                             "TMDB trending movies cross-referenced against Radarr and Plex; --import adds missing"),
     ]),
     ("Maintenance", [
         ("plex_metadata",    "[--library <name>] [--fix] [--episodes]",
@@ -7204,6 +7206,72 @@ class PlexShell(cmd.Cmd):
 
         console.print(t)
         console.print(f"[dim]{len(movies)} release(s) found.[/dim]")
+
+    def do_trending_missing(self, arg: str):
+        """trending_missing [--window day|week] [--count N] [--import] [--dry-run] [--profile id] [--search]"""
+        tokens    = self._tokens(arg)
+        window    = self._flag_value(tokens, "--window", "week")
+        if window not in ("day", "week"):
+            console.print("[yellow]--window must be 'day' or 'week'.[/yellow]"); return
+        count     = self._int_flag(tokens, "--count", 20, minimum=1)
+        do_import = "--import" in tokens
+        dry_run   = "--dry-run" in tokens
+        search    = "--search" in tokens
+        profile_id: int | None = None
+        if "--profile" in tokens:
+            idx = tokens.index("--profile")
+            if idx + 1 < len(tokens):
+                try:
+                    profile_id = int(tokens[idx + 1])
+                except ValueError:
+                    console.print("[red]--profile requires an integer ID.[/red]"); return
+
+        tc = self._get_tmdb_client()
+        rc = self._get_radarr_client()
+        if not tc or not rc: return
+
+        with console.status(f"Fetching TMDB trending ({window})..."):
+            trending = tc.trending(window)
+        if not trending:
+            console.print("[yellow]No trending data returned from TMDB.[/yellow]"); return
+        trending = trending[:count]
+
+        with console.status("Loading Radarr and Plex libraries..."):
+            radarr_ids = {m.get("tmdbId") for m in rc.movies()}
+            plex_set   = self._plex_movie_set()
+
+        t = Table(title=f"Trending Movies ({window}) — top {len(trending)}", box=box.ROUNDED)
+        t.add_column("#",          style="dim",        width=4,  justify="right")
+        t.add_column("Title",      style="bold white",  min_width=30)
+        t.add_column("Year",       width=6,             justify="right", style="dim")
+        t.add_column("Rating",     width=7,             justify="right")
+        t.add_column("Radarr",     width=9,             justify="center")
+        t.add_column("Plex",       width=9,             justify="center")
+
+        missing_movies = []
+        for i, m in enumerate(trending, 1):
+            in_r = m["tmdb_id"] in radarr_ids
+            in_p = self._in_plex(m["title"], m["year"], plex_set)
+            rating_str = f"[yellow]{m['rating']}[/yellow]" if m["rating"] >= 7 else str(m["rating"]) if m["rating"] else "—"
+            t.add_row(
+                str(i),
+                m["title"],
+                str(m["year"]) if m["year"] else "—",
+                rating_str,
+                "[green]yes[/green]" if in_r else "[red]no[/red]",
+                "[green]yes[/green]" if in_p else "[dim]no[/dim]",
+            )
+            if not in_r:
+                missing_movies.append(m)
+
+        console.print(t)
+        console.print(
+            f"[yellow]{len(missing_movies)} of {len(trending)} not in Radarr.[/yellow]"
+            + (f"  [dim]Run [bold]trending_missing --import[/bold] to add them.[/dim]" if not do_import and missing_movies else "")
+        )
+
+        if do_import and missing_movies:
+            self._radarr_import_workflow(missing_movies, rc, dry_run, profile_id, search)
 
     def do_radarr_collections(self, arg: str):
         """radarr_collections [--import] — TMDB franchise completion; --import adds missing to Radarr"""
