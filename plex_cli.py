@@ -1217,7 +1217,8 @@ _HELP_SECTIONS = [
         ("radarr_import",   "<name> [--dry-run] [--profile <id>] [--search]", "Add missing movies from a named list to Radarr"),
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
-        ("radarr_pick",    "<name> [--all] [--profile <id>]",                  "Interactively scroll and select movies to download; --all shows owned titles greyed out"),
+        ("radarr_pick",    "<name>|--director <name>|--actor <name> [--all] [--profile <id>]",
+                                                                                 "Interactively select movies to download from a list, director filmography, or actor filmography"),
         ("radarr_upgrade",    "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
         ("radarr_upgrade_4k", "<title> [--search]",                             "Switch a movie's quality profile to 4K and optionally trigger a search"),
         ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
@@ -5535,7 +5536,7 @@ class PlexShell(cmd.Cmd):
         console.print("[dim]Radarr is searching in the background.[/dim]")
 
     def do_radarr_pick(self, arg: str):
-        """radarr_pick <name> [--profile <id>] — interactively select movies to download"""
+        """radarr_pick <name>|--director <name>|--actor <name> [--all] [--profile <id>]"""
         try:
             import questionary
         except ImportError:
@@ -5546,11 +5547,7 @@ class PlexShell(cmd.Cmd):
             tokens = shlex.split(arg.strip()) if arg.strip() else []
         except ValueError:
             tokens = arg.strip().split()
-        if not tokens:
-            console.print("[yellow]Usage: radarr_pick <name> [--profile <id>][/yellow]")
-            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
 
-        name       = tokens[0]
         show_all   = "--all" in tokens
         profile_id: int | None = None
         if "--profile" in tokens:
@@ -5560,19 +5557,72 @@ class PlexShell(cmd.Cmd):
                 except ValueError:
                     console.print("[red]--profile requires an integer ID.[/red]"); return
 
-        lists = load_lists()
-        if name not in lists:
-            console.print(f"[red]Unknown list:[/red] '{name}'")
-            console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+        director_name = self._flag_value(tokens, "--director")
+        actor_name    = self._flag_value(tokens, "--actor")
+        use_person    = bool(director_name or actor_name)
+
+        if not use_person and not tokens:
+            console.print("[yellow]Usage: radarr_pick <name> [--all] [--profile <id>][/yellow]")
+            console.print("[yellow]       radarr_pick --director <name> [--all] [--profile <id>][/yellow]")
+            console.print("[yellow]       radarr_pick --actor <name> [--all] [--profile <id>][/yellow]")
+            console.print("[dim]Run [bold]radarr_lists[/bold] for available list names.[/dim]"); return
 
         tc = self._get_tmdb_client()
         rc = self._get_radarr_client()
         if not tc or not rc: return
 
-        with console.status("Fetching list from TMDB..."):
-            movies = tc.list_movies(lists[name])
-        if not movies:
-            console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
+        if use_person:
+            person_query = director_name or actor_name
+            is_director  = bool(director_name)
+            with console.status(f"Searching TMDB for '{person_query}'..."):
+                candidates = tc.search_person(person_query)
+            if not candidates:
+                console.print(f"[yellow]No TMDB results for '{person_query}'.[/yellow]"); return
+            if len(candidates) == 1:
+                person = candidates[0]
+                console.print(f"[dim]Found: {person.get('name')}[/dim]")
+            else:
+                try:
+                    p_choices = [
+                        questionary.Choice(
+                            f"{p.get('name')} — {', '.join(k.get('title') or k.get('name','') for k in p.get('known_for',[])[:2]) or '?'}",
+                            value=p,
+                        )
+                        for p in candidates[:8]
+                    ]
+                    person = questionary.select("Select person:", choices=p_choices).ask()
+                    if not person: return
+                except Exception:
+                    person = min(candidates[:8], key=lambda p: -SequenceMatcher(
+                        None, person_query.lower(), (p.get("name") or "").lower()).ratio())
+                    console.print(f"[dim]Using best match: {person.get('name')}[/dim]")
+            with console.status(f"Fetching {person['name']} filmography..."):
+                films = tc.director_filmography(person["id"]) if is_director else tc.actor_filmography(person["id"])
+            if not films:
+                console.print(f"[yellow]No films found for {person.get('name')}.[/yellow]"); return
+            movies = films
+            name   = person["name"]
+        else:
+            # positional list name: first token that isn't a flag or flag-value
+            flag_values = set()
+            for flag in ("--profile", "--director", "--actor"):
+                if flag in tokens:
+                    idx = tokens.index(flag)
+                    if idx + 1 < len(tokens):
+                        flag_values.add(tokens[idx + 1])
+            positional = [t for t in tokens if not t.startswith("--") and t not in flag_values]
+            if not positional:
+                console.print("[yellow]Usage: radarr_pick <name>[/yellow]")
+                console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+            name  = positional[0]
+            lists = load_lists()
+            if name not in lists:
+                console.print(f"[red]Unknown list:[/red] '{name}'")
+                console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
+            with console.status("Fetching list from TMDB..."):
+                movies = tc.list_movies(lists[name])
+            if not movies:
+                console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
 
         with console.status("Loading Radarr and Plex libraries..."):
             radarr_by_tmdb = {m.get("tmdbId"): m for m in rc.movies()}
