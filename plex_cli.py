@@ -671,6 +671,56 @@ class TautulliClient:
             params["search"] = user
         return self._cmd("get_history", **params).get("data", {}).get("data", [])
 
+# ── Overseerr client ──────────────────────────────────────────────────────────
+
+class OverseerrClient:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = (base_url if "://" in base_url else f"http://{base_url}").rstrip("/")
+        self.api_key  = api_key
+        self.session  = requests.Session()
+
+    def _get(self, path: str, **params) -> dict:
+        try:
+            r = self.session.get(
+                f"{self.base_url}/api/v1{path}",
+                headers={"X-Api-Key": self.api_key, "Accept": "application/json"},
+                params=params,
+                timeout=15,
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ConnectionError:
+            console.print(f"[red]Cannot reach Overseerr at {self.base_url}[/red]"); return {}
+        except requests.exceptions.HTTPError as e:
+            console.print(f"[red]Overseerr HTTP {e.response.status_code}[/red]"); return {}
+
+    def status(self) -> dict:
+        return self._get("/status")
+
+    def requests(self, take: int = 25, skip: int = 0, filter_: str = "all") -> dict:
+        return self._get("/request", take=take, skip=skip, filter=filter_)
+
+    def movie(self, tmdb_id: int) -> dict:
+        return self._get(f"/movie/{tmdb_id}")
+
+# ── OMDB client ───────────────────────────────────────────────────────────────
+
+class OMDBClient:
+    BASE = "http://www.omdbapi.com/"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.session = requests.Session()
+
+    def by_imdb_id(self, imdb_id: str) -> dict:
+        try:
+            r = self.session.get(self.BASE, params={"i": imdb_id, "apikey": self.api_key}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            return data if data.get("Response") != "False" else {}
+        except Exception:
+            return {}
+
 # ── TMDB client ───────────────────────────────────────────────────────────────
 
 class TMDBClient:
@@ -1111,6 +1161,11 @@ _HELP_SECTIONS = [
         ("sonarr_upgrade", "",           "Shows with episodes below quality cutoff; select to trigger re-search"),
         ("sonarr_add",     "<name>",     "Search for a TV show and add it to Sonarr"),
     ]),
+    ("Overseerr", [
+        ("overseerr_status",   "",                                                      "Overseerr connection info and request summary"),
+        ("overseerr_requests", "[--filter all|pending|approved|declined|available] [--count N]",
+                                                                                        "Movie requests with TMDB, IMDB, and Rotten Tomatoes ratings"),
+    ]),
     ("Tautulli", [
         ("tautulli_status",  "",                              "Tautulli connection info"),
         ("tautulli_history", "[--user <name>] [--count N]",  "Rich play history: stream type, duration, platform"),
@@ -1405,6 +1460,41 @@ class PlexShell(cmd.Cmd):
                 console.print("[red]TMDB API key is required.[/red]"); return None
             cfg["tmdb_api_key"] = key; save_config(cfg)
         return TMDBClient(key)
+
+    def _get_overseerr_client(self) -> "OverseerrClient | None":
+        cfg = load_config()
+        url = cfg.get("overseerr_url", "") or os.environ.get("OVERSEERR_URL", "")
+        key = cfg.get("overseerr_api_key", "") or os.environ.get("OVERSEERR_API_KEY", "")
+        if not url or not key:
+            console.print(Panel(
+                "Overseerr URL and API key are required.\n\n"
+                "Find your API key: Overseerr → Settings → General → API Key",
+                title="[yellow]Overseerr Setup[/yellow]", border_style="yellow"))
+            url = Prompt.ask("[yellow]Overseerr URL[/yellow]", default="http://localhost:5055")
+            key = Prompt.ask("[yellow]Overseerr API Key[/yellow]")
+            if not url or not key:
+                console.print("[red]Overseerr URL and API key are required.[/red]"); return None
+            cfg["overseerr_url"] = url; cfg["overseerr_api_key"] = key; save_config(cfg)
+        oc = OverseerrClient(url, key)
+        with console.status("Connecting to Overseerr..."):
+            info = oc.status()
+        if not info:
+            return None
+        return oc
+
+    def _get_omdb_client(self) -> "OMDBClient | None":
+        cfg = load_config()
+        key = cfg.get("omdb_api_key", "") or os.environ.get("OMDB_API_KEY", "")
+        if not key:
+            console.print(Panel(
+                "An OMDB API key is required for IMDB and Rotten Tomatoes ratings.\n\n"
+                "Get a free key (1000 req/day): omdbapi.com → API Key",
+                title="[yellow]OMDB Setup[/yellow]", border_style="yellow"))
+            key = Prompt.ask("[yellow]OMDB API Key[/yellow]")
+            if not key:
+                console.print("[red]OMDB API key is required.[/red]"); return None
+            cfg["omdb_api_key"] = key; save_config(cfg)
+        return OMDBClient(key)
 
     def _plex_movie_set(self) -> set[tuple[str, int]]:
         result: set[tuple[str, int]] = set()
@@ -6192,6 +6282,103 @@ class PlexShell(cmd.Cmd):
                 u.get("last_played") or "—",
             )
         console.print(t)
+
+    def do_overseerr_status(self, _):
+        """overseerr_status — Overseerr connection info and request summary"""
+        oc = self._get_overseerr_client()
+        if not oc: return
+        with console.status("Fetching Overseerr status..."):
+            info    = oc.status()
+            req_all = oc.requests(take=1, filter_="all")
+            req_pen = oc.requests(take=1, filter_="pending")
+            req_apr = oc.requests(take=1, filter_="approved")
+        rows = [
+            ("Version",         info.get("version", "?")),
+            ("Commit",          (info.get("commitTag") or "?")[:8]),
+            ("Total requests",  str((req_all.get("pageInfo") or {}).get("results", "?"))),
+            ("Pending",         str((req_pen.get("pageInfo") or {}).get("results", "?"))),
+            ("Approved",        str((req_apr.get("pageInfo") or {}).get("results", "?"))),
+        ]
+        t = Table(box=box.SIMPLE_HEAVY, show_header=False, padding=(0, 2))
+        t.add_column(style="dim"); t.add_column(style="bold white")
+        for k, v in rows:
+            t.add_row(k, v)
+        console.print(Panel(t, title="[bold cyan]Overseerr[/bold cyan]", border_style="cyan"))
+
+    def do_overseerr_requests(self, arg: str):
+        """overseerr_requests [--filter all|pending|approved|declined|available] [--count N]"""
+        tokens  = self._tokens(arg)
+        filter_ = self._flag_value(tokens, "--filter", "all")
+        count   = self._int_flag(tokens, "--count", 25, minimum=1)
+
+        VALID_FILTERS = ("all", "pending", "approved", "declined", "available", "processing", "unavailable")
+        if filter_ not in VALID_FILTERS:
+            console.print(f"[yellow]--filter must be one of: {', '.join(VALID_FILTERS)}[/yellow]"); return
+
+        oc = self._get_overseerr_client()
+        if not oc: return
+        omdb = self._get_omdb_client()
+        if not omdb: return
+
+        with console.status(f"Fetching requests (filter={filter_})..."):
+            data = oc.requests(take=count, filter_=filter_)
+
+        results = [r for r in (data.get("results") or []) if r.get("media", {}).get("mediaType") == "movie"]
+        if not results:
+            console.print("[yellow]No movie requests found.[/yellow]"); return
+
+        REQ_STATUS = {1: "[yellow]Pending[/yellow]", 2: "[green]Approved[/green]", 3: "[red]Declined[/red]"}
+        MEDIA_STATUS = {3: "[cyan]Processing[/cyan]", 4: "[blue]Partial[/blue]", 5: "[green]Available[/green]"}
+
+        enriched = []
+        with console.status(f"Fetching details for {len(results)} movie(s)..."):
+            for req in results:
+                tmdb_id    = req.get("media", {}).get("tmdbId")
+                movie_data = oc.movie(tmdb_id) if tmdb_id else {}
+                imdb_id    = (movie_data.get("externalIds") or {}).get("imdbId", "")
+                omdb_data  = omdb.by_imdb_id(imdb_id) if imdb_id else {}
+
+                rt_score = ""
+                for rating in (omdb_data.get("Ratings") or []):
+                    if rating.get("Source") == "Rotten Tomatoes":
+                        rt_score = rating.get("Value", "")
+                        break
+                imdb_rating = omdb_data.get("imdbRating", "")
+                if imdb_rating in ("N/A", ""):
+                    imdb_rating = ""
+
+                release = movie_data.get("releaseDate") or ""
+                media_status = req.get("media", {}).get("status", 0)
+                req_status   = req.get("status", 0)
+                status_str   = MEDIA_STATUS.get(media_status) or REQ_STATUS.get(req_status, "?")
+
+                enriched.append({
+                    "title":      movie_data.get("title") or "?",
+                    "year":       release[:4] if release else "—",
+                    "requester":  (req.get("requestedBy") or {}).get("displayName", "?"),
+                    "status":     status_str,
+                    "tmdb":       f"{movie_data['voteAverage']:.1f}" if movie_data.get("voteAverage") else "—",
+                    "imdb":       imdb_rating or "—",
+                    "rt":         rt_score or "—",
+                })
+
+        t = Table(title=f"Overseerr Movie Requests — {len(enriched)} shown", box=box.ROUNDED)
+        t.add_column("#",            style="dim",        width=4,  justify="right")
+        t.add_column("Title",        style="bold white",  min_width=28)
+        t.add_column("Year",         width=6,             justify="right", style="dim")
+        t.add_column("Requested By", width=16)
+        t.add_column("Status",       width=14,            justify="center")
+        t.add_column("TMDB",         width=6,             justify="right")
+        t.add_column("IMDB",         width=6,             justify="right")
+        t.add_column("RT",           width=6,             justify="right")
+
+        for i, e in enumerate(enriched, 1):
+            t.add_row(str(i), e["title"], e["year"], e["requester"],
+                      e["status"], e["tmdb"], e["imdb"], e["rt"])
+        console.print(t)
+        total = (data.get("pageInfo") or {}).get("results", len(enriched))
+        if total > len(enriched):
+            console.print(f"[dim]Showing {len(enriched)} of {total} total. Use --count to see more.[/dim]")
 
     def do_smart_recommendations(self, arg: str):
         """smart_recommendations [--count N] [--min-rating R] — personalized picks from Tautulli watch history × TMDB"""

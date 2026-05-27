@@ -9,7 +9,9 @@
       "Bash(grep -E \"\\\\.\\(py|txt\\)$\")",
       "Bash(ls -la \"c:\\\\Users\\\\Zach\\\\Projects\\\\plex-api\\\\\" | head -30)",
       "Read(//c/Users/Zach/Projects/**)",
-      "PowerShell(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('plex_cli.py', doraise=True\\); print\\('OK'\\)\")"
+      "PowerShell(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('plex_cli.py', doraise=True\\); print\\('OK'\\)\")",
+      "WebFetch(domain:docs.seerr.dev)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
