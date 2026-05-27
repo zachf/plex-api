@@ -560,8 +560,8 @@ class RadarrClient:
         """Trigger an immediate search for movies already in Radarr by their Radarr IDs."""
         return self.post("/command", {"name": "MoviesSearch", "movieIds": movie_ids})
 
-    def calendar(self, start: str, end: str) -> list:
-        r = self.get("/calendar", start=start, end=end)
+    def calendar(self, start: str, end: str, unmonitored: bool = True) -> list:
+        r = self.get("/calendar", start=start, end=end, unmonitored=str(unmonitored).lower())
         return r if isinstance(r, list) else []
 
 # ── Sonarr client ─────────────────────────────────────────────────────────────
@@ -1188,7 +1188,7 @@ _HELP_SECTIONS = [
         ("radarr_upgrade_4k", "<title> [--search]",                             "Switch a movie's quality profile to 4K and optionally trigger a search"),
         ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
         ("radarr_collections", "[--import]", "TMDB franchise completion: show what's missing per series; --import adds them"),
-        ("radarr_calendar",    "[--days N]", "Upcoming movie releases for monitored titles (default 30 days)"),
+        ("radarr_calendar",    "[--days N]", "Upcoming movie releases in Radarr, monitored or not (default 30 days)"),
         ("trending_missing",   "[--window day|week] [--count N] [--import] [--dry-run] [--profile id] [--search]",
                                              "TMDB trending movies cross-referenced against Radarr and Plex; --import adds missing"),
         ("radarr_monitored",   "[--missing] [--downloaded]",                "All monitored movies; --missing filters to undownloaded, --downloaded to files on disk"),
@@ -7493,7 +7493,7 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Downloaded titles that are not in Plex usually need a library scan.[/dim]")
 
     def do_radarr_calendar(self, arg: str):
-        """radarr_calendar [--days N] — upcoming movie releases monitored by Radarr (default 30 days)"""
+        """radarr_calendar [--days N] — upcoming movie releases in Radarr, monitored or not (default 30 days)"""
         tokens = arg.strip().split() if arg.strip() else []
         days = 30
         if "--days" in tokens:
