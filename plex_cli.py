@@ -1217,7 +1217,7 @@ _HELP_SECTIONS = [
         ("radarr_import",   "<name> [--dry-run] [--profile <id>] [--search]", "Add missing movies from a named list to Radarr"),
         ("radarr_director", "<name> [--dry-run] [--profile <id>] [--search]", "Import a director's filmography from TMDB into Radarr"),
         ("radarr_download", "<name> [--dry-run] [--profile <id>]",            "Search Radarr for all missing movies from a list"),
-        ("radarr_pick",    "<name> [--profile <id>]",                         "Interactively scroll and select movies to download"),
+        ("radarr_pick",    "<name> [--all] [--profile <id>]",                  "Interactively scroll and select movies to download; --all shows owned titles greyed out"),
         ("radarr_upgrade",    "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
         ("radarr_upgrade_4k", "<title> [--search]",                             "Switch a movie's quality profile to 4K and optionally trigger a search"),
         ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
@@ -5551,6 +5551,7 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Run [bold]radarr_lists[/bold] for available names.[/dim]"); return
 
         name       = tokens[0]
+        show_all   = "--all" in tokens
         profile_id: int | None = None
         if "--profile" in tokens:
             idx = tokens.index("--profile")
@@ -5590,11 +5591,8 @@ class PlexShell(cmd.Cmd):
                 status = "missing"
             rows.append({**m, "radarr": rm, "status": status})
 
-        downloadable = sorted(
-            [r for r in rows if r["status"] in ("missing", "not_in_radarr")],
-            key=lambda r: r.get("year") or 0,
-        )
-        if not downloadable:
+        downloadable = [r for r in rows if r["status"] in ("missing", "not_in_radarr")]
+        if not downloadable and not show_all:
             console.print("[green]Nothing to download — all movies are in Plex or already downloaded.[/green]")
             return
 
@@ -5608,27 +5606,50 @@ class PlexShell(cmd.Cmd):
                     if imdb_id:
                         omdb_ratings[r["tmdb_id"]] = _omdb_ratings(omdb.by_imdb_id(imdb_id))
 
-        STATUS_TAG = {"missing": "missing", "not_in_radarr": "not in Radarr"}
+        STATUS_TAG = {
+            "missing":        "missing",
+            "not_in_radarr":  "not in Radarr",
+            "has_file":       "downloaded",
+            "in_plex":        "in Plex",
+        }
         def _pick_label(r: dict) -> str:
-            parts = [f"{r['title']} ({r['year']})  [{STATUS_TAG[r['status']]}]"]
+            parts = [f"{r['title']} ({r['year']})  [{STATUS_TAG.get(r['status'], r['status'])}]"]
             imdb_r, rt_r = omdb_ratings.get(r["tmdb_id"], ("", ""))
             if imdb_r: parts.append(f"IMDB {imdb_r}")
             if rt_r:   parts.append(f"RT {rt_r}")
             return "  ".join(parts)
 
-        choices = [
-            questionary.Choice(title=_pick_label(r), value=r)
-            for r in downloadable
-        ]
+        if show_all:
+            display_rows = sorted(rows, key=lambda r: r.get("year") or 0, reverse=True)
+            choices = [
+                questionary.Choice(
+                    title=_pick_label(r),
+                    value=r,
+                    disabled=STATUS_TAG[r["status"]] if r["status"] in ("has_file", "in_plex") else None,
+                )
+                for r in display_rows
+            ]
+        else:
+            display_rows = sorted(downloadable, key=lambda r: r.get("year") or 0, reverse=True)
+            choices = [questionary.Choice(title=_pick_label(r), value=r) for r in display_rows]
 
-        console.print(f"\n[bold]{name}[/bold]  —  {len(downloadable)} downloadable movies")
+        total_str = f"{len(downloadable)} downloadable" + (f" of {len(rows)} total" if show_all else "")
+        console.print(f"\n[bold]{name}[/bold]  —  {total_str}")
         console.print("[dim]↑↓ scroll · Space toggle · a select all · enter confirm · ctrl-c cancel[/dim]\n")
 
-        selected = questionary.checkbox(
-            f"Select movies to download:",
+        try:
+            from questionary import Style as _QStyle
+            _picker_style = _QStyle([("checkbox-disabled-unselected", "fg:#666666")])
+        except Exception:
+            _picker_style = None
+
+        picker = questionary.checkbox(
+            "Select movies to download:",
             choices=choices,
             instruction=" ",
-        ).ask()
+            **({"style": _picker_style} if _picker_style else {}),
+        )
+        selected = picker.ask()
 
         if not selected:
             console.print("[dim]Nothing selected.[/dim]"); return
