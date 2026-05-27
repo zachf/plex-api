@@ -280,8 +280,8 @@ class PlexClient:
     def libraries(self) -> list:
         return self._mc("/library/sections", "Directory")
 
-    def library_contents(self, section_id: str, sort: str = "titleSort") -> list:
-        return self._mc(f"/library/sections/{section_id}/all", sort=sort)
+    def library_contents(self, section_id: str, sort: str = "titleSort", **params) -> list:
+        return self._mc(f"/library/sections/{section_id}/all", sort=sort, **params)
 
     def library_episodes(self, section_id: str) -> list:
         """Fetch all episodes in a TV library (type=4 returns leaf items with Media/Part)."""
@@ -711,13 +711,20 @@ class OMDBClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.session = requests.Session()
+        self._cache  = load_omdb_cache()
 
     def by_imdb_id(self, imdb_id: str) -> dict:
+        if imdb_id in self._cache:
+            return self._cache[imdb_id]
         try:
             r = self.session.get(self.BASE, params={"i": imdb_id, "apikey": self.api_key}, timeout=10)
             r.raise_for_status()
             data = r.json()
-            return data if data.get("Response") != "False" else {}
+            if data.get("Response") != "False":
+                self._cache[imdb_id] = data
+                save_omdb_cache(self._cache)
+                return data
+            return {}
         except Exception:
             return {}
 
@@ -843,6 +850,10 @@ class TMDBClient:
         """Fetch full movie detail including credits and keywords."""
         return self._get(f"/movie/{tmdb_id}", append_to_response="credits,keywords")
 
+    def external_ids(self, tmdb_id: int) -> dict:
+        """Fetch external IDs (imdb_id, wikidata_id, etc.) for a movie."""
+        return self._get(f"/movie/{tmdb_id}/external_ids")
+
 # ── TMDB named lists ──────────────────────────────────────────────────────────
 
 _DEFAULT_TMDB_LISTS: dict[str, int] = {
@@ -891,6 +902,29 @@ def load_lists() -> dict[str, int]:
 
 def save_lists(lists: dict[str, int]) -> None:
     LISTS_FILE.write_text(json.dumps(lists, indent=2), encoding="utf-8")
+
+_OMDB_CACHE_PATH = Path.home() / ".plex_cli_omdb_cache.json"
+
+def load_omdb_cache() -> dict:
+    try:
+        return json.loads(_OMDB_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_omdb_cache(cache: dict) -> None:
+    try:
+        _OMDB_CACHE_PATH.write_text(json.dumps(cache), encoding="utf-8")
+    except Exception:
+        pass
+
+def _omdb_ratings(data: dict) -> tuple[str, str]:
+    """Return (imdb_rating, rt_pct) from an OMDB response dict."""
+    imdb = data.get("imdbRating", "")
+    if imdb == "N/A":
+        imdb = ""
+    rt = next((r["Value"] for r in (data.get("Ratings") or [])
+               if r.get("Source") == "Rotten Tomatoes"), "")
+    return imdb, rt
 
 # ── Display helpers ───────────────────────────────────────────────────────────
 
@@ -1358,6 +1392,11 @@ class PlexShell(cmd.Cmd):
         url = cfg.get("radarr_url", "") or os.environ.get("RADARR_URL", "")
         key = cfg.get("radarr_api_key", "") or os.environ.get("RADARR_API_KEY", "")
         return RadarrClient(url, key) if url and key else None
+
+    def _configured_omdb_client(self) -> "OMDBClient | None":
+        cfg = load_config()
+        key = cfg.get("omdb_api_key", "") or os.environ.get("OMDB_API_KEY", "")
+        return OMDBClient(key) if key else None
 
     def _configured_sonarr_client(self) -> "SonarrClient | None":
         cfg = load_config()
@@ -2247,20 +2286,39 @@ class PlexShell(cmd.Cmd):
 
     def do_toprated(self, arg: str):
         libs = self._libs_for(arg.strip() or None)
+        omdb = self._configured_omdb_client()
         all_items = []
         with console.status("Fetching ratings..."):
             for lib in libs:
-                for item in self.client.library_contents(lib.get("key",""), sort="rating:desc"):
+                for item in self.client.library_contents(lib.get("key",""), sort="rating:desc", includeGuids=1):
                     r = item.get("rating") or item.get("audienceRating")
                     if r:
                         all_items.append((float(r), lib.get("title",""), item))
         all_items.sort(key=lambda x: x[0], reverse=True)
+        top = all_items[:50]
+        omdb_map: dict[str, tuple[str, str]] = {}
+        if omdb and top:
+            with console.status("Fetching IMDB / RT ratings..."):
+                for _, _, item in top:
+                    imdb_id = next((g["id"][7:] for g in (item.get("Guid") or [])
+                                    if g.get("id", "").startswith("imdb://")), "")
+                    if imdb_id:
+                        omdb_map[item.get("ratingKey", "")] = _omdb_ratings(omdb.by_imdb_id(imdb_id))
         t = Table(title="Top Rated", box=box.ROUNDED)
-        t.add_column("#", style="dim", width=4); t.add_column("Rating", width=7, justify="right", style="bold green")
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Rating", width=7, justify="right", style="bold green")
         t.add_column("Title", style="bold white", min_width=28)
-        t.add_column("Year", width=6, justify="right"); t.add_column("Library", style="cyan", width=16)
-        for i, (r, lt, item) in enumerate(all_items[:50], 1):
-            t.add_row(str(i), f"{r:.1f}", item.get("title",""), year(item), lt)
+        t.add_column("Year", width=6, justify="right")
+        t.add_column("Library", style="cyan", width=16)
+        if omdb:
+            t.add_column("IMDB", width=7, justify="right")
+            t.add_column("RT", width=6, justify="right")
+        for i, (r, lt, item) in enumerate(top, 1):
+            row = [str(i), f"{r:.1f}", item.get("title",""), year(item), lt]
+            if omdb:
+                imdb_r, rt_r = omdb_map.get(item.get("ratingKey", ""), ("", ""))
+                row += [imdb_r or "—", rt_r or "—"]
+            t.add_row(*row)
         console.print(t)
 
     def do_watch_calendar(self, arg: str):
@@ -2335,8 +2393,15 @@ class PlexShell(cmd.Cmd):
         """recommendations [library_id] — highly rated unwatched content (audience rating ≥ 7.5)"""
         section_id = arg.strip() or None
         MIN_RATING = 7.5
+        omdb = self._configured_omdb_client()
         with console.status("Finding recommendations..."):
-            items = self._all_items(section_id)
+            if section_id:
+                libs = self._libs_for(section_id)
+            else:
+                libs = [l for l in self.client.libraries() if l.get("type") in ("movie", "show")]
+            items = []
+            for lib in libs:
+                items.extend(self.client.library_contents(lib.get("key", ""), includeGuids=1))
         recs = []
         for item in items:
             if item.get("viewCount"):
@@ -2348,6 +2413,15 @@ class PlexShell(cmd.Cmd):
             console.print(f"[yellow]No unwatched items with rating ≥ {MIN_RATING}.[/yellow]")
             return
         recs.sort(key=lambda x: x[0], reverse=True)
+        top = recs[:50]
+        omdb_map: dict[str, tuple[str, str]] = {}
+        if omdb and top:
+            with console.status("Fetching IMDB / RT ratings..."):
+                for _, item in top:
+                    imdb_id = next((g["id"][7:] for g in (item.get("Guid") or [])
+                                    if g.get("id", "").startswith("imdb://")), "")
+                    if imdb_id:
+                        omdb_map[item.get("ratingKey", "")] = _omdb_ratings(omdb.by_imdb_id(imdb_id))
         t = Table(title=f"Recommendations — Unwatched, Rating ≥ {MIN_RATING}",
                   caption=f"{len(recs)} items", caption_justify="right", box=box.ROUNDED)
         t.add_column("#", style="dim", width=4)
@@ -2355,8 +2429,15 @@ class PlexShell(cmd.Cmd):
         t.add_column("Title", style="bold white", min_width=30)
         t.add_column("Year", width=6, justify="right")
         t.add_column("Type", style="yellow", width=10)
-        for i, (r, item) in enumerate(recs[:50], 1):
-            t.add_row(str(i), f"{r:.1f}", item.get("title", ""), year(item), item.get("type", ""))
+        if omdb:
+            t.add_column("IMDB", width=7, justify="right")
+            t.add_column("RT", width=6, justify="right")
+        for i, (r, item) in enumerate(top, 1):
+            row = [str(i), f"{r:.1f}", item.get("title", ""), year(item), item.get("type", "")]
+            if omdb:
+                imdb_r, rt_r = omdb_map.get(item.get("ratingKey", ""), ("", ""))
+                row += [imdb_r or "—", rt_r or "—"]
+            t.add_row(*row)
         console.print(t)
 
     def do_rewatched(self, arg: str):
@@ -5514,12 +5595,26 @@ class PlexShell(cmd.Cmd):
             console.print("[green]Nothing to download — all movies are in Plex or already downloaded.[/green]")
             return
 
+        omdb = self._configured_omdb_client()
+        omdb_ratings: dict[int, tuple[str, str]] = {}
+        if omdb:
+            with console.status("Fetching ratings..."):
+                for r in downloadable:
+                    ext     = tc.external_ids(r["tmdb_id"])
+                    imdb_id = ext.get("imdb_id", "")
+                    if imdb_id:
+                        omdb_ratings[r["tmdb_id"]] = _omdb_ratings(omdb.by_imdb_id(imdb_id))
+
         STATUS_TAG = {"missing": "missing", "not_in_radarr": "not in Radarr"}
+        def _pick_label(r: dict) -> str:
+            parts = [f"{r['title']} ({r['year']})  [{STATUS_TAG[r['status']]}]"]
+            imdb_r, rt_r = omdb_ratings.get(r["tmdb_id"], ("", ""))
+            if imdb_r: parts.append(f"IMDB {imdb_r}")
+            if rt_r:   parts.append(f"RT {rt_r}")
+            return "  ".join(parts)
+
         choices = [
-            questionary.Choice(
-                title=f"{r['title']} ({r['year']})  [{STATUS_TAG[r['status']]}]",
-                value=r,
-            )
+            questionary.Choice(title=_pick_label(r), value=r)
             for r in downloadable
         ]
 
