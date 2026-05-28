@@ -6988,6 +6988,18 @@ class PlexShell(cmd.Cmd):
             return any(abs(wy - year) <= 1 and SequenceMatcher(None, t, wt).ratio() >= 0.88
                        for wt, wy in watched)
 
+        omdb = self._configured_omdb_client()
+        rt_map: dict[int, str] = {}
+        if omdb:
+            with console.status("Fetching Rotten Tomatoes ratings..."):
+                for f in films:
+                    ext = tmdb.external_ids(f["tmdb_id"])
+                    imdb_id = ext.get("imdb_id", "")
+                    if imdb_id:
+                        _, rt = _omdb_ratings(omdb.by_imdb_id(imdb_id))
+                        if rt:
+                            rt_map[f["tmdb_id"]] = rt
+
         t = Table(
             title=f"[bold white]{person['name']}[/bold white] — {len(films)} directed films",
             box=box.ROUNDED,
@@ -6995,6 +7007,8 @@ class PlexShell(cmd.Cmd):
         t.add_column("Year",   width=6,  justify="right", style="dim")
         t.add_column("Title",  style="bold cyan", min_width=30)
         t.add_column("Rating", width=7,  justify="right", style="dim")
+        if rt_map:
+            t.add_column("RT",  width=6,  justify="right", style="red")
         t.add_column("Plex",   width=6,  justify="center")
         if watched:
             t.add_column("Watched", width=8, justify="center")
@@ -7014,8 +7028,10 @@ class PlexShell(cmd.Cmd):
                 str(f["year"]) if f["year"] else "—",
                 f["title"],
                 f"{f['rating']:.1f}" if f.get("rating") else "—",
-                "[green]✓[/green]" if has_plex else "[dim]—[/dim]",
             ]
+            if rt_map:
+                row.append(rt_map.get(f["tmdb_id"], "—"))
+            row.append("[green]✓[/green]" if has_plex else "[dim]—[/dim]")
             if watched:
                 row.append("[green]✓[/green]" if seen else "[dim]—[/dim]")
             if radarr_ids:
@@ -7100,6 +7116,18 @@ class PlexShell(cmd.Cmd):
             return any(abs(wy - year) <= 1 and SequenceMatcher(None, t, wt).ratio() >= 0.88
                        for wt, wy in watched)
 
+        omdb = self._configured_omdb_client()
+        rt_map: dict[int, str] = {}
+        if omdb:
+            with console.status("Fetching Rotten Tomatoes ratings..."):
+                for f in films:
+                    ext = tmdb.external_ids(f["tmdb_id"])
+                    imdb_id = ext.get("imdb_id", "")
+                    if imdb_id:
+                        _, rt = _omdb_ratings(omdb.by_imdb_id(imdb_id))
+                        if rt:
+                            rt_map[f["tmdb_id"]] = rt
+
         t = Table(
             title=f"[bold white]{person['name']}[/bold white] — {len(films)} acting credits",
             box=box.ROUNDED,
@@ -7108,6 +7136,8 @@ class PlexShell(cmd.Cmd):
         t.add_column("Title",     style="bold cyan", min_width=28)
         t.add_column("Character", style="italic", min_width=20)
         t.add_column("Rating",    width=7,  justify="right", style="dim")
+        if rt_map:
+            t.add_column("RT",    width=6,  justify="right", style="red")
         t.add_column("Plex",      width=6,  justify="center")
         if watched:
             t.add_column("Watched", width=8, justify="center")
@@ -7128,8 +7158,10 @@ class PlexShell(cmd.Cmd):
                 f["title"],
                 f["character"] or "—",
                 f"{f['rating']:.1f}" if f.get("rating") else "—",
-                "[green]✓[/green]" if has_plex else "[dim]—[/dim]",
             ]
+            if rt_map:
+                row.append(rt_map.get(f["tmdb_id"], "—"))
+            row.append("[green]✓[/green]" if has_plex else "[dim]—[/dim]")
             if watched:
                 row.append("[green]✓[/green]" if seen else "[dim]—[/dim]")
             if radarr_ids:
