@@ -635,6 +635,10 @@ class SonarrClient:
     def search_series(self, series_id: int) -> dict:
         return self.post("/command", {"name": "SeriesSearch", "seriesId": series_id})
 
+    def calendar(self, start: str, end: str, unmonitored: bool = True) -> list:
+        r = self.get("/calendar", start=start, end=end, unmonitored=str(unmonitored).lower())
+        return r if isinstance(r, list) else []
+
 # ── Tautulli client ───────────────────────────────────────────────────────────
 
 class TautulliClient:
@@ -938,7 +942,7 @@ def print_libraries(libs: list):
         t.add_row(lib.get("key", ""), lib.get("title", ""), lib.get("type", ""), str(lib.get("count", "?")))
     console.print(t)
 
-def print_media_table(items: list, title: str = "Results"):
+def print_media_table(items: list, title: str = "Results", show_resolution: bool = False):
     if not items:
         console.print("[yellow]No results.[/yellow]")
         return
@@ -950,9 +954,15 @@ def print_media_table(items: list, title: str = "Results"):
     t.add_column("Year", width=6, justify="right")
     t.add_column("Rating", width=7, justify="right")
     t.add_column("Duration", width=9, justify="right")
+    if show_resolution:
+        t.add_column("Resolution", width=10, justify="right")
     for item in items:
-        t.add_row(item.get("ratingKey", ""), full_title(item), item.get("type", ""),
-                  year(item), rating(item), format_duration(item.get("duration")))
+        row = [item.get("ratingKey", ""), full_title(item), item.get("type", ""),
+               year(item), rating(item), format_duration(item.get("duration"))]
+        if show_resolution:
+            res = resolution_label((item.get("Media") or [{}])[0].get("videoResolution", ""))
+            row.append(res)
+        t.add_row(*row)
     console.print(t)
 
 def build_sessions_table(sessions: list) -> Table:
@@ -1189,11 +1199,12 @@ _HELP_SECTIONS = [
                                                                  "Build a playlist from combined filters"),
     ]),
     ("Sonarr", [
-        ("sonarr_status",  "",           "Sonarr connection info, quality profiles, root folders"),
-        ("sonarr_sync",    "",           "Find Sonarr downloads missing from Plex, and Plex shows not in Sonarr"),
-        ("sonarr_missing", "",           "Shows with monitored but missing episodes; select to trigger search"),
-        ("sonarr_upgrade", "",           "Shows with episodes below quality cutoff; select to trigger re-search"),
-        ("sonarr_add",     "<name>",     "Search for a TV show and add it to Sonarr"),
+        ("sonarr_status",   "",           "Sonarr connection info, quality profiles, root folders"),
+        ("sonarr_sync",     "",           "Find Sonarr downloads missing from Plex, and Plex shows not in Sonarr"),
+        ("sonarr_missing",  "",           "Shows with monitored but missing episodes; select to trigger search"),
+        ("sonarr_upgrade",  "",           "Shows with episodes below quality cutoff; select to trigger re-search"),
+        ("sonarr_add",      "<name>",     "Search for a TV show and add it to Sonarr"),
+        ("sonarr_calendar", "[--days N]", "Upcoming episode air dates in Sonarr (default 30 days)"),
     ]),
     ("Overseerr", [
         ("overseerr_status",   "",                                                      "Overseerr connection info and request summary"),
@@ -3361,28 +3372,35 @@ class PlexShell(cmd.Cmd):
         print_media_table(results, f"Content Rating: {rating_val}")
 
     def do_byresolution(self, arg: str):
-        """byresolution <resolution> [library_id] — list items at a given resolution (4K, 1080p, 720p, SD)"""
+        """byresolution <resolution> [library_id] — list items at a given resolution (4K, 1080p, 720p, SD, sub1080)"""
         _ALIASES = {
             "4k": "4K", "2160": "4K", "2160p": "4K",
             "1080": "1080p", "1080p": "1080p",
             "720": "720p", "720p": "720p",
             "sd": "SD", "480": "SD", "480p": "SD", "576": "SD", "576p": "SD",
+            "sub1080": "sub1080", "<1080": "sub1080", "below1080": "sub1080",
         }
+        _SUB1080 = {"720p", "SD", "Unknown"}
         parts = arg.strip().split()
         if not parts:
             console.print("[yellow]Usage: byresolution <resolution> [library_id][/yellow]")
-            console.print("[dim]Resolutions: 4K  1080p  720p  SD[/dim]")
+            console.print("[dim]Resolutions: 4K  1080p  720p  SD  sub1080[/dim]")
             return
         target = _ALIASES.get(parts[0].lower())
         if not target:
-            console.print(f"[yellow]Unknown resolution '{parts[0]}'. Try: 4K, 1080p, 720p, SD[/yellow]")
+            console.print(f"[yellow]Unknown resolution '{parts[0]}'. Try: 4K, 1080p, 720p, SD, sub1080[/yellow]")
             return
         section_id = parts[1] if len(parts) > 1 else None
         with console.status(f"Finding [cyan]{target}[/cyan] items..."):
             items = self._all_items(section_id)
-        results = [i for i in items
-                   if i.get("Media") and resolution_label(i["Media"][0].get("videoResolution")) == target]
-        print_media_table(results, f"Resolution: {target}")
+        if target == "sub1080":
+            results = [i for i in items
+                       if i.get("Media") and resolution_label(i["Media"][0].get("videoResolution")) in _SUB1080]
+            print_media_table(results, "Resolution: below 1080p (720p / SD / Unknown)", show_resolution=True)
+        else:
+            results = [i for i in items
+                       if i.get("Media") and resolution_label(i["Media"][0].get("videoResolution")) == target]
+            print_media_table(results, f"Resolution: {target}", show_resolution=True)
 
     def _tag_stats_table(self, title: str, tag_key: str, items: list):
         """Shared helper for director_stats / actor_stats."""
@@ -6259,6 +6277,66 @@ class PlexShell(cmd.Cmd):
                 console.print("[dim]Sonarr is searching for episodes in the background.[/dim]")
         else:
             console.print(f"[red]Failed to add show.[/red] Response: {result}")
+
+    def do_sonarr_calendar(self, arg: str):
+        """sonarr_calendar [--days N] — upcoming episode air dates in Sonarr (default 30 days)"""
+        tokens = arg.strip().split() if arg.strip() else []
+        days = 30
+        if "--days" in tokens:
+            idx = tokens.index("--days")
+            if idx + 1 < len(tokens):
+                try: days = int(tokens[idx + 1])
+                except ValueError: pass
+
+        sc = self._get_sonarr_client()
+        if not sc: return
+
+        today = date.today()
+        end   = today + timedelta(days=days)
+
+        with console.status(f"Fetching Sonarr calendar ({today} → {end})..."):
+            episodes = sc.calendar(today.isoformat(), end.isoformat())
+            all_series = sc.series()
+
+        if not episodes:
+            console.print(f"[yellow]No episodes airing in the next {days} day(s).[/yellow]"); return
+
+        series_titles = {s["id"]: s.get("title", "?") for s in all_series if "id" in s}
+
+        def _air_date(ep: dict) -> str:
+            return ep.get("airDate") or ep.get("airDateUtc", "9999")[:10]
+
+        def _fmt_date(s: str | None) -> str:
+            if not s: return "—"
+            return s[:10]
+
+        episodes.sort(key=_air_date)
+
+        t = Table(title=f"Upcoming Episodes — next {days} day(s)  ({today} → {end})", box=box.ROUNDED)
+        t.add_column("Air Date",      width=12)
+        t.add_column("Show",          style="bold cyan", min_width=24)
+        t.add_column("S/E",           width=7,  justify="right", style="dim")
+        t.add_column("Episode Title", min_width=24)
+        t.add_column("Status",        width=13)
+
+        for ep in episodes:
+            embedded = ep.get("series") or {}
+            show    = embedded.get("title") or series_titles.get(ep.get("seriesId", -1), "?")
+            s_num   = ep.get("seasonNumber", 0)
+            e_num   = ep.get("episodeNumber", 0)
+            ep_title = ep.get("title", "—")
+            air     = _fmt_date(_air_date(ep))
+            se      = f"S{s_num:02d}E{e_num:02d}"
+            if ep.get("hasFile"):
+                status = "[green]Downloaded[/green]"
+            elif ep.get("monitored"):
+                status = "[yellow]Monitored[/yellow]"
+            else:
+                status = "[dim]Unmonitored[/dim]"
+            t.add_row(air, show, se, ep_title, status)
+
+        console.print(t)
+        console.print(f"[dim]{len(episodes)} episode(s) found.[/dim]")
 
     # ── Tautulli commands ─────────────────────────────────────────────────────
 
