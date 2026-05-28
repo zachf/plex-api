@@ -1151,6 +1151,8 @@ _HELP_SECTIONS = [
     ("Deeper analysis", [
         ("bitrate",         "[library_id]",                      "Bitrate distribution with outlier flagging"),
         ("subtitles",       "[library_id]",                      "Items missing subtitle tracks"),
+        ("foreign_subtitle_audit", "[--language en] [--library id] [--forced-ok] [--include-unknown] [--count N]",
+                                                                 "Non-target-language audio missing full target-language subtitles"),
         ("hdr",             "[library_id]",                      "List HDR and Dolby Vision content"),
         ("audioformat",     "<format>",                          "Items with a specific audio format"),
         ("audio_bloat_audit","[--library id] [--count N] [--min-size GB]",
@@ -3648,6 +3650,198 @@ class PlexShell(cmd.Cmd):
         for lt, item in sorted(missing, key=lambda x: x[1].get("title","").lower()):
             t.add_row(lt, item.get("ratingKey",""), item.get("title",""), year(item), item.get("type",""))
         console.print(t)
+
+    def do_foreign_subtitle_audit(self, arg: str):
+        """foreign_subtitle_audit [--language en] [--library id] [--forced-ok] [--include-unknown] [--count N]"""
+        tokens = self._tokens(arg)
+        target = self._flag_value(tokens, "--language", "en").lower()
+        library_filter = self._flag_value(tokens, "--library", "")
+        forced_ok = self._has_flag(tokens, "--forced-ok")
+        include_unknown = self._has_flag(tokens, "--include-unknown")
+        count = self._int_flag(tokens, "--count", 100, minimum=1)
+
+        value_flags = {"--language", "--library", "--count"}
+        value_indexes = {i + 1 for i, tok in enumerate(tokens)
+                         if tok in value_flags and i + 1 < len(tokens)}
+        positionals = [tok for i, tok in enumerate(tokens)
+                       if i not in value_indexes and not tok.startswith("--")]
+        if not library_filter and positionals:
+            library_filter = positionals[0]
+
+        aliases = {
+            "en": {"en", "eng", "english"},
+            "eng": {"en", "eng", "english"},
+            "es": {"es", "esp", "spa", "spanish", "espanol"},
+            "spa": {"es", "esp", "spa", "spanish", "espanol"},
+            "fr": {"fr", "fre", "fra", "french", "francais"},
+            "de": {"de", "deu", "ger", "german", "deutsch"},
+            "it": {"it", "ita", "italian", "italiano"},
+            "ja": {"ja", "jpn", "japanese"},
+            "jpn": {"ja", "jpn", "japanese"},
+            "ko": {"ko", "kor", "korean"},
+            "zh": {"zh", "chi", "zho", "chinese", "mandarin", "cantonese"},
+            "pt": {"pt", "por", "portuguese", "portugues"},
+        }
+        target_aliases = aliases.get(target, {target})
+
+        def _truthy(value) -> bool:
+            return str(value).lower() in ("1", "true", "yes")
+
+        def _stream_values(stream: dict) -> list[str]:
+            vals = []
+            for key in ("languageCode", "language", "languageTag", "title",
+                        "displayTitle", "extendedDisplayTitle"):
+                raw = stream.get(key)
+                if raw:
+                    vals.append(str(raw).strip().lower())
+            return vals
+
+        def _matches_target(stream: dict) -> bool:
+            for val in _stream_values(stream):
+                if val in target_aliases:
+                    return True
+                if target in ("en", "es", "fr", "de", "it", "ja", "ko", "zh", "pt"):
+                    if val == target or val.startswith(f"{target}-"):
+                        return True
+                words = set(re.split(r"[^a-zA-Z]+", val))
+                if words & target_aliases:
+                    return True
+            return False
+
+        def _is_forced(stream: dict) -> bool:
+            if _truthy(stream.get("forced")):
+                return True
+            text = " ".join(_stream_values(stream))
+            if "non-forced" in text or "non forced" in text:
+                return False
+            return bool(re.search(r"\bforced\b", text))
+
+        def _lang_label(stream: dict) -> str:
+            for key in ("language", "languageCode", "languageTag", "title"):
+                raw = stream.get(key)
+                if raw:
+                    val = str(raw).strip()
+                    if val and val.lower() not in ("und", "unknown", "none"):
+                        return val
+            return "Unknown"
+
+        def _display_title(item: dict) -> str:
+            title = item.get("title", "?")
+            gp = item.get("grandparentTitle", "")
+            parent = item.get("parentTitle", "")
+            if gp and parent:
+                return f"{gp} - {parent} - {title}"
+            if parent:
+                return f"{parent} - {title}"
+            return title
+
+        def _select_libraries() -> list[dict]:
+            libs = self.client.libraries()
+            if not library_filter:
+                return [lib for lib in libs if lib.get("type") in ("movie", "show")]
+            q = library_filter.lower()
+            matches = [
+                lib for lib in libs
+                if lib.get("type") in ("movie", "show")
+                and (q == str(lib.get("key", "")).lower()
+                     or q == (lib.get("title", "") or "").lower()
+                     or q in (lib.get("title", "") or "").lower())
+            ]
+            if not matches:
+                console.print(f"[yellow]Library '{library_filter}' not found.[/yellow]")
+            return matches
+
+        def _stream_type(stream: dict) -> str:
+            return str(stream.get("streamType", ""))
+
+        flagged = []
+        checked = skipped_unknown = 0
+        with console.status("Auditing foreign-language subtitle coverage..."):
+            for lib in _select_libraries():
+                lib_title = lib.get("title", "")
+                for item in self.client._leaf_items(lib):
+                    if item.get("type") not in ("movie", "episode"):
+                        continue
+                    checked += 1
+                    item_audio_labels: set[str] = set()
+                    item_has_target_audio = False
+                    item_has_known_foreign_audio = False
+                    item_has_unknown_audio = False
+                    item_target_subs = []
+                    item_target_full_subs = []
+                    item_target_forced_subs = []
+
+                    for media in item.get("Media", []):
+                        for part in media.get("Part", []):
+                            streams = part.get("Stream", [])
+                            audio_streams = [s for s in streams if _stream_type(s) == "2"]
+                            if not audio_streams and media.get("audioCodec"):
+                                audio_streams = [{"language": "Unknown"}]
+                            for stream in audio_streams:
+                                label = _lang_label(stream)
+                                item_audio_labels.add(label)
+                                if _matches_target(stream):
+                                    item_has_target_audio = True
+                                elif label == "Unknown":
+                                    item_has_unknown_audio = True
+                                else:
+                                    item_has_known_foreign_audio = True
+
+                            for stream in (s for s in streams if _stream_type(s) == "3"):
+                                if not _matches_target(stream):
+                                    continue
+                                item_target_subs.append(stream)
+                                if _is_forced(stream):
+                                    item_target_forced_subs.append(stream)
+                                else:
+                                    item_target_full_subs.append(stream)
+
+                    if item_has_target_audio:
+                        continue
+                    if not item_has_known_foreign_audio and not (include_unknown and item_has_unknown_audio):
+                        if item_has_unknown_audio and not include_unknown:
+                            skipped_unknown += 1
+                        continue
+                    if item_target_full_subs or (forced_ok and item_target_subs):
+                        continue
+
+                    sub_status = "Missing"
+                    if item_target_forced_subs and not item_target_full_subs:
+                        sub_status = "Forced only"
+                    flagged.append({
+                        "library": lib_title,
+                        "key": item.get("ratingKey", ""),
+                        "title": _display_title(item),
+                        "audio": ", ".join(sorted(item_audio_labels)) or "Unknown",
+                        "subs": sub_status,
+                    })
+
+        if not flagged:
+            console.print(f"[green]No foreign-language items missing full {target.upper()} subtitles.[/green]")
+            if skipped_unknown:
+                console.print(f"[dim]{skipped_unknown} item(s) had unknown audio language; use --include-unknown to include them.[/dim]")
+            return
+
+        flagged.sort(key=lambda r: (r["subs"] != "Missing", r["library"], r["title"].lower()))
+        shown = flagged[:count]
+        t = Table(
+            title=f"Foreign Subtitle Audit - missing full {target.upper()} subtitles ({len(flagged)} found)",
+            box=box.ROUNDED,
+        )
+        t.add_column("Key", style="dim", width=7)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Audio", width=16)
+        t.add_column("Subs", width=12)
+        for row in shown:
+            sub_style = "[red]Missing[/red]" if row["subs"] == "Missing" else "[yellow]Forced only[/yellow]"
+            t.add_row(row["key"], f"{row['library']}: {row['title']}", row["audio"], sub_style)
+        console.print(t)
+        console.print(f"[dim]Checked {checked} movie/episode item(s). "
+                      f"Forced subtitles {'count as sufficient' if forced_ok else 'are flagged as forced-only'}.[/dim]")
+        if len(flagged) > len(shown):
+            console.print(f"[dim]Showing {len(shown)} of {len(flagged)}. Use --count to show more.[/dim]")
+        if skipped_unknown:
+            console.print(f"[dim]{skipped_unknown} item(s) had unknown audio language; use --include-unknown to include them.[/dim]")
 
     def do_hdr(self, arg: str):
         section_id = arg.strip() or None
@@ -8239,6 +8433,21 @@ class PlexShell(cmd.Cmd):
         if prev in ("--count", "--min-size"):
             return []
         return self._c_flags(text, self._ABA_FLAGS) if text.startswith("-") else []
+
+    _FSA_FLAGS = ["--language", "--library", "--forced-ok", "--include-unknown", "--count"]
+    _FSA_LANGS = ("en", "eng", "es", "spa", "fr", "de", "it", "ja", "jpn", "ko", "zh", "pt")
+
+    def complete_foreign_subtitle_audit(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
+        if prev == "--language":
+            return [lang for lang in self._FSA_LANGS if lang.startswith(text.lower())]
+        if prev == "--count":
+            return []
+        if text.startswith("-"):
+            return self._c_flags(text, self._FSA_FLAGS)
+        return self._c_libs(text) if len(line[:begidx].split()) == 1 else []
 
     def _cached_radarr_lists(self) -> list[str]:
         if not hasattr(self, "_c_radarr_lists"):

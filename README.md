@@ -194,6 +194,7 @@ python plex_cli.py <command> [args]
 |---|---|---|
 | `bitrate` | `[library_id]` | Bitrate distribution with outlier flagging |
 | `subtitles` | `[library_id]` | Items missing subtitle tracks |
+| `foreign_subtitle_audit` | `[--language en] [--library id] [--forced-ok] [--include-unknown] [--count N]` | Non-target-language audio missing full target-language subtitles |
 | `hdr` | `[library_id]` | HDR and Dolby Vision content |
 | `audioformat` | `<format>` | Items with a specific audio format |
 | `audio_bloat_audit` | `[--library id] [--count N] [--min-size GB]` | Large files with lossless/high-channel audio ranked by estimated savings |
