@@ -1042,6 +1042,130 @@ def _distribution_table(title: str, counts: Counter, cap: int = 0):
     if cap and len(counts) > cap:
         console.print(f"[dim]Showing top {cap} of {len(counts)}.[/dim]")
 
+# ── Pager ─────────────────────────────────────────────────────────────────────
+
+class _LessPager:
+    """Pure-Python pager with less-like keyboard shortcuts.
+
+    Space/f = next page   b = back   j/k = one line   d/u = half page
+    g/G = top/bottom      Arrow keys and PgUp/PgDn also work.   q = quit
+    """
+
+    def show(self, content: str) -> None:
+        import shutil
+        lines = content.splitlines()
+        h = shutil.get_terminal_size((80, 24)).lines
+        if len(lines) < h - 1:
+            sys.stdout.write(content)
+            sys.stdout.flush()
+            return
+        try:
+            self._page(lines)
+        except Exception:
+            sys.stdout.write(content)
+            sys.stdout.flush()
+
+    @staticmethod
+    def _getch() -> bytes:
+        if sys.platform == "win32":
+            import msvcrt
+            ch = msvcrt.getch()
+            if ch in (b"\x00", b"\xe0"):   # extended key prefix
+                return ch + msvcrt.getch()
+            return ch
+        else:
+            import tty, termios
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.buffer.read(1)
+                if ch == b"\x1b":
+                    ch += sys.stdin.buffer.read(2)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            return ch
+
+    def _page(self, lines: list[str]) -> None:
+        import shutil
+        total = len(lines)
+        pos   = 0
+
+        while True:
+            sz        = shutil.get_terminal_size((80, 24))
+            page_size = max(1, sz.lines - 1)
+            at_end    = pos + page_size >= total
+
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write("\n".join(lines[pos : pos + page_size]))
+
+            pct    = min(100, int((pos + page_size) / max(total, 1) * 100))
+            status = (
+                " (END)  q=quit "
+                if at_end else
+                f" {pct}%  Spc=next  b=back  j/k=↑↓  d/u=½pg  g/G=top/bot  q=quit "
+            )
+            sys.stdout.write(f"\n\033[7m{status}\033[m")
+            sys.stdout.flush()
+
+            try:
+                key = self._getch()
+            except KeyboardInterrupt:
+                break
+
+            if key in (b"q", b"Q", b"\x03"):             # q / Q / Ctrl-C
+                break
+            elif at_end and key in (b" ", b"f"):
+                break
+            elif key in (b" ", b"f", b"\x06"):            # Space / f / Ctrl-F
+                pos = min(pos + page_size, max(0, total - page_size))
+            elif key in (b"b", b"\x02"):                   # b / Ctrl-B
+                pos = max(0, pos - page_size)
+            elif key in (b"j", b"\r", b"\n", b"\x0e"):    # j / Enter / Ctrl-N
+                pos = min(pos + 1, max(0, total - page_size))
+            elif key in (b"k", b"\x10"):                   # k / Ctrl-P
+                pos = max(0, pos - 1)
+            elif key in (b"d", b"\x04"):                   # d / Ctrl-D
+                pos = min(pos + page_size // 2, max(0, total - page_size))
+            elif key in (b"u", b"\x15"):                   # u / Ctrl-U
+                pos = max(0, pos - page_size // 2)
+            elif key in (b"g", b"<"):
+                pos = 0
+            elif key in (b"G", b">"):
+                pos = max(0, total - page_size)
+            # Windows extended scan codes
+            elif key == b"\xe0P": pos = min(pos + 1, max(0, total - page_size))   # Down
+            elif key == b"\xe0H": pos = max(0, pos - 1)                            # Up
+            elif key == b"\xe0Q": pos = min(pos + page_size, max(0, total - page_size))  # PgDn
+            elif key == b"\xe0I": pos = max(0, pos - page_size)                    # PgUp
+            elif key == b"\xe0G": pos = 0                                           # Home
+            elif key == b"\xe0O": pos = max(0, total - page_size)                  # End
+            # ANSI escape sequences (Unix / VS Code PTY)
+            elif key == b"\x1b[A":  pos = max(0, pos - 1)
+            elif key == b"\x1b[B":  pos = min(pos + 1, max(0, total - page_size))
+            elif key == b"\x1b[5~": pos = max(0, pos - page_size)
+            elif key == b"\x1b[6~": pos = min(pos + page_size, max(0, total - page_size))
+
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
+
+_PAGER = _LessPager()
+
+# Commands that use Prompt.ask() mid-output where the user must see the
+# preceding table to make a choice — skip pager for these.
+_INTERACTIVE_COMMANDS = frozenset({
+    "collection_gaps",   # import confirmation
+    "fixtitles",         # apply/edit/cancel after proposals table
+    "play",              # pick active session by number
+    "playlist_build",    # confirmation after preview
+    "radarr_director",   # director match selection + profile/folder prompts
+    "radarr_download",   # movie number entry
+    "radarr_import",     # profile, folder, confirmation prompts
+    "radarr_upgrade",    # confirmation prompt
+    "radarr_upgrade_4k", # search confirmation prompt
+    "sonarr_add",        # show/profile/folder selection prompts
+})
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 _HELP_SECTIONS = [
@@ -1293,6 +1417,13 @@ class PlexShell(cmd.Cmd):
     def do_EOF(self, _):
         console.print()
         return self.do_quit(_)
+
+    def onecmd(self, line: str) -> bool:
+        cmd = line.strip().split()[0] if line.strip() else ""
+        if cmd in _INTERACTIVE_COMMANDS:
+            return super().onecmd(line)
+        with console.pager(pager=_PAGER, styles=True):
+            return super().onecmd(line)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -4267,8 +4398,8 @@ class PlexShell(cmd.Cmd):
         items_4k = []
         with console.status("Scanning for 4K content..."):
             for lib in libs:
-                lid, lt = lib.get("key", ""), lib.get("title", "")
-                for item in self.client.library_contents(lid):
+                lt = lib.get("title", "")
+                for item in self.client._leaf_items(lib):
                     for media in item.get("Media", []):
                         if (media.get("videoResolution") or "").lower() not in ("4k", "2160"):
                             continue
@@ -4288,10 +4419,16 @@ class PlexShell(cmd.Cmd):
                             profile = (media.get("videoProfile") or "").lower()
                             if "main 10" in profile or "high 10" in profile:
                                 hdr_type = "HDR10 (profile)"
+                        if item.get("type") == "episode":
+                            show = item.get("grandparentTitle", "?")
+                            ep   = f"S{item.get('parentIndex', 0):02d}E{item.get('index', 0):02d}"
+                            title = f"{show} · {ep} · {item.get('title', '')}"
+                        else:
+                            title = item.get("title", "?") or "?"
                         items_4k.append({
                             "ratingKey": item.get("ratingKey", ""),
-                            "title": item.get("title", ""),
-                            "year": item.get("year"),
+                            "title": title,
+                            "year": item.get("year") or item.get("parentYear"),
                             "library": lt,
                             "hdr": hdr_type or "None",
                             "videoCodec": (media.get("videoCodec") or "?").upper(),
