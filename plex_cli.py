@@ -564,6 +564,12 @@ class RadarrClient:
         r = self.get("/calendar", start=start, end=end, unmonitored=str(unmonitored).lower())
         return r if isinstance(r, list) else []
 
+    def history(self, page_size: int = 50) -> list:
+        r = self.get("/history", page=1, pageSize=page_size,
+                     sortKey="date", sortDirection="descending",
+                     includeMovie="true")
+        return r.get("records", []) if isinstance(r, dict) else []
+
 # ── Sonarr client ─────────────────────────────────────────────────────────────
 
 class SonarrClient:
@@ -638,6 +644,12 @@ class SonarrClient:
     def calendar(self, start: str, end: str, unmonitored: bool = True) -> list:
         r = self.get("/calendar", start=start, end=end, unmonitored=str(unmonitored).lower())
         return r if isinstance(r, list) else []
+
+    def history(self, page_size: int = 50) -> list:
+        r = self.get("/history", page=1, pageSize=page_size,
+                     sortKey="date", sortDirection="descending",
+                     includeSeries="true", includeEpisode="true")
+        return r.get("records", []) if isinstance(r, dict) else []
 
 # ── Tautulli client ───────────────────────────────────────────────────────────
 
@@ -1327,6 +1339,8 @@ _HELP_SECTIONS = [
     ("Sonarr", [
         ("sonarr_status",   "",           "Sonarr connection info, quality profiles, root folders"),
         ("sonarr_sync",     "",           "Find Sonarr downloads missing from Plex, and Plex shows not in Sonarr"),
+        ("sonarr_history",  "[--count N] [--event grabbed|imported|failed|deleted|renamed|ignored] [--failures]",
+                                            "Recent Sonarr grabs, imports, failures, and file events"),
         ("sonarr_missing",  "",           "Shows with monitored but missing episodes; select to trigger search"),
         ("sonarr_upgrade",  "",           "Shows with episodes below quality cutoff; select to trigger re-search"),
         ("sonarr_add",      "<name>",     "Search for a TV show and add it to Sonarr"),
@@ -1359,6 +1373,8 @@ _HELP_SECTIONS = [
         ("radarr_upgrade",    "",                                                "List movies below quality cutoff; select to trigger upgrade searches"),
         ("radarr_upgrade_4k", "<title> [--search]",                             "Switch a movie's quality profile to 4K and optionally trigger a search"),
         ("radarr_sync",        "",           "Find Radarr downloads missing from Plex, and Plex movies not in Radarr"),
+        ("radarr_history",     "[--count N] [--event grabbed|imported|failed|deleted|renamed|ignored] [--failures]",
+                                                 "Recent Radarr grabs, imports, failures, and file events"),
         ("radarr_collections", "[--import]", "TMDB franchise completion: show what's missing per series; --import adds them"),
         ("radarr_calendar",    "[--days N]", "Upcoming movie releases in Radarr, monitored or not (default 30 days)"),
         ("trending_missing",   "[--window day|week] [--count N] [--import] [--dry-run] [--profile id] [--search]",
@@ -1531,6 +1547,178 @@ class PlexShell(cmd.Cmd):
             return max(minimum, int(raw))
         except ValueError:
             return default
+
+    def _positional_count(self, tokens: list[str], default: int = 25) -> int:
+        count = self._int_flag(tokens, "--count", default, minimum=1)
+        if "--count" in tokens:
+            return count
+        for token in tokens:
+            if token.isdigit():
+                return max(1, int(token))
+        return count
+
+    def _arr_history_event_key(self, record: dict) -> str:
+        raw = record.get("eventType", "")
+        text = re.sub(r"[^a-z0-9]+", "", str(raw).strip().lower())
+        if text in ("1", "grabbed") or "grab" in text:
+            return "grabbed"
+        if text in ("2", "downloadfolderimported", "seriesfolderimported",
+                    "moviefolderimported", "episodefileimported", "moviefileimported",
+                    "imported") or "import" in text:
+            return "imported"
+        if text in ("3", "downloadfailed", "failed") or "fail" in text:
+            return "failed"
+        if text in ("4", "moviefiledeleted", "episodefiledeleted", "deleted") or "delete" in text:
+            return "deleted"
+        if text in ("5", "moviefilerenamed", "episodefilerenamed", "renamed") or "rename" in text:
+            return "renamed"
+        if text in ("6", "downloadignored", "ignored") or "ignore" in text:
+            return "ignored"
+        return text or "unknown"
+
+    def _arr_history_event_label(self, record: dict) -> str:
+        key = self._arr_history_event_key(record)
+        labels = {
+            "grabbed": "Grabbed",
+            "imported": "Imported",
+            "failed": "Failed",
+            "deleted": "Deleted",
+            "renamed": "Renamed",
+            "ignored": "Ignored",
+        }
+        styles = {
+            "grabbed": "cyan",
+            "imported": "green",
+            "failed": "red",
+            "deleted": "yellow",
+            "renamed": "blue",
+            "ignored": "magenta",
+        }
+        label = labels.get(key, str(record.get("eventType") or key).strip() or "Unknown")
+        style = styles.get(key, "dim")
+        return f"[{style}]{label}[/{style}]"
+
+    def _arr_history_matches(self, record: dict, event_filter: str) -> bool:
+        if not event_filter:
+            return True
+        key = self._arr_history_event_key(record)
+        event_filter = event_filter.lower()
+        if event_filter == "failures":
+            return key in ("failed", "ignored")
+        aliases = {
+            "grab": "grabbed",
+            "grabbed": "grabbed",
+            "import": "imported",
+            "imported": "imported",
+            "failure": "failed",
+            "failed": "failed",
+            "delete": "deleted",
+            "deleted": "deleted",
+            "rename": "renamed",
+            "renamed": "renamed",
+            "ignore": "ignored",
+            "ignored": "ignored",
+        }
+        wanted = aliases.get(event_filter, event_filter)
+        raw = str(record.get("eventType", "")).lower()
+        return key == wanted or event_filter in raw
+
+    def _arr_history_date(self, value: str | None) -> str:
+        if not value:
+            return "-"
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return value[:16].replace("T", " ")
+
+    def _arr_history_quality(self, record: dict) -> str:
+        quality = record.get("quality") or {}
+        if isinstance(quality, str):
+            return quality
+        if not isinstance(quality, dict):
+            return "-"
+        q = quality.get("quality") or {}
+        if isinstance(q, dict):
+            return q.get("name") or quality.get("qualityName") or "-"
+        return str(q or quality.get("name") or "-")
+
+    def _arr_history_detail(self, record: dict) -> str:
+        data = record.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        key = self._arr_history_event_key(record)
+        preferred = {
+            "grabbed": ("indexer", "releaseGroup", "downloadClient", "downloadClientName"),
+            "imported": ("importedPath", "droppedPath", "downloadClient", "downloadClientName"),
+            "failed": ("message", "reason", "errorMessage", "failureMessage", "details"),
+            "ignored": ("message", "reason", "errorMessage", "failureMessage", "details"),
+            "deleted": ("reason", "message", "path"),
+            "renamed": ("sourcePath", "path", "message"),
+        }.get(key, ())
+        values = []
+        for field in ("sourceTitle", *preferred, "message", "reason"):
+            raw = record.get(field) or data.get(field)
+            if raw:
+                text = str(raw).strip()
+                if text and text not in values:
+                    values.append(text)
+        detail = " / ".join(values) if values else "-"
+        return detail if len(detail) <= 90 else detail[:87] + "..."
+
+    def _radarr_history_title(self, record: dict) -> str:
+        movie = record.get("movie") or {}
+        title = movie.get("title") or record.get("movieTitle") or record.get("title") or "?"
+        yr = movie.get("year") or record.get("year")
+        return f"{title} ({yr})" if yr else title
+
+    def _sonarr_history_title(self, record: dict) -> str:
+        series = record.get("series") or {}
+        episode = record.get("episode") or {}
+        show = series.get("title") or record.get("seriesTitle") or "?"
+        season = episode.get("seasonNumber") or record.get("seasonNumber")
+        ep_num = episode.get("episodeNumber") or record.get("episodeNumber")
+        ep_title = episode.get("title") or record.get("episodeTitle") or ""
+        try:
+            se = f"S{int(season):02d}E{int(ep_num):02d}"
+        except (TypeError, ValueError):
+            se = ""
+        suffix = f" - {ep_title}" if ep_title else ""
+        return f"{show} {se}{suffix}".strip()
+
+    def _render_arr_history(self, service: str, records: list[dict], title_func,
+                            count: int, event_filter: str = "") -> None:
+        filtered = [r for r in records if self._arr_history_matches(r, event_filter)]
+        rows = filtered[:count]
+        if not rows:
+            detail = f" matching {event_filter}" if event_filter else ""
+            console.print(f"[yellow]No {service} history records{detail}.[/yellow]")
+            return
+        title = f"{service} History ({len(rows)} shown"
+        if event_filter:
+            title += f", filter: {event_filter}"
+        title += ")"
+        t = Table(title=title, box=box.ROUNDED)
+        t.add_column("Date", width=16, style="dim")
+        t.add_column("Event", width=8)
+        t.add_column("Title", style="bold white", width=22, overflow="fold")
+        t.add_column("Detail", style="dim", width=17, overflow="fold")
+        for record in rows:
+            quality = self._arr_history_quality(record)
+            detail = self._arr_history_detail(record)
+            if quality != "-":
+                detail = f"{quality} / {detail}" if detail != "-" else quality
+            t.add_row(
+                self._arr_history_date(record.get("date")),
+                self._arr_history_event_label(record),
+                title_func(record),
+                detail,
+            )
+        console.print(t)
+        if len(filtered) > len(rows):
+            console.print(f"[dim]Showing {len(rows)} of {len(filtered)} matching record(s). Use --count to show more.[/dim]")
 
     def _configured_radarr_client(self) -> "RadarrClient | None":
         cfg = load_config()
@@ -6360,6 +6548,23 @@ class PlexShell(cmd.Cmd):
         else:
             console.print("[green]✓ All Plex shows are monitored by Sonarr.[/green]")
 
+    def do_sonarr_history(self, arg: str):
+        """sonarr_history [--count N] [--event grabbed|imported|failed|deleted|renamed|ignored] [--failures]"""
+        tokens = self._tokens(arg)
+        count = self._positional_count(tokens, default=25)
+        event_filter = self._flag_value(tokens, "--event", "").lower()
+        if self._has_flag(tokens, "--failures"):
+            event_filter = "failures"
+
+        sc = self._get_sonarr_client()
+        if not sc: return
+
+        fetch_count = min(1000, max(count, count * 4 if event_filter else count))
+        with console.status(f"Fetching Sonarr history ({fetch_count} recent records)..."):
+            records = sc.history(fetch_count)
+        self._render_arr_history("Sonarr", records, self._sonarr_history_title,
+                                 count, event_filter)
+
     def do_sonarr_missing(self, _arg: str):
         """sonarr_missing — shows with monitored but missing episodes; select to trigger search"""
         sc = self._get_sonarr_client()
@@ -7803,6 +8008,23 @@ class PlexShell(cmd.Cmd):
         else:
             console.print("[green]✓ All Plex movies are monitored by Radarr.[/green]")
 
+    def do_radarr_history(self, arg: str):
+        """radarr_history [--count N] [--event grabbed|imported|failed|deleted|renamed|ignored] [--failures]"""
+        tokens = self._tokens(arg)
+        count = self._positional_count(tokens, default=25)
+        event_filter = self._flag_value(tokens, "--event", "").lower()
+        if self._has_flag(tokens, "--failures"):
+            event_filter = "failures"
+
+        rc = self._get_radarr_client()
+        if not rc: return
+
+        fetch_count = min(1000, max(count, count * 4 if event_filter else count))
+        with console.status(f"Fetching Radarr history ({fetch_count} recent records)..."):
+            records = rc.history(fetch_count)
+        self._render_arr_history("Radarr", records, self._radarr_history_title,
+                                 count, event_filter)
+
     def do_quality_upgrade_plan(self, arg: str):
         """quality_upgrade_plan [--limit N] [--movies|--shows] - prioritize Radarr/Sonarr cutoff work"""
         tokens = self._tokens(arg)
@@ -8620,6 +8842,8 @@ class PlexShell(cmd.Cmd):
     _QUP_FLAGS = ["--limit", "--movies", "--shows"]
     _PW_FLAGS  = ["--days", "--past", "--missing-only"]
     _CMP_FLAGS = ["--library", "--count", "--min-size", "--target"]
+    _ARR_HISTORY_FLAGS = ["--count", "--event", "--failures"]
+    _ARR_HISTORY_EVENTS = ("grabbed", "imported", "failed", "deleted", "renamed", "ignored")
 
     def complete_plex_metadata(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)
@@ -8652,6 +8876,18 @@ class PlexShell(cmd.Cmd):
     def complete_radarr_calendar(self, text, line, begidx, endidx):
         if text.startswith("-"): return self._c_flags(text, ["--days"])
         return []
+
+    def complete_radarr_history(self, text, line, begidx, endidx):
+        prev = self._prev(line, begidx)
+        if prev == "--event":
+            return [event for event in self._ARR_HISTORY_EVENTS if event.startswith(text.lower())]
+        if prev == "--count":
+            return []
+        if text.startswith("-"):
+            return self._c_flags(text, self._ARR_HISTORY_FLAGS)
+        return []
+
+    complete_sonarr_history = complete_radarr_history
 
     def complete_watch_next(self, text, line, begidx, endidx):
         prev = self._prev(line, begidx)

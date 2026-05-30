@@ -277,6 +277,7 @@ Credentials are prompted on first use and saved to `~/.plex_cli.json`.
 |---|---|---|
 | `sonarr_status` | | Connection info, quality profiles, root folders |
 | `sonarr_sync` | | Shows downloaded in Sonarr missing from Plex, and Plex shows not in Sonarr |
+| `sonarr_history` | `[--count N] [--event grabbed\|imported\|failed\|deleted\|renamed\|ignored] [--failures]` | Recent grabs, imports, failures, and file events |
 | `sonarr_missing` | | Shows with monitored but missing episodes; select to trigger search |
 | `sonarr_upgrade` | | Shows with episodes below quality cutoff; select to trigger re-search |
 | `sonarr_add` | `<name>` | Search for a TV show and add it to Sonarr |
@@ -299,6 +300,7 @@ Credentials are prompted on first use and saved to `~/.plex_cli.json`.
 | `radarr_pick` | `<name> [--profile <id>]` | Interactive checkbox to select movies to download |
 | `radarr_upgrade` | | Movies below quality cutoff; select to trigger upgrade searches |
 | `radarr_sync` | | Radarr downloads missing from Plex, and Plex movies not in Radarr |
+| `radarr_history` | `[--count N] [--event grabbed\|imported\|failed\|deleted\|renamed\|ignored] [--failures]` | Recent grabs, imports, failures, and file events |
 | `radarr_collections` | `[--import]` | TMDB franchise completion per series; `--import` adds missing |
 
 #### Built-in TMDB Lists
