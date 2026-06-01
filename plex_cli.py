@@ -1235,7 +1235,6 @@ _HELP_SECTIONS = [
     ("Storage", [
         ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
         ("smallest",        "[count] [--library name]",           "Titles with the smallest file sizes"),
-        ("tv_storage",      "[--library name] [--count N]",       "Disk usage grouped by TV show"),
         ("tvlargest",       "[count] [--library name]",           "TV shows with the most total disk usage"),
         ("tvsmallest",      "[count] [--library name]",           "TV shows with the least total disk usage"),
         ("longest",         "[count] [--library name]",           "Titles with the longest runtime"),
@@ -3008,20 +3007,6 @@ class PlexShell(cmd.Cmd):
         t.add_section()
         t.add_row("", f"[bold]{format_size(total)}[/bold]", f"[dim]Total ({len(rows)} shows)[/dim]", "", "", "")
         console.print(t)
-
-    def do_tv_storage(self, arg: str):
-        """tv_storage [--library name] [--count N] - disk usage grouped by TV show"""
-        tokens = self._tokens(arg)
-        count = self._int_flag(tokens, "--count", 0, minimum=0)
-        if count == 0:
-            for token in tokens:
-                if token.isdigit():
-                    count = int(token)
-                    break
-        _, flags = parse_search_args(arg)
-        library_filter = self._flag_value(tokens, "--library", flags.get("library", ""))
-        title = "TV Show Disk Usage" if count == 0 else f"TV Show Disk Usage (top {count})"
-        self._show_size_table(count, True, library_filter, title=title)
 
     def do_tvlargest(self, arg: str):
         """tvlargest [count] [--library name] — TV shows with the most total disk usage (default 25)"""
@@ -8773,15 +8758,6 @@ class PlexShell(cmd.Cmd):
     complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
     complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
 
-    _TV_STORAGE_FLAGS = ["--library", "--count"]
-
-    def complete_tv_storage(self, text, line, begidx, endidx):
-        prev = self._prev(line, begidx)
-        if prev == "--library":
-            return self._c_libs(text)
-        if prev == "--count":
-            return []
-        return self._c_flags(text, self._TV_STORAGE_FLAGS) if text.startswith("-") else []
 
     _ABA_FLAGS = ["--library", "--count", "--min-size"]
 

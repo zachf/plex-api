@@ -127,7 +127,6 @@ python plex_cli.py <command> [args]
 |---|---|---|
 | `largest` | `[count] [--library name]` | Titles with the biggest file sizes |
 | `smallest` | `[count] [--library name]` | Titles with the smallest file sizes |
-| `tv_storage` | `[--library name] [--count N]` | Disk usage grouped by TV show |
 | `tvlargest` | `[count] [--library name]` | TV shows with the most total disk usage |
 | `tvsmallest` | `[count] [--library name]` | TV shows with the least total disk usage |
 | `longest` | `[count] [--library name]` | Titles with the longest runtime |
