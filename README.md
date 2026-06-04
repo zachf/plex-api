@@ -72,9 +72,6 @@ python plex_cli.py <command> [args]
 | Command | Description |
 |---|---|
 | `health` | One-page summary: library stats, zero-duration items, stale shows, Radarr sync and upgrade gaps |
-| `watch_next` | Ranked picks from On Deck, unwatched ratings, recency, runtime, and genre filters |
-| `quality_upgrade_plan` | Prioritize Radarr/Sonarr quality upgrades using Plex watch stats |
-| `premiere_watchlist` | Radarr release calendar with Plex indexed/missing status |
 
 ### Basic
 
@@ -258,7 +255,6 @@ Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
 | `playlist_remove` | `<playlist_id> <item_id>` | Remove an item from a playlist |
 | `collections` | `[library_id]` | List collections |
 | `collection` | `<key>` | Show items in a collection |
-| `collection_gaps` | `[--import] [--dry-run] [--limit N]` | TMDB franchise gaps across Plex and Radarr; optionally import Radarr gaps |
 | `playlist_build` | `<name> [--genre g] [--director d] [--actor a] [--year y] [--decade Xd] [--studio s] [--contentrating r] [--unwatched] [--rating n] [--library id] [--limit n]` | Build a playlist from combined filters |
 
 `playlist_build` examples:
