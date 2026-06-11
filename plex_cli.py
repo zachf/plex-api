@@ -767,7 +767,8 @@ class TMDBClient:
     def list_movies(self, list_id: int) -> list[dict]:
         def _parse(items):
             return [{"tmdb_id": m["id"], "title": m["title"],
-                     "year": int((m.get("release_date") or "0")[:4] or 0)}
+                     "year": int((m.get("release_date") or "0")[:4] or 0),
+                     "tmdb_score": round(float(m.get("vote_average") or 0), 1)}
                     for m in items]
         first = self._get(f"/list/{list_id}")
         results = _parse(first.get("items", []))
@@ -5932,18 +5933,38 @@ class PlexShell(cmd.Cmd):
         for sel_n, r in enumerate(downloadable, 1):
             dl_num[id(r)] = sel_n
 
+        # Rotten Tomatoes scores (via OMDB) for the downloadable candidates —
+        # the rows the user is deciding on. TMDB scores come free with the list.
+        omdb = self._configured_omdb_client()
+        rt_by_tmdb: dict[int, str] = {}
+        if omdb:
+            with console.status("Fetching Rotten Tomatoes scores..."):
+                for r in downloadable:
+                    ext     = tc.external_ids(r["tmdb_id"])
+                    imdb_id = ext.get("imdb_id", "")
+                    if imdb_id:
+                        _, rt = _omdb_ratings(omdb.by_imdb_id(imdb_id))
+                        if rt:
+                            rt_by_tmdb[r["tmdb_id"]] = rt
+
         # Full list table
         t = Table(title=f"{name}  ({len(rows)} titles)", box=box.ROUNDED)
         t.add_column("#",       style="dim",       width=5,  justify="right")
         t.add_column("Title",   style="bold white", min_width=32)
         t.add_column("Year",    width=6,            justify="right")
+        t.add_column("TMDB",    width=6,            justify="right")
+        t.add_column("RT",      width=6,            justify="right")
         t.add_column("In Plex", width=9,            justify="center")
         t.add_column("Status",  width=16)
         for r in rows:
-            num = dl_num.get(id(r), "")
+            num   = dl_num.get(id(r), "")
+            score = r.get("tmdb_score") or 0
+            rt    = rt_by_tmdb.get(r["tmdb_id"], "")
             t.add_row(
                 str(num) if num else "[dim]—[/dim]",
                 r["title"], str(r["year"]),
+                f"{score:.1f}" if score else "[dim]—[/dim]",
+                rt if rt else "[dim]—[/dim]",
                 "[green]yes[/green]" if r["status"] == "in_plex" else "[dim]no[/dim]",
                 STATUS_LABEL[r["status"]],
             )
