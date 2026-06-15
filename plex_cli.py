@@ -1385,6 +1385,7 @@ _HELP_SECTIONS = [
         ("plex_metadata",    "[--library <name>] [--fix] [--episodes]",
                                                                  "Audit library for missing metadata fields; --fix triggers Plex refresh"),
         ("plex_duplicates",  "[--library <name>]",               "Find duplicate movies; shows resolution, size, and reclaimable space"),
+        ("omdb_cache",       "",                                 "Summarize the local OMDB ratings cache: size, types, rating coverage, top genres"),
     ]),
     ("Shell", [
         ("help",            "",                                  "Show this help"),
@@ -2334,6 +2335,64 @@ class PlexShell(cmd.Cmd):
         self.client.token = arg.strip()
         self.client.session.params["X-Plex-Token"] = arg.strip()  # type: ignore
         console.print("[green]Token saved.[/green]")
+
+    def do_omdb_cache(self, _):
+        """omdb_cache — summarize the local OMDB ratings cache (size, types, rating coverage, top genres)"""
+        cache = load_omdb_cache()
+        if not cache:
+            console.print(f"[yellow]OMDB cache is empty.[/yellow] [dim]({_OMDB_CACHE_PATH})[/dim]")
+            return
+
+        try:
+            file_bytes = _OMDB_CACHE_PATH.stat().st_size
+        except OSError:
+            file_bytes = 0
+
+        # Rating coverage + averages across the three sources OMDB returns.
+        sources = {"Internet Movie Database": [], "Rotten Tomatoes": [], "Metacritic": []}
+        empty = 0
+        genre_counts: Counter = Counter()
+        type_counts:  Counter = Counter()
+        for entry in cache.values():
+            if not isinstance(entry, dict) or entry.get("Response") == "False" or not entry.get("Title"):
+                empty += 1
+                continue
+            type_counts[entry.get("Type", "unknown")] += 1
+            for g in (entry.get("Genre") or "").split(","):
+                g = g.strip()
+                if g and g != "N/A":
+                    genre_counts[g] += 1
+            for rating in (entry.get("Ratings") or []):
+                src = rating.get("Source", "")
+                val = (rating.get("Value") or "").split("/")[0].rstrip("%").strip()
+                if src in sources:
+                    try: sources[src].append(float(val))
+                    except ValueError: pass
+
+        total = len(cache)
+        console.print(Panel(
+            f"[bold]Location:[/bold] {_OMDB_CACHE_PATH}\n"
+            f"[bold]Size:[/bold]     {format_size(file_bytes)}\n"
+            f"[bold]Entries:[/bold]  {total}" +
+            (f"  [dim]({empty} empty/not-found)[/dim]" if empty else ""),
+            title="[bold white]OMDB Cache[/bold white]", border_style="cyan"))
+
+        _distribution_table("Type distribution", type_counts)
+
+        # Rating coverage table
+        rt = Table(title="Rating coverage", box=box.ROUNDED)
+        rt.add_column("Source",  style="bold cyan")
+        rt.add_column("Cached",  justify="right", width=8)
+        rt.add_column("Share",   justify="right", width=8)
+        rt.add_column("Average", justify="right", width=9)
+        scored = total - empty
+        for label, vals in sources.items():
+            avg = f"{sum(vals) / len(vals):.1f}" if vals else "[dim]—[/dim]"
+            share = f"{len(vals) / scored * 100:.1f}%" if scored else "0.0%"
+            rt.add_row(label, str(len(vals)), share, avg)
+        console.print(rt)
+
+        _distribution_table("Top genres", genre_counts, cap=10)
 
     # ── Library health ────────────────────────────────────────────────────────
 

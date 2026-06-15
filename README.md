@@ -333,6 +333,7 @@ Lists are stored in `~/.plex_cli_lists.json` and can be extended with `radarr_li
 |---|---|---|
 | `plex_metadata` | `[--library <name>] [--fix] [--episodes]` | Audit for missing metadata fields; `--fix` triggers Plex refresh |
 | `plex_duplicates` | `[--library <name>]` | Find duplicate movies; shows resolution, size, and reclaimable space |
+| `omdb_cache` | | Summarize the local OMDB ratings cache: size, types, rating coverage, top genres |
 
 `plex_metadata` checks: poster, summary, genres, content rating, director, cast, release date, and audience rating. `--fix` calls `PUT /library/metadata/{id}/refresh` on every flagged item. `--episodes` extends the audit to episode level (slow on large libraries).
 
