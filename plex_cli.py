@@ -1300,6 +1300,8 @@ _HELP_SECTIONS = [
         ("content_rating",  "[library_id]",                      "Content rating distribution (G, PG, R, TV-MA, etc.)"),
         ("missing_episodes",  "[library_id]",                    "TV seasons with gaps in episode numbering"),
         ("incomplete_seasons","[library_id]",                    "Seasons with fewer episodes than the show's typical season"),
+        ("season_quality",    "[library_id] [--count N] [--audio]",
+                                                                 "TV seasons with mixed resolution or codec quality"),
         ("abandoned",         "[threshold%] [--library id]",     "Shows started but not finished (default <80% watched)"),
         ("duration_outliers", "[library_id]",                    "TV episodes with runtime far from the show's median"),
         ("4k_audit",          "[library_id]",                    "4K content breakdown by HDR type, audio, and codec"),
@@ -1408,7 +1410,7 @@ class PlexShell(cmd.Cmd):
         try:
             import readline
             readline.set_completer_delims(readline.get_completer_delims().replace("-", ""))
-        except ImportError:
+        except Exception:
             pass
 
     def emptyline(self): pass
@@ -4521,6 +4523,189 @@ class PlexShell(cmd.Cmd):
         for show, season, have, typical in incomplete:
             t.add_row(show, f"S{season:02d}", str(have), str(typical), str(typical - have))
         console.print(t)
+
+    def do_season_quality(self, arg: str):
+        """season_quality [library_id] [--count N] [--audio] — seasons with mixed resolution or codec quality"""
+        tokens = self._tokens(arg)
+        count = self._int_flag(tokens, "--count", 50, minimum=1)
+        include_audio = self._has_flag(tokens, "--audio")
+
+        section_id = self._flag_value(tokens, "--library", "")
+        if not section_id:
+            value_flags = {"--library", "--count"}
+            skip_next = False
+            for token in tokens:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if token in value_flags:
+                    skip_next = True
+                    continue
+                if token.startswith("--"):
+                    continue
+                section_id = token
+                break
+
+        with console.status("Fetching TV libraries..."):
+            tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
+        if section_id:
+            wanted = section_id.lower()
+            tv_libs = [
+                l for l in tv_libs
+                if l.get("key") == section_id or (l.get("title") or "").lower() == wanted
+            ]
+        if not tv_libs:
+            console.print("[yellow]No TV libraries found.[/yellow]"); return
+
+        res_rank = {"4K": 4, "1080p": 3, "720p": 2, "SD": 1, "Unknown": 0}
+
+        def _intish(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _season_resolution(value) -> str:
+            label = resolution_label(value)
+            return {"1080P": "1080p", "720P": "720p", "480P": "SD", "576P": "SD"}.get(label, label)
+
+        def _media_rank(media: dict) -> tuple[int, int, int]:
+            resolution = _season_resolution(media.get("videoResolution"))
+            bitrate = _intish(media.get("bitrate"))
+            size = sum(_intish(p.get("size")) for p in media.get("Part", []))
+            return res_rank.get(resolution, 0), bitrate, size
+
+        def _profile(ep: dict) -> dict:
+            media_items = ep.get("Media") or []
+            media = max(media_items, key=_media_rank) if media_items else {}
+            resolution = _season_resolution(media.get("videoResolution"))
+            video = (media.get("videoCodec") or "unknown").upper()
+            audio = (media.get("audioCodec") or "unknown").upper()
+            channels = media.get("audioChannels")
+            if channels:
+                audio = f"{audio} {channels}ch"
+            return {
+                "episode": _intish(ep.get("index")),
+                "title": ep.get("title", ""),
+                "ratingKey": ep.get("ratingKey", ""),
+                "resolution": resolution,
+                "res_rank": res_rank.get(resolution, 0),
+                "video": video,
+                "audio": audio,
+            }
+
+        def _count_summary(counter: Counter, limit: int = 3) -> str:
+            parts = [f"{name}:{qty}" for name, qty in counter.most_common(limit)]
+            if len(counter) > limit:
+                parts.append(f"+{len(counter) - limit}")
+            return ", ".join(parts)
+
+        groups: dict[tuple[str, str, str, int], list[dict]] = defaultdict(list)
+        with console.status("Scanning season quality..."):
+            for lib in tv_libs:
+                lib_key = lib.get("key", "")
+                lib_title = lib.get("title", lib_key)
+                for ep in self.client.library_episodes(lib_key):
+                    season = _intish(ep.get("parentIndex"))
+                    if season == 0:
+                        continue
+                    show = ep.get("grandparentTitle") or "?"
+                    groups[(lib_key, lib_title, show, season)].append(_profile(ep))
+
+        findings = []
+        for (_lib_key, lib_title, show, season), profiles in groups.items():
+            if len(profiles) < 2:
+                continue
+            res_counts = Counter(p["resolution"] for p in profiles)
+            video_counts = Counter(p["video"] for p in profiles)
+            audio_counts = Counter(p["audio"] for p in profiles)
+
+            mixed_res = len(res_counts) > 1
+            mixed_video = len(video_counts) > 1
+            mixed_audio = include_audio and len(audio_counts) > 1
+            if not (mixed_res or mixed_video or mixed_audio):
+                continue
+
+            issues = []
+            if mixed_res:
+                issues.append("resolution")
+            if mixed_video:
+                issues.append("video")
+            if mixed_audio:
+                issues.append("audio")
+
+            if mixed_res:
+                min_rank = min(p["res_rank"] for p in profiles)
+                examples = [p for p in profiles if p["res_rank"] == min_rank]
+            elif mixed_video:
+                common_video = video_counts.most_common(1)[0][0]
+                examples = [p for p in profiles if p["video"] != common_video]
+            else:
+                common_audio = audio_counts.most_common(1)[0][0]
+                examples = [p for p in profiles if p["audio"] != common_audio]
+
+            examples.sort(key=lambda p: p["episode"])
+            example_text = "; ".join(
+                f"E{p['episode']:02d} {p['resolution']}/{p['video']}"
+                for p in examples[:4]
+            )
+            if len(examples) > 4:
+                example_text += f"; +{len(examples) - 4}"
+
+            severity = (3 if mixed_res else 0) + (2 if mixed_video else 0) + (1 if mixed_audio else 0)
+            findings.append({
+                "severity": severity,
+                "library": lib_title,
+                "show": show,
+                "season": season,
+                "episodes": len(profiles),
+                "issues": ", ".join(issues),
+                "resolutions": _count_summary(res_counts),
+                "video": _count_summary(video_counts),
+                "audio": _count_summary(audio_counts),
+                "examples": example_text,
+            })
+
+        if not findings:
+            console.print("[green]No mixed season quality detected.[/green]")
+            if not include_audio:
+                console.print("[dim]Use --audio to also flag audio codec/channel variation.[/dim]")
+            return
+
+        findings.sort(key=lambda r: (-r["severity"], r["library"], r["show"], r["season"]))
+        total = len(findings)
+        shown = findings[:count]
+
+        title = f"Season Quality Variance ({total} season{'s' if total != 1 else ''} found"
+        if total > len(shown):
+            title += f", showing {len(shown)}"
+        title += ")"
+        t = Table(title=title, box=box.ROUNDED)
+        t.add_column("Library", style="cyan", width=14)
+        t.add_column("Show", style="bold white", min_width=24)
+        t.add_column("Season", width=8, justify="center")
+        t.add_column("Eps", width=5, justify="right")
+        t.add_column("Issues", style="yellow", min_width=12)
+        t.add_column("Resolution", min_width=14)
+        t.add_column("Video", min_width=14)
+        if include_audio:
+            t.add_column("Audio", min_width=14)
+        t.add_column("Examples", min_width=18, overflow="fold")
+
+        for row in shown:
+            values = [
+                row["library"], row["show"], f"S{row['season']:02d}", str(row["episodes"]),
+                row["issues"], row["resolutions"], row["video"],
+            ]
+            if include_audio:
+                values.append(row["audio"])
+            values.append(row["examples"])
+            t.add_row(*values)
+        console.print(t)
+        if total > len(shown):
+            console.print(f"[dim]Use --count {total} to show every flagged season.[/dim]")
+        if not include_audio:
+            console.print("[dim]Audio variation is informational only; add --audio to flag it as an issue.[/dim]")
 
     def do_abandoned(self, arg: str):
         """abandoned [threshold%] [--library id] — shows started but not finished (default < 80% watched)"""
@@ -8804,7 +8989,7 @@ class PlexShell(cmd.Cmd):
     complete_subtitles = complete_hdr = complete_multiversion = complete_genres = _c_lib_arg
     complete_studios = complete_collections = complete_popularity = _c_lib_arg
     complete_fixtitles = complete_stale = _c_lib_arg
-    complete_missing_episodes = complete_incomplete_seasons = _c_lib_arg
+    complete_missing_episodes = complete_incomplete_seasons = complete_season_quality = _c_lib_arg
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
     complete_rewatched = complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg

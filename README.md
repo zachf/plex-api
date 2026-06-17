@@ -205,6 +205,7 @@ python plex_cli.py <command> [args]
 | `content_rating` | `[library_id]` | Content rating distribution |
 | `missing_episodes` | `[library_id]` | TV seasons with gaps in episode numbering |
 | `incomplete_seasons` | `[library_id]` | Seasons with fewer episodes than typical |
+| `season_quality` | `[library_id] [--count N] [--audio]` | TV seasons with mixed resolution or video codec quality |
 | `abandoned` | `[threshold%] [--library id]` | Shows started but not finished (<80% default) |
 | `duration_outliers` | `[library_id]` | Episodes with runtime far from the show's median |
 | `4k_audit` | `[library_id]` | 4K content breakdown by HDR, audio, and codec |
