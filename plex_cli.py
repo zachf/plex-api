@@ -536,6 +536,8 @@ class RadarrClient:
     def movies(self)           -> list: r = self.get("/movie"); return r if isinstance(r, list) else []
     def quality_profiles(self) -> list: r = self.get("/qualityprofile"); return r if isinstance(r, list) else []
     def root_folders(self)     -> list: r = self.get("/rootfolder"); return r if isinstance(r, list) else []
+    def diskspace(self, silent: bool = False) -> list:
+        r = self.get("/diskspace", silent=silent); return r if isinstance(r, list) else []
 
     def add_movie(self, tmdb_id: int, title: str, year: int,
                   quality_profile_id: int, root_folder_path: str,
@@ -608,6 +610,8 @@ class SonarrClient:
     def series(self)           -> list: r = self.get("/series"); return r if isinstance(r, list) else []
     def quality_profiles(self) -> list: r = self.get("/qualityprofile"); return r if isinstance(r, list) else []
     def root_folders(self)     -> list: r = self.get("/rootfolder"); return r if isinstance(r, list) else []
+    def diskspace(self, silent: bool = False) -> list:
+        r = self.get("/diskspace", silent=silent); return r if isinstance(r, list) else []
 
     def wanted_missing(self, page_size: int = 1000) -> list:
         r = self.get("/wanted/missing", pageSize=page_size,
@@ -1241,6 +1245,7 @@ _HELP_SECTIONS = [
         ("longest",         "[count] [--library name]",           "Titles with the longest runtime"),
         ("shortest",        "[count] [--library name]",           "Titles with the shortest runtime"),
         ("storage",         "",                                  "Disk usage breakdown by library"),
+        ("diskspace",       "",                                  "Free and used disk space on Radarr/Sonarr mounts"),
         ("bycodec",         "<codec>",                           "Titles using a given video or audio codec"),
         ("codecs",          "",                                  "Video / audio codec distribution"),
         ("transcode",       "",                                  "Items likely to require transcoding"),
@@ -3139,6 +3144,71 @@ class PlexShell(cmd.Cmd):
             for row in top:
                 t2.add_row(format_size(row.get("size")), row["title"], row["library"], row["videoCodec"].upper())
             console.print(t2)
+
+    def do_diskspace(self, _):
+        """diskspace — free and used disk space on Radarr/Sonarr mounts"""
+        rc = self._configured_radarr_client()
+        sc = self._configured_sonarr_client()
+        if not rc and not sc:
+            console.print(Panel(
+                "Configure Radarr or Sonarr to view disk space.\n\n"
+                "Run [bold]radarr_status[/bold] or [bold]sonarr_status[/bold] to set them up.",
+                title="[yellow]Disk Space[/yellow]", border_style="yellow"))
+            return
+
+        # Both services usually report the same physical mounts — merge by path
+        # and record which service(s) saw each one.
+        mounts: dict[str, dict] = {}
+        with console.status("Fetching disk space..."):
+            for label, client in (("Radarr", rc), ("Sonarr", sc)):
+                if not client:
+                    continue
+                for d in client.diskspace(silent=True):
+                    path = d.get("path", "")
+                    if not path:
+                        continue
+                    entry = mounts.setdefault(path, {**d, "sources": set()})
+                    entry["sources"].add(label)
+
+        if not mounts:
+            console.print("[yellow]No disk space data returned.[/yellow]"); return
+
+        t = Table(title="Disk Space", box=box.ROUNDED)
+        t.add_column("Path",   style="bold white", min_width=18)
+        t.add_column("Label",  style="dim")
+        t.add_column("Source", style="dim", width=14)
+        t.add_column("Free",   justify="right", width=10, style="bold")
+        t.add_column("Total",  justify="right", width=10)
+        t.add_column("Used",   justify="left",  width=18)
+        # Root folders on the same physical pool report identical free/total —
+        # dedupe by (total, free) so the TOTAL doesn't count one volume twice.
+        seen_vol: set[tuple[int, int]] = set()
+        sum_free = sum_total = 0
+        for path in sorted(mounts):
+            d     = mounts[path]
+            total = d.get("totalSpace") or 0
+            free  = d.get("freeSpace") or 0
+            used  = max(total - free, 0)
+            pct   = (used / total * 100) if total else 0
+            if (total, free) not in seen_vol:
+                seen_vol.add((total, free))
+                sum_free += free; sum_total += total
+            color = "green" if pct < 75 else ("yellow" if pct < 90 else "red")
+            filled = round(pct / 100 * 10)
+            bar    = "█" * filled + "░" * (10 - filled)
+            t.add_row(
+                path, d.get("label", "") or "",
+                ", ".join(sorted(d["sources"])),
+                format_size(free), format_size(total),
+                f"[{color}]{bar}[/{color}] {pct:.0f}%",
+            )
+        if len(seen_vol) > 1:
+            tpct  = ((sum_total - sum_free) / sum_total * 100) if sum_total else 0
+            t.add_section()
+            t.add_row("[bold]TOTAL[/bold]", "[dim]unique volumes[/dim]", "",
+                      f"[bold]{format_size(sum_free)}[/bold]",
+                      format_size(sum_total), f"{tpct:.0f}% used")
+        console.print(t)
 
     def do_bycodec(self, arg: str):
         if not arg.strip():

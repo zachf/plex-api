@@ -131,6 +131,7 @@ python plex_cli.py <command> [args]
 | `longest` | `[count] [--library name]` | Titles with the longest runtime |
 | `shortest` | `[count] [--library name]` | Titles with the shortest runtime |
 | `storage` | | Disk usage breakdown by library |
+| `diskspace` | | Free and used disk space on Radarr/Sonarr mounts |
 | `bycodec` | `<codec>` | Titles using a given video or audio codec |
 | `codecs` | | Video / audio codec distribution |
 | `transcode` | | Items likely to require transcoding |
