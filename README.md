@@ -85,6 +85,8 @@ python plex_cli.py <command> [args]
 | `sessions` | | Active playback sessions |
 | `recent` | `[count]` | Recently added content |
 | `ondeck` | | Continue watching |
+| `ondeck_clear` | | Select On Deck items and mark them watched or reset progress |
+| `hubs` | `[--library <name>] [--count N]` | Home screen hubs such as Continue Watching, Recently Added, and top picks |
 | `children` | `<key>` | Seasons / episodes for a show |
 | `url` | `<key>` | Print stream URL |
 | `token` | `<token>` | Set or update Plex token |
@@ -132,6 +134,7 @@ python plex_cli.py <command> [args]
 | `bycodec` | `<codec>` | Titles using a given video or audio codec |
 | `codecs` | | Video / audio codec distribution |
 | `transcode` | | Items likely to require transcoding |
+| `oversized` | `[--library id] [--4k GB] [--1080p GB] [--720p GB] [--sd GB] [--count N]` | Files larger than resolution-specific size thresholds |
 
 ### Collection Tools
 
@@ -189,6 +192,7 @@ python plex_cli.py <command> [args]
 | Command | Args | Description |
 |---|---|---|
 | `bitrate` | `[library_id]` | Bitrate distribution with outlier flagging |
+| `bitrate_outliers` | `[--library id] [--count N]` | Files above expected bitrate limits for their resolution |
 | `subtitles` | `[library_id]` | Items missing subtitle tracks |
 | `foreign_subtitle_audit` | `[--language en] [--library id] [--forced-ok] [--include-unknown] [--count N]` | Non-target-language audio missing full target-language subtitles |
 | `hdr` | `[library_id]` | HDR and Dolby Vision content |
@@ -225,6 +229,7 @@ Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
 | `collection_gaps` | `[--import] [--dry-run] [--limit N]` | TMDB franchise gaps across Plex and Radarr; optionally add Radarr gaps |
 | `smart_recommendations` | `[--count N] [--min-rating R]` | Personalized picks: builds a genre profile from your Tautulli history, queries TMDB for popular matching films, filters out anything already in Plex or Radarr |
 | `trending_in_library` | `[--window day\|week]` | TMDB trending movies split into owned vs. not-yet-owned (default: week) |
+| `trending_missing` | `[--window day\|week] [--count N] [--import] [--dry-run] [--profile id] [--search]` | TMDB trending movies missing from Radarr, optionally importing them |
 | `tmdb_movie` | `<title>` | Search TMDB by title and display full details: overview, rating, cast, director, studios, budget/revenue, keywords, plus Plex and Radarr status |
 | `director_deep_dive` | `<name>` | Full directed filmography with Plex ownership, Tautulli watch status, and Radarr presence per title |
 | `actor_deep_dive` | `<name>` | Acting credits with character names, Plex ownership, Tautulli watch status, and Radarr presence |
@@ -276,6 +281,28 @@ Credentials are prompted on first use and saved to `~/.plex_cli.json`.
 | `sonarr_missing` | | Shows with monitored but missing episodes; select to trigger search |
 | `sonarr_upgrade` | | Shows with episodes below quality cutoff; select to trigger re-search |
 | `sonarr_add` | `<name>` | Search for a TV show and add it to Sonarr |
+| `sonarr_calendar` | `[--days N]` | Upcoming monitored and unmonitored episode air dates |
+
+### Tautulli
+
+Credentials are prompted on first use and saved to `~/.plex_cli.json`.
+
+| Command | Args | Description |
+|---|---|---|
+| `tautulli_status` | | Tautulli connection info |
+| `tautulli_history` | `[--user <name>] [--count N]` | Play history with stream decision, platform, watched %, and duration |
+| `tautulli_stats` | `[--days N]` | Top movies, shows, and users over the last N days |
+| `tautulli_plays` | `[--days N]` | Plays per day as a compact bar chart |
+| `tautulli_users` | | Users ranked by total plays and watch time |
+
+### Overseerr
+
+Credentials are prompted on first use and saved to `~/.plex_cli.json`.
+
+| Command | Args | Description |
+|---|---|---|
+| `overseerr_status` | | Overseerr connection info and request summary |
+| `overseerr_requests` | `[--filter all\|pending\|approved\|declined\|available] [--count N]` | Movie requests enriched with TMDB, IMDb, and Rotten Tomatoes ratings |
 
 ### Radarr
 
@@ -293,9 +320,12 @@ Credentials are prompted on first use and saved to `~/.plex_cli.json`.
 | `radarr_director` | `<name> [--dry-run] [--profile <id>] [--search]` | Import a director's filmography from TMDB |
 | `radarr_download` | `<name> [--dry-run] [--profile <id>]` | Search Radarr for all missing movies from a list |
 | `radarr_pick` | `<name> [--profile <id>]` | Interactive checkbox to select movies to download |
+| `radarr_upgrade_4k` | `<title> [--search]` | Switch a Radarr movie to a 4K quality profile and optionally search |
 | `radarr_upgrade` | | Movies below quality cutoff; select to trigger upgrade searches |
 | `radarr_sync` | | Radarr downloads missing from Plex, and Plex movies not in Radarr |
 | `radarr_history` | `[--count N] [--event grabbed\|imported\|failed\|deleted\|renamed\|ignored] [--failures]` | Recent grabs, imports, failures, and file events |
+| `radarr_calendar` | `[--days N]` | Upcoming monitored and unmonitored movie releases |
+| `radarr_monitored` | `[--missing] [--downloaded]` | Monitored Radarr movies, optionally filtered by file status |
 | `radarr_collections` | `[--import]` | TMDB franchise completion per series; `--import` adds missing |
 
 #### Built-in TMDB Lists
