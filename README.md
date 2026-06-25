@@ -108,13 +108,13 @@ python plex_cli.py <command> [args]
 |---|---|---|
 | `stats` | | Library totals and watch history summary |
 | `history` | `[user] [count]` | Recent watch history |
-| `unwatched` | `[library_id]` | Content never played |
-| `toprated` | `[library_id]` | Highest-rated items |
-| `popularity` | `[library_id]` | Most-watched titles by play count |
+| `unwatched` | `[count] [--library id\|name] [--sort added\|title\|library\|year]` | Content never played (default: all) |
+| `toprated` | `[count] [--library id\|name] [--all] [--sort rating\|title\|year]` | Highest-rated items (default 50) |
+| `popularity` | `[count] [--library id\|name] [--all] [--sort plays\|title]` | Most-watched titles by play count |
 | `watch_calendar` | `[days]` | Day-by-day view of what was watched (default 7) |
 | `watched_by_decade` | `[count]` | Which release decade you watch most |
-| `recommendations` | `[library_id]` | Highly rated unwatched content (≥7.5) |
-| `rewatched` | `[library_id]` | Titles played more than once |
+| `recommendations` | `[count] [--library id\|name] [--all] [--sort rating\|title\|year]` | Highly rated unwatched content (≥7.5, default 50) |
+| `rewatched` | `[count] [--library id\|name] [--all] [--sort plays\|title\|year]` | Titles played more than once |
 | `show_progress` | `[library_id]` | Every TV show with watched %, episode counts, last watched |
 | `binge_candidates` | `[library_id]` | TV shows ranked by unwatched episode count |
 | `overdue` | `[months] [library_id]` | Items added >N months ago, never played (default 12) |
@@ -124,12 +124,12 @@ python plex_cli.py <command> [args]
 
 | Command | Args | Description |
 |---|---|---|
-| `largest` | `[count] [--library name]` | Titles with the biggest file sizes |
-| `smallest` | `[count] [--library name]` | Titles with the smallest file sizes |
-| `tvlargest` | `[count] [--library name]` | TV shows with the most total disk usage |
-| `tvsmallest` | `[count] [--library name]` | TV shows with the least total disk usage |
-| `longest` | `[count] [--library name]` | Titles with the longest runtime |
-| `shortest` | `[count] [--library name]` | Titles with the shortest runtime |
+| `largest` | `[count] [--library id\|name] [--all] [--sort size\|title\|library]` | Titles with the biggest file sizes |
+| `smallest` | `[count] [--library id\|name] [--all] [--sort size\|title\|library]` | Titles with the smallest file sizes |
+| `tvlargest` | `[count] [--library id\|name] [--all] [--sort size\|title\|episodes]` | TV shows with the most total disk usage |
+| `tvsmallest` | `[count] [--library id\|name] [--all] [--sort size\|title\|episodes]` | TV shows with the least total disk usage |
+| `longest` | `[count] [--library id\|name] [--all] [--sort duration\|title\|year]` | Titles with the longest runtime |
+| `shortest` | `[count] [--library id\|name] [--all] [--sort duration\|title\|year]` | Titles with the shortest runtime |
 | `storage` | | Disk usage breakdown by library |
 | `diskspace` | | Free and used disk space on Radarr/Sonarr mounts |
 | `bycodec` | `<codec>` | Titles using a given video or audio codec |

@@ -1225,25 +1225,25 @@ _HELP_SECTIONS = [
     ("Watch statistics", [
         ("stats",           "",                                  "Library totals and watch history summary"),
         ("history",         "[user] [count]",                    "Recent watch history"),
-        ("unwatched",       "[library_id]",                      "Content never played"),
-        ("toprated",        "[library_id]",                      "Highest-rated items"),
-        ("popularity",      "[library_id]",                      "Most-watched titles ranked by play count"),
+        ("unwatched",       "[count] [--library id|name] [--sort added|title|library|year]", "Content never played (default: all)"),
+        ("toprated",        "[count] [--library id|name] [--all] [--sort rating|title|year]", "Highest-rated items (default 50)"),
+        ("popularity",      "[count] [--library id|name] [--all] [--sort plays|title]", "Most-watched titles ranked by play count"),
         ("watch_calendar",    "[days]",                          "Day-by-day view of what was watched (default 7)"),
         ("watched_by_decade", "[count]",                         "Which release decade you watch most, from play history"),
-        ("recommendations",   "[library_id]",                    "Highly rated unwatched content (≥7.5)"),
-        ("rewatched",         "[library_id]",                    "Titles played more than once, ranked by play count"),
+        ("recommendations",   "[count] [--library id|name] [--all] [--sort rating|title|year]", "Highly rated unwatched content (≥7.5, default 50)"),
+        ("rewatched",         "[count] [--library id|name] [--all] [--sort plays|title|year]", "Titles played more than once, ranked by play count"),
         ("show_progress",     "[library_id]",                    "Every TV show with watched %, episode counts, last watched"),
         ("binge_candidates",  "[library_id]",                    "TV shows ranked by number of unwatched episodes"),
         ("overdue",           "[months] [library_id]",           "Items added >N months ago never played (default 12)"),
         ("added_trend",       "[months]",                        "Items added per month — library growth over time (default 12)"),
     ]),
     ("Storage", [
-        ("largest",         "[count] [--library name]",           "Titles with the biggest file sizes"),
-        ("smallest",        "[count] [--library name]",           "Titles with the smallest file sizes"),
-        ("tvlargest",       "[count] [--library name]",           "TV shows with the most total disk usage"),
-        ("tvsmallest",      "[count] [--library name]",           "TV shows with the least total disk usage"),
-        ("longest",         "[count] [--library name]",           "Titles with the longest runtime"),
-        ("shortest",        "[count] [--library name]",           "Titles with the shortest runtime"),
+        ("largest",         "[count] [--library id|name] [--all] [--sort size|title|library]", "Titles with the biggest file sizes"),
+        ("smallest",        "[count] [--library id|name] [--all] [--sort size|title|library]", "Titles with the smallest file sizes"),
+        ("tvlargest",       "[count] [--library id|name] [--all] [--sort size|title|episodes]", "TV shows with the most total disk usage"),
+        ("tvsmallest",      "[count] [--library id|name] [--all] [--sort size|title|episodes]", "TV shows with the least total disk usage"),
+        ("longest",         "[count] [--library id|name] [--all] [--sort duration|title|year]", "Titles with the longest runtime"),
+        ("shortest",        "[count] [--library id|name] [--all] [--sort duration|title|year]", "Titles with the shortest runtime"),
         ("storage",         "",                                  "Disk usage breakdown by library"),
         ("diskspace",       "",                                  "Free and used disk space on Radarr/Sonarr mounts"),
         ("bycodec",         "<codec>",                           "Titles using a given video or audio codec"),
@@ -1528,6 +1528,54 @@ class PlexShell(cmd.Cmd):
     def _parse_size_args(self, arg: str) -> tuple[int, str]:
         _, flags = parse_search_args(arg)
         return next((int(t) for t in arg.split() if t.isdigit()), 25), flags.get("library", "")
+
+    def _parse_list_args(self, arg: str, *, default_count: int = 25,
+                         sort_fields: tuple[str, ...] = (), default_sort: str = ""):
+        """Shared parser for ranked-list commands (largest, toprated, etc.).
+
+        Supports a positional count or ``--count N``, ``--all`` (no limit,
+        returns count 0), ``--library <id|name>`` and ``--sort <field>``.
+        Returns ``(count, library, sort)``.
+        """
+        tokens = self._tokens(arg)
+        count = 0 if "--all" in tokens else self._positional_count(tokens, default_count)
+        library = self._flag_value(tokens, "--library")
+        sort = default_sort
+        if sort_fields:
+            requested = self._flag_value(tokens, "--sort").lower()
+            if requested in sort_fields:
+                sort = requested
+            elif requested:
+                console.print(f"[yellow]Unknown sort '{requested}'; options: "
+                              f"{', '.join(sort_fields)}. Using '{default_sort}'.[/yellow]")
+        return count, library, sort
+
+    def _resolve_libraries(self, library: str) -> list[dict]:
+        """Resolve a ``--library`` value (numeric section id or name substring)
+        to real library dicts. Empty value returns all libraries."""
+        libs = self.client.libraries()
+        if not library:
+            return libs
+        if library.isdigit():
+            match = [l for l in libs if str(l.get("key")) == library]
+            return match or [{"key": library, "title": f"Library {library}"}]
+        lo = library.lower()
+        return [l for l in libs if lo in l.get("title", "").lower()]
+
+    def _filter_by_library(self, rows: list[dict], library: str, key: str = "library") -> list[dict]:
+        """Filter rows carrying a library-name field by a ``--library`` id or name."""
+        if not library:
+            return rows
+        names = {l.get("title", "").lower() for l in self._resolve_libraries(library)}
+        return [r for r in rows if r.get(key, "").lower() in names]
+
+    @staticmethod
+    def _showing_caption(shown: int, total: int, noun: str = "item") -> str:
+        """Consistent 'showing X of Y' / 'N items' table caption."""
+        plural = "" if total == 1 else "s"
+        if total and shown < total:
+            return f"showing {shown} of {total} {noun}{plural}"
+        return f"{total} {noun}{plural}"
 
     def _tokens(self, arg: str) -> list[str]:
         try:
@@ -2664,37 +2712,66 @@ class PlexShell(cmd.Cmd):
             records = [r for r in records if username_filter in r.get("User",{}).get("title","").lower()]
         self._history_table(records, "Watch History")
 
+    _UNWATCHED_SORTS = ("added", "title", "library", "year")
+
     def do_unwatched(self, arg: str):
-        libs = self._libs_for(arg.strip() or None)
-        t = Table(title="Unwatched Content", box=box.ROUNDED)
+        limit, lib, sort = self._parse_list_args(
+            arg, default_count=0, sort_fields=self._UNWATCHED_SORTS, default_sort="added")
+        libs = self._resolve_libraries(lib)
+        rows = []
+        with console.status("Scanning..."):
+            for lb in libs:
+                for item in self.client.library_contents(lb.get("key", "")):
+                    if not item.get("viewCount"):
+                        rows.append((lb.get("title", ""), item))
+        if not rows:
+            console.print("[green]Everything has been watched![/green]"); return
+        sorters = {
+            "added":   (lambda x: x[1].get("addedAt") or 0, True),
+            "title":   (lambda x: x[1].get("title", "").lower(), False),
+            "library": (lambda x: (x[0].lower(), x[1].get("title", "").lower()), False),
+            "year":    (lambda x: int(x[1].get("year") or 0), True),
+        }
+        keyfn, rev = sorters.get(sort, sorters["added"])
+        rows.sort(key=keyfn, reverse=rev)
+        total = len(rows)
+        if limit > 0:
+            rows = rows[:limit]
+        t = Table(title="Unwatched Content", box=box.ROUNDED,
+                  caption=self._showing_caption(len(rows), total), caption_justify="right")
         t.add_column("Library", style="cyan", width=16); t.add_column("Key", style="dim", width=7)
         t.add_column("Title", style="bold white", min_width=28)
         t.add_column("Year", width=6, justify="right"); t.add_column("Added", width=17, style="dim")
-        count = 0
-        with console.status("Scanning..."):
-            for lib in libs:
-                for item in self.client.library_contents(lib.get("key","")):
-                    if not item.get("viewCount"):
-                        t.add_row(lib.get("title",""), item.get("ratingKey",""), item.get("title",""),
-                                  year(item), format_ts(item.get("addedAt")))
-                        count += 1
-        if count == 0:
-            console.print("[green]Everything has been watched![/green]")
-        else:
-            console.print(t); console.print(f"[yellow]{count} unwatched items.[/yellow]")
+        for lib_title, item in rows:
+            t.add_row(lib_title, item.get("ratingKey", ""), item.get("title", ""),
+                      year(item), format_ts(item.get("addedAt")))
+        console.print(t)
+
+    _TOPRATED_SORTS = ("rating", "title", "year")
 
     def do_toprated(self, arg: str):
-        libs = self._libs_for(arg.strip() or None)
+        count, lib, sort = self._parse_list_args(
+            arg, default_count=50, sort_fields=self._TOPRATED_SORTS, default_sort="rating")
+        libs = self._resolve_libraries(lib)
         omdb = self._configured_omdb_client()
         all_items = []
         with console.status("Fetching ratings..."):
-            for lib in libs:
-                for item in self.client.library_contents(lib.get("key",""), sort="rating:desc", includeGuids=1):
+            for lb in libs:
+                for item in self.client.library_contents(lb.get("key",""), sort="rating:desc", includeGuids=1):
                     r = item.get("rating") or item.get("audienceRating")
                     if r:
-                        all_items.append((float(r), lib.get("title",""), item))
-        all_items.sort(key=lambda x: x[0], reverse=True)
-        top = all_items[:50]
+                        all_items.append((float(r), lb.get("title",""), item))
+        if not all_items:
+            console.print("[yellow]No rated items found.[/yellow]"); return
+        sorters = {
+            "rating": (lambda x: x[0], True),
+            "title":  (lambda x: x[2].get("title", "").lower(), False),
+            "year":   (lambda x: int(x[2].get("year") or 0), True),
+        }
+        keyfn, rev = sorters.get(sort, sorters["rating"])
+        all_items.sort(key=keyfn, reverse=rev)
+        grand_total = len(all_items)
+        top = all_items if count <= 0 else all_items[:count]
         omdb_map: dict[str, tuple[str, str]] = {}
         if omdb and top:
             with console.status("Fetching IMDB / RT ratings..."):
@@ -2703,7 +2780,8 @@ class PlexShell(cmd.Cmd):
                                     if g.get("id", "").startswith("imdb://")), "")
                     if imdb_id:
                         omdb_map[item.get("ratingKey", "")] = _omdb_ratings(omdb.by_imdb_id(imdb_id))
-        t = Table(title="Top Rated", box=box.ROUNDED)
+        t = Table(title="Top Rated", box=box.ROUNDED,
+                  caption=self._showing_caption(len(top), grand_total), caption_justify="right")
         t.add_column("#", style="dim", width=4)
         t.add_column("Rating", width=7, justify="right", style="bold green")
         t.add_column("Title", style="bold white", min_width=28)
@@ -2788,19 +2866,21 @@ class PlexShell(cmd.Cmd):
         if no_year:
             console.print(f"[dim]{no_year} history entries had no year data.[/dim]")
 
+    _RECS_SORTS = ("rating", "title", "year")
+
     def do_recommendations(self, arg: str):
-        """recommendations [library_id] — highly rated unwatched content (audience rating ≥ 7.5)"""
-        section_id = arg.strip() or None
+        """recommendations [count] [--library id|name] [--sort rating|title|year] — highly rated unwatched content (audience rating ≥ 7.5)"""
+        count, lib, sort = self._parse_list_args(
+            arg, default_count=50, sort_fields=self._RECS_SORTS, default_sort="rating")
         MIN_RATING = 7.5
         omdb = self._configured_omdb_client()
         with console.status("Finding recommendations..."):
-            if section_id:
-                libs = self._libs_for(section_id)
-            else:
-                libs = [l for l in self.client.libraries() if l.get("type") in ("movie", "show")]
+            libs = self._resolve_libraries(lib)
+            if not lib:
+                libs = [l for l in libs if l.get("type") in ("movie", "show")]
             items = []
-            for lib in libs:
-                items.extend(self.client.library_contents(lib.get("key", ""), includeGuids=1))
+            for lb in libs:
+                items.extend(self.client.library_contents(lb.get("key", ""), includeGuids=1))
         recs = []
         for item in items:
             if item.get("viewCount"):
@@ -2811,8 +2891,15 @@ class PlexShell(cmd.Cmd):
         if not recs:
             console.print(f"[yellow]No unwatched items with rating ≥ {MIN_RATING}.[/yellow]")
             return
-        recs.sort(key=lambda x: x[0], reverse=True)
-        top = recs[:50]
+        sorters = {
+            "rating": (lambda x: x[0], True),
+            "title":  (lambda x: x[1].get("title", "").lower(), False),
+            "year":   (lambda x: int(x[1].get("year") or 0), True),
+        }
+        keyfn, rev = sorters.get(sort, sorters["rating"])
+        recs.sort(key=keyfn, reverse=rev)
+        grand_total = len(recs)
+        top = recs if count <= 0 else recs[:count]
         omdb_map: dict[str, tuple[str, str]] = {}
         if omdb and top:
             with console.status("Fetching IMDB / RT ratings..."):
@@ -2822,7 +2909,7 @@ class PlexShell(cmd.Cmd):
                     if imdb_id:
                         omdb_map[item.get("ratingKey", "")] = _omdb_ratings(omdb.by_imdb_id(imdb_id))
         t = Table(title=f"Recommendations — Unwatched, Rating ≥ {MIN_RATING}",
-                  caption=f"{len(recs)} items", caption_justify="right", box=box.ROUNDED)
+                  caption=self._showing_caption(len(top), grand_total), caption_justify="right", box=box.ROUNDED)
         t.add_column("#", style="dim", width=4)
         t.add_column("Rating", width=7, justify="right", style="bold green")
         t.add_column("Title", style="bold white", min_width=30)
@@ -2839,25 +2926,35 @@ class PlexShell(cmd.Cmd):
             t.add_row(*row)
         console.print(t)
 
+    _REWATCHED_SORTS = ("plays", "title", "year")
+
     def do_rewatched(self, arg: str):
-        """rewatched [library_id] — titles played more than once, ranked by play count"""
-        section_id = arg.strip() or None
+        """rewatched [count] [--library id|name] [--sort plays|title|year] — titles played more than once, ranked by play count"""
+        count, lib, sort = self._parse_list_args(
+            arg, default_count=50, sort_fields=self._REWATCHED_SORTS, default_sort="plays")
         with console.status("Scanning watch counts..."):
-            items = self._all_items(section_id)
-        rows = sorted(
-            [(item.get("viewCount", 0), item) for item in items if (item.get("viewCount") or 0) > 1],
-            key=lambda x: x[0], reverse=True,
-        )
+            items = [item for lb in self._resolve_libraries(lib)
+                     for item in self.client.library_contents(lb.get("key", ""))]
+        rows = [(item.get("viewCount", 0), item) for item in items if (item.get("viewCount") or 0) > 1]
         if not rows:
             console.print("[yellow]No rewatched titles found.[/yellow]"); return
-        t = Table(title=f"Most Rewatched ({len(rows)} titles)", box=box.ROUNDED,
-                  caption=f"showing top {min(50, len(rows))}", caption_justify="right")
+        sorters = {
+            "plays": (lambda x: x[0], True),
+            "title": (lambda x: x[1].get("title", "").lower(), False),
+            "year":  (lambda x: int(x[1].get("year") or 0), True),
+        }
+        keyfn, rev = sorters.get(sort, sorters["plays"])
+        rows.sort(key=keyfn, reverse=rev)
+        total = len(rows)
+        shown = rows if count <= 0 else rows[:count]
+        t = Table(title="Most Rewatched", box=box.ROUNDED,
+                  caption=self._showing_caption(len(shown), total, "title"), caption_justify="right")
         t.add_column("#", style="dim", width=4)
         t.add_column("Plays", width=6, justify="right", style="bold green")
         t.add_column("Title", style="bold white", min_width=30)
         t.add_column("Year", width=6, justify="right")
         t.add_column("Type", style="yellow", width=10)
-        for i, (plays, item) in enumerate(rows[:50], 1):
+        for i, (plays, item) in enumerate(shown, 1):
             t.add_row(str(i), str(plays), item.get("title", ""), year(item), item.get("type", ""))
         console.print(t)
 
@@ -2989,18 +3086,28 @@ class PlexShell(cmd.Cmd):
 
     # ── Storage analysis ──────────────────────────────────────────────────────
 
-    def _size_table(self, count: int, largest: bool, library_filter: str = ""):
+    _SIZE_SORTS = ("size", "title", "library")
+
+    def _size_table(self, count: int, largest: bool, library_filter: str = "", sort: str = "size"):
         label = "Largest" if largest else "Smallest"
         with console.status(f"Fetching {label.lower()} files..."):
             rows = [r for r in self.client.all_media_rows() if r.get("size")]
-        if library_filter:
-            rows = [r for r in rows if library_filter.lower() in r["library"].lower()]
-            if not rows:
-                console.print(f"[yellow]No results for library '{library_filter}'.[/yellow]"); return
-        rows.sort(key=lambda r: r["size"], reverse=largest)
-        rows = rows[:count]
-        title = f"{label} {count} Files" + (f" — {library_filter}" if library_filter else "")
-        t = Table(title=title, box=box.ROUNDED)
+        rows = self._filter_by_library(rows, library_filter)
+        if not rows:
+            console.print(f"[yellow]No results{f' for library {library_filter!r}' if library_filter else ''}.[/yellow]"); return
+        sorters = {
+            "size":    (lambda r: r["size"], largest),
+            "title":   (lambda r: r["title"].lower(), False),
+            "library": (lambda r: (r["library"].lower(), -r["size"]), False),
+        }
+        keyfn, rev = sorters.get(sort, sorters["size"])
+        rows.sort(key=keyfn, reverse=rev)
+        total = len(rows)
+        if count > 0:
+            rows = rows[:count]
+        title = f"{label} Files" + (f" — {library_filter}" if library_filter else "")
+        t = Table(title=title, box=box.ROUNDED,
+                  caption=self._showing_caption(len(rows), total, "file"), caption_justify="right")
         t.add_column("#", style="dim", width=4); t.add_column("Size", width=10, justify="right", style="bold yellow")
         t.add_column("Title", style="bold white", min_width=28); t.add_column("Library", style="cyan", width=16)
         t.add_column("Video", width=8); t.add_column("Audio", width=8)
@@ -3015,17 +3122,19 @@ class PlexShell(cmd.Cmd):
         console.print(t)
 
     def do_largest(self, arg: str):
-        count, lib = self._parse_size_args(arg); self._size_table(count, True, lib)
+        count, lib, sort = self._parse_list_args(arg, sort_fields=self._SIZE_SORTS, default_sort="size")
+        self._size_table(count, True, lib, sort)
     def do_smallest(self, arg: str):
-        count, lib = self._parse_size_args(arg); self._size_table(count, False, lib)
+        count, lib, sort = self._parse_list_args(arg, sort_fields=self._SIZE_SORTS, default_sort="size")
+        self._size_table(count, False, lib, sort)
+
+    _SHOW_SIZE_SORTS = ("size", "title", "episodes")
 
     def _show_size_table(self, count: int, largest: bool, library_filter: str = "",
-                         title: str | None = None):
+                         title: str | None = None, sort: str = "size"):
         label = "Largest" if largest else "Smallest"
         with console.status("Fetching TV libraries..."):
-            tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
-        if library_filter:
-            tv_libs = [l for l in tv_libs if library_filter.lower() in l.get("title", "").lower()]
+            tv_libs = [l for l in self._resolve_libraries(library_filter) if l.get("type") == "show"]
         if not tv_libs:
             suffix = f" matching '{library_filter}'" if library_filter else ""
             console.print(f"[yellow]No TV libraries found{suffix}.[/yellow]")
@@ -3051,15 +3160,22 @@ class PlexShell(cmd.Cmd):
             console.print("[yellow]No episode data found.[/yellow]")
             return
 
-        rows = sorted(show_data.values(), key=lambda x: x["size"], reverse=largest)
+        sorters = {
+            "size":     (lambda x: x["size"], largest),
+            "title":    (lambda x: x["title"].lower(), False),
+            "episodes": (lambda x: x["episodes"], largest),
+        }
+        keyfn, rev = sorters.get(sort, sorters["size"])
+        rows = sorted(show_data.values(), key=keyfn, reverse=rev)
+        total = len(rows)
         if count > 0:
             rows = rows[:count]
         if title is None:
-            title = (f"{label} {count} TV Shows by Disk Usage"
-                     if count > 0 else "TV Show Disk Usage")
+            title = "TV Shows by Disk Usage"
         if library_filter:
             title += f" - {library_filter}"
-        t = Table(title=title, box=box.ROUNDED)
+        t = Table(title=title, box=box.ROUNDED,
+                  caption=self._showing_caption(len(rows), total, "show"), caption_justify="right")
         t.add_column("#", style="dim", width=4)
         t.add_column("Total Size", width=12, justify="right", style="bold yellow")
         t.add_column("Show", style="bold white", min_width=30)
@@ -3076,22 +3192,26 @@ class PlexShell(cmd.Cmd):
         console.print(t)
 
     def do_tvlargest(self, arg: str):
-        """tvlargest [count] [--library name] — TV shows with the most total disk usage (default 25)"""
-        count, lib = self._parse_size_args(arg)
-        self._show_size_table(count, True, lib)
+        """tvlargest [count] [--library id|name] [--sort size|title|episodes] — TV shows with the most total disk usage (default 25)"""
+        count, lib, sort = self._parse_list_args(arg, sort_fields=self._SHOW_SIZE_SORTS, default_sort="size")
+        self._show_size_table(count, True, lib, sort=sort)
 
     def do_tvsmallest(self, arg: str):
-        """tvsmallest [count] [--library name] — TV shows with the least total disk usage (default 25)"""
-        count, lib = self._parse_size_args(arg)
-        self._show_size_table(count, False, lib)
+        """tvsmallest [count] [--library id|name] [--sort size|title|episodes] — TV shows with the least total disk usage (default 25)"""
+        count, lib, sort = self._parse_list_args(arg, sort_fields=self._SHOW_SIZE_SORTS, default_sort="size")
+        self._show_size_table(count, False, lib, sort=sort)
 
-    def _duration_table(self, count: int, longest: bool, library_filter: str = ""):
+    _DURATION_SORTS = ("duration", "title", "year")
+
+    def _duration_table(self, count: int, longest: bool, library_filter: str = "", sort: str = "duration"):
         label = "Longest" if longest else "Shortest"
         with console.status(f"Fetching {label.lower()} titles..."):
             data = self.client.all_items_by_library()
+        allowed = ({l.get("title", "").lower() for l in self._resolve_libraries(library_filter)}
+                   if library_filter else None)
         rows = []
         for lt, d in data.items():
-            if library_filter and library_filter.lower() not in lt.lower():
+            if allowed is not None and lt.lower() not in allowed:
                 continue
             for item in d["items"]:
                 dur = item.get("duration")
@@ -3099,10 +3219,19 @@ class PlexShell(cmd.Cmd):
                     rows.append((lt, item, dur))
         if not rows:
             console.print(f"[yellow]No results{f' for library {library_filter!r}' if library_filter else ''}.[/yellow]"); return
-        rows.sort(key=lambda x: x[2], reverse=longest)
-        rows = rows[:count]
-        title = f"{label} {count} Titles" + (f" — {library_filter}" if library_filter else "")
-        t = Table(title=title, box=box.ROUNDED)
+        sorters = {
+            "duration": (lambda x: x[2], longest),
+            "title":    (lambda x: x[1].get("title", "").lower(), False),
+            "year":     (lambda x: int(x[1].get("year") or 0), longest),
+        }
+        keyfn, rev = sorters.get(sort, sorters["duration"])
+        rows.sort(key=keyfn, reverse=rev)
+        total = len(rows)
+        if count > 0:
+            rows = rows[:count]
+        title = f"{label} Titles" + (f" — {library_filter}" if library_filter else "")
+        t = Table(title=title, box=box.ROUNDED,
+                  caption=self._showing_caption(len(rows), total, "title"), caption_justify="right")
         t.add_column("#", style="dim", width=4); t.add_column("Duration", width=10, justify="right", style="bold yellow")
         t.add_column("Title", style="bold white", min_width=28); t.add_column("Library", style="cyan", width=16)
         t.add_column("Year", width=6, justify="right"); t.add_column("Type", style="yellow", width=8)
@@ -3111,9 +3240,11 @@ class PlexShell(cmd.Cmd):
         console.print(t)
 
     def do_longest(self, arg: str):
-        count, lib = self._parse_size_args(arg); self._duration_table(count, True, lib)
+        count, lib, sort = self._parse_list_args(arg, sort_fields=self._DURATION_SORTS, default_sort="duration")
+        self._duration_table(count, True, lib, sort)
     def do_shortest(self, arg: str):
-        count, lib = self._parse_size_args(arg); self._duration_table(count, False, lib)
+        count, lib, sort = self._parse_list_args(arg, sort_fields=self._DURATION_SORTS, default_sort="duration")
+        self._duration_table(count, False, lib, sort)
 
     def do_storage(self, _):
         with console.status("Calculating storage..."):
@@ -5278,12 +5409,16 @@ class PlexShell(cmd.Cmd):
 
     # ── Breakdown views ───────────────────────────────────────────────────────
 
+    _POPULARITY_SORTS = ("plays", "title")
+
     def do_popularity(self, arg: str):
-        section_id = arg.strip() or None
+        count, lib, sort = self._parse_list_args(
+            arg, default_count=50, sort_fields=self._POPULARITY_SORTS, default_sort="plays")
         with console.status("Fetching watch history..."):
             hist = self.client.history(count=5000)
-        if section_id:
-            hist = [h for h in hist if str(h.get("librarySectionID","")) == section_id]
+        if lib:
+            keys = {str(l.get("key", "")) for l in self._resolve_libraries(lib)}
+            hist = [h for h in hist if str(h.get("librarySectionID", "")) in keys]
         if not hist:
             console.print("[yellow]No history available (may require Plex Pass).[/yellow]"); return
         counts: Counter = Counter()
@@ -5293,11 +5428,15 @@ class PlexShell(cmd.Cmd):
             counts[key] += 1
             if key not in type_map:
                 type_map[key] = "show" if h.get("grandparentTitle") else h.get("type","")
-        t = Table(title="Most Watched Titles", caption=f"Based on {len(hist)} history entries",
+        ranked = (sorted(counts.items(), key=lambda x: x[0].lower())
+                  if sort == "title" else counts.most_common())
+        total = len(ranked)
+        shown = ranked if count <= 0 else ranked[:count]
+        t = Table(title="Most Watched Titles", caption=self._showing_caption(len(shown), total, "title"),
                   caption_justify="right", box=box.ROUNDED)
         t.add_column("#", style="dim", width=4); t.add_column("Title", style="bold white", min_width=30)
         t.add_column("Type", style="yellow", width=10); t.add_column("Plays", justify="right", width=8, style="bold green")
-        for i, (ts, cnt) in enumerate(counts.most_common(50), 1):
+        for i, (ts, cnt) in enumerate(shown, 1):
             t.add_row(str(i), ts, type_map.get(ts,""), str(cnt))
         console.print(t)
 
@@ -9055,14 +9194,46 @@ class PlexShell(cmd.Cmd):
         if prev == "--library": return self._c_libs(text)
         return self._c_flags(text, ["--library"]) if text.startswith("-") else []
 
-    complete_browse = complete_unwatched = complete_toprated = complete_bitrate = _c_lib_arg
+    def _c_list_flags(self, text, line, begidx, sort_fields=()):
+        """Completion for ranked-list commands (--library / --count / --all / --sort)."""
+        prev = self._prev(line, begidx)
+        if prev == "--library":
+            return self._c_libs(text)
+        if prev == "--sort":
+            return [f for f in sort_fields if f.startswith(text.lower())]
+        if prev == "--count":
+            return []
+        flags = ["--library", "--count", "--all"] + (["--sort"] if sort_fields else [])
+        return self._c_flags(text, flags) if text.startswith("-") else []
+
+    def complete_largest(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._SIZE_SORTS)
+    complete_smallest = complete_largest
+    def complete_longest(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._DURATION_SORTS)
+    complete_shortest = complete_longest
+    def complete_tvlargest(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._SHOW_SIZE_SORTS)
+    complete_tvsmallest = complete_tvlargest
+    def complete_unwatched(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._UNWATCHED_SORTS)
+    def complete_toprated(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._TOPRATED_SORTS)
+    def complete_recommendations(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._RECS_SORTS)
+    def complete_rewatched(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._REWATCHED_SORTS)
+    def complete_popularity(self, text, line, begidx, endidx):
+        return self._c_list_flags(text, line, begidx, self._POPULARITY_SORTS)
+
+    complete_browse = complete_bitrate = _c_lib_arg
     complete_subtitles = complete_hdr = complete_multiversion = complete_genres = _c_lib_arg
-    complete_studios = complete_collections = complete_popularity = _c_lib_arg
+    complete_studios = complete_collections = _c_lib_arg
     complete_fixtitles = complete_stale = _c_lib_arg
     complete_missing_episodes = complete_incomplete_seasons = complete_season_quality = _c_lib_arg
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
-    complete_framerate = complete_director_stats = complete_actor_stats = complete_recommendations = _c_lib_arg
-    complete_rewatched = complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
+    complete_framerate = complete_director_stats = complete_actor_stats = _c_lib_arg
+    complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
     complete_zero_duration = complete_added_trend = complete_resolution_trend = _c_lib_arg
     complete_container_format = complete_size_by_codec = complete_channel_dist = _c_lib_arg
     complete_binge_candidates = complete_overdue = complete_watched_by_decade = _c_lib_arg
@@ -9090,8 +9261,7 @@ class PlexShell(cmd.Cmd):
         if len(tokens) >= 2:
             return self._c_libs(text)
         return []
-    complete_largest = complete_smallest = complete_longest = complete_shortest = _c_lib_flag
-    complete_tvlargest = complete_tvsmallest = complete_analyze = complete_abandoned = _c_lib_flag
+    complete_analyze = complete_abandoned = _c_lib_flag
 
 
     _ABA_FLAGS = ["--library", "--count", "--min-size"]
