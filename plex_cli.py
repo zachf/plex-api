@@ -280,6 +280,17 @@ class PlexClient:
     def libraries(self) -> list:
         return self._mc("/library/sections", "Directory")
 
+    def library_count(self, section_id: str) -> int | None:
+        """Return the item count for a section via MediaContainer.totalSize.
+
+        /library/sections does not include per-section counts, so this makes a
+        lightweight request (container size 0 fetches no items, just the total).
+        """
+        mc = self.get(f"/library/sections/{section_id}/all",
+                      **{"X-Plex-Container-Size": 0, "X-Plex-Container-Start": 0}).get("MediaContainer", {})
+        count = mc.get("totalSize", mc.get("size"))
+        return count if isinstance(count, int) else None
+
     def library_contents(self, section_id: str, sort: str = "titleSort", **params) -> list:
         return self._mc(f"/library/sections/{section_id}/all", sort=sort, **params)
 
@@ -956,7 +967,9 @@ def print_libraries(libs: list):
     t.add_column("Type", style="yellow")
     t.add_column("Items", justify="right")
     for lib in libs:
-        t.add_row(lib.get("key", ""), lib.get("title", ""), lib.get("type", ""), str(lib.get("count", "?")))
+        count = lib.get("count")
+        t.add_row(lib.get("key", ""), lib.get("title", ""), lib.get("type", ""),
+                  f"{count:,}" if isinstance(count, int) else "?")
     console.print(t)
 
 def print_media_table(items: list, title: str = "Results", show_resolution: bool = False):
@@ -2055,6 +2068,8 @@ class PlexShell(cmd.Cmd):
     def do_libraries(self, _):
         libs = self.client.libraries()
         if libs:
+            for lib in libs:
+                lib["count"] = self.client.library_count(lib.get("key", ""))
             print_libraries(libs)
 
     def do_browse(self, arg: str):
