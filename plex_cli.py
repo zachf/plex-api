@@ -1201,6 +1201,7 @@ _INTERACTIVE_COMMANDS = frozenset({
 _HELP_SECTIONS = [
     ("Dashboard", [
         ("health",                "",                                "One-page health summary: library stats, zero-duration, stale shows, Radarr sync and upgrade gaps"),
+        ("doctor",                "",                                "Read-only configuration, connectivity, and storage diagnostics"),
         ("watch_next",            "[--count N] [--library id] [--runtime min] [--genre g] [--type movie|episode]",
                                                                  "Ranked picks from On Deck, unwatched ratings, recency, and runtime filters"),
         ("quality_upgrade_plan",  "[--limit N] [--movies|--shows]", "Prioritize Radarr/Sonarr quality upgrades using Plex watch stats"),
@@ -6716,6 +6717,137 @@ class PlexShell(cmd.Cmd):
             console.print("[dim]Nothing selected.[/dim]"); return
 
         self._execute_radarr_download(selected, rc, profile_id)
+
+    def do_doctor(self, _arg: str):
+        """doctor — read-only diagnostics for configured services, Plex access, and Arr storage."""
+        import concurrent.futures
+
+        cfg = load_config()
+
+        def setting(name: str, env_name: str) -> str:
+            return cfg.get(name, "") or os.environ.get(env_name, "")
+
+        def request_json(session, url: str, **kwargs) -> tuple[bool, dict | list, str]:
+            """Quiet diagnostic request; never include a URL or credential in output."""
+            try:
+                response = session.get(url, timeout=10, **kwargs)
+                if not response.ok:
+                    detail = f"HTTP {response.status_code}"
+                    if response.status_code in (401, 403):
+                        detail += " (check credentials)"
+                    return False, {}, detail
+                try:
+                    return True, response.json(), ""
+                except ValueError:
+                    return False, {}, "non-JSON response"
+            except requests.exceptions.Timeout:
+                return False, {}, "timed out"
+            except requests.exceptions.RequestException as exc:
+                return False, {}, exc.__class__.__name__.replace("Error", "")
+
+        def check_plex() -> tuple[bool, str]:
+            ok, data, detail = request_json(self.client.session, f"{self.client.base_url}/")
+            if not ok:
+                return False, detail
+            info = data.get("MediaContainer", {}) if isinstance(data, dict) else {}
+            ok, data, detail = request_json(self.client.session, f"{self.client.base_url}/library/sections")
+            if not ok:
+                return False, f"server reachable; libraries: {detail}"
+            libraries = data.get("MediaContainer", {}).get("Directory", []) if isinstance(data, dict) else []
+            return True, f"{info.get('friendlyName') or 'connected'} • {len(libraries)} libraries • v{info.get('version', '?')}"
+
+        def check_arr(client) -> tuple[bool, str]:
+            ok, data, detail = request_json(client.session, f"{client.base_url}/api/v3/system/status")
+            if not ok:
+                return False, detail
+            info = data if isinstance(data, dict) else {}
+            ok, roots, root_detail = request_json(client.session, f"{client.base_url}/api/v3/rootfolder")
+            if not ok:
+                return True, f"v{info.get('version', '?')} • root folders unavailable ({root_detail})"
+            root_list = roots if isinstance(roots, list) else []
+            low_space = sum(
+                1 for root in root_list
+                if isinstance(root.get("freeSpace"), (int, float))
+                and root["freeSpace"] < 10 * 1024 ** 3
+            )
+            detail = f"v{info.get('version', '?')} • {len(root_list)} root folder(s)"
+            if low_space:
+                detail += f" • [yellow]{low_space} below 10 GB free[/yellow]"
+            return True, detail
+
+        def check_tautulli(url: str, key: str) -> tuple[bool, str]:
+            ok, data, detail = request_json(requests.Session(), f"{url.rstrip('/')}/api/v2",
+                                             params={"apikey": key, "cmd": "get_server_info"})
+            response = data.get("response", {}) if isinstance(data, dict) else {}
+            info = response.get("data", {}) if isinstance(response, dict) else {}
+            if not ok or not info:
+                return False, detail or "invalid response or credentials"
+            return True, f"{info.get('pms_name') or info.get('server_name') or 'connected'} • v{info.get('tautulli_version', '?')}"
+
+        def check_overseerr(url: str, key: str) -> tuple[bool, str]:
+            ok, data, detail = request_json(requests.Session(), f"{url.rstrip('/')}/api/v1/status",
+                                             headers={"X-Api-Key": key, "Accept": "application/json"})
+            info = data if isinstance(data, dict) else {}
+            return (True, f"v{info.get('version', '?')}") if ok else (False, detail)
+
+        def check_tmdb(key: str) -> tuple[bool, str]:
+            ok, _data, detail = request_json(requests.Session(), "https://api.themoviedb.org/3/configuration",
+                                              params={"api_key": key})
+            return (True, "API key accepted") if ok else (False, detail)
+
+        configured = {
+            "Radarr": (setting("radarr_url", "RADARR_URL"), setting("radarr_api_key", "RADARR_API_KEY")),
+            "Sonarr": (setting("sonarr_url", "SONARR_URL"), setting("sonarr_api_key", "SONARR_API_KEY")),
+            "Tautulli": (setting("tautulli_url", "TAUTULLI_URL"), setting("tautulli_api_key", "TAUTULLI_API_KEY")),
+            "Overseerr": (setting("overseerr_url", "OVERSEERR_URL"), setting("overseerr_api_key", "OVERSEERR_API_KEY")),
+            "TMDB": ("configured", setting("tmdb_api_key", "TMDB_API_KEY")),
+            "OMDb": ("configured", setting("omdb_api_key", "OMDB_API_KEY")),
+        }
+
+        with console.status("Running read-only diagnostics..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                futures = {"Plex": pool.submit(check_plex)}
+                for name, cls in (("Radarr", RadarrClient), ("Sonarr", SonarrClient)):
+                    url, key = configured[name]
+                    if url and key:
+                        futures[name] = pool.submit(check_arr, cls(url, key))
+                url, key = configured["Tautulli"]
+                if url and key:
+                    futures["Tautulli"] = pool.submit(check_tautulli, url, key)
+                url, key = configured["Overseerr"]
+                if url and key:
+                    futures["Overseerr"] = pool.submit(check_overseerr, url, key)
+                _url, key = configured["TMDB"]
+                if key:
+                    futures["TMDB"] = pool.submit(check_tmdb, key)
+                results = {name: future.result() for name, future in futures.items()}
+        # OMDb has no inexpensive health endpoint. Do not consume a quota-bearing
+        # lookup merely for diagnostics; its key is checked when ratings are used.
+        if configured["OMDb"][1]:
+            results["OMDb"] = (True, "API key configured; validated on first rating lookup")
+
+        config_state, config_ok = "present", True
+        if not CONFIG_FILE.exists():
+            config_state = "not found (environment variables may still be in use)"
+        else:
+            try:
+                json.loads(CONFIG_FILE.read_text())
+            except Exception:
+                config_state, config_ok = "unreadable or invalid JSON", False
+
+        table = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 1))
+        table.add_column("Check", style="bold cyan", min_width=13)
+        table.add_column("Status", min_width=12)
+        table.add_column("Details")
+        table.add_row("Configuration", "[green]OK[/green]" if config_ok else "[red]FAIL[/red]", config_state)
+        for name in ("Plex", "Radarr", "Sonarr", "Tautulli", "Overseerr", "TMDB", "OMDb"):
+            if name not in results:
+                table.add_row(name, "[dim]NOT SET[/dim]", "optional service is not configured")
+                continue
+            ok, detail = results[name]
+            table.add_row(name, "[green]OK[/green]" if ok else "[red]FAIL[/red]", detail or "no details")
+        console.print(Panel(table, title="[bold white]Doctor[/bold white]",
+                            subtitle="[dim]No changes were made.[/dim]", border_style="cyan"))
 
     def do_health(self, _arg: str):
         """health — one-page summary: library stats, zero-duration, stale shows, Radarr sync/upgrade gaps"""

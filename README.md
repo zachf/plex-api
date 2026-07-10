@@ -72,6 +72,7 @@ python plex_cli.py <command> [args]
 | Command | Description |
 |---|---|
 | `health` | One-page summary: library stats, zero-duration items, stale shows, Radarr sync and upgrade gaps |
+| `doctor` | Read-only configuration, connectivity, and storage diagnostics |
 
 ### Basic
 
