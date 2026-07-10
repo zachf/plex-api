@@ -7,6 +7,7 @@ import cmd
 import csv
 from difflib import SequenceMatcher
 import json
+import math
 import os
 import re
 import shlex
@@ -86,9 +87,41 @@ def format_ts(ts: int | None) -> str:
 def year(item: dict) -> str:
     return str(item.get("year", "")) or "—"
 
+def rating_value(item: dict, audience_first: bool = False) -> float | None:
+    """Return the first valid rating without treating numeric zero as missing."""
+    keys = ("audienceRating", "rating") if audience_first else ("rating", "audienceRating")
+    for key in keys:
+        raw = item.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+            if math.isfinite(value):
+                return value
+        except (TypeError, ValueError):
+            pass
+    return None
+
+def format_rating_value(value) -> str:
+    try:
+        numeric = float(value)
+        return f"{numeric:.1f}" if value is not None and math.isfinite(numeric) else "—"
+    except (TypeError, ValueError):
+        return "—"
+
 def rating(item: dict) -> str:
-    r = item.get("rating") or item.get("audienceRating")
-    return f"{r:.1f}" if r is not None else "—"
+    return format_rating_value(rating_value(item))
+
+def progress_percent(value, total) -> int:
+    """Return a safe integer percentage for untrusted Plex progress values."""
+    try:
+        value_num = float(value or 0)
+        total_num = float(total or 0)
+        if total_num <= 0 or not math.isfinite(value_num) or not math.isfinite(total_num):
+            return 0
+        return max(0, min(100, int(value_num / total_num * 100)))
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return 0
 
 def full_title(item: dict) -> str:
     """Compose grandparent — parent — title for display."""
@@ -217,12 +250,18 @@ class PlexClient:
             r = self.session.request(method, url, params=params, timeout=15)
             r.raise_for_status()
             return r
+        except requests.exceptions.Timeout:
+            if not silent:
+                console.print(f"[red]Request to {self.base_url} timed out[/red]")
         except requests.exceptions.ConnectionError:
             if not silent:
                 console.print(f"[red]Cannot reach {self.base_url}[/red]")
         except requests.exceptions.HTTPError as e:
             if not silent:
                 console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+        except requests.exceptions.RequestException:
+            if not silent:
+                console.print(f"[red]Request to {self.base_url} failed[/red]")
         return None
 
     def get(self, path: str, silent: bool = False, **params) -> dict:
@@ -231,7 +270,7 @@ class PlexClient:
             return {}
         try:
             return r.json()
-        except requests.exceptions.JSONDecodeError:
+        except ValueError:
             if not silent:
                 console.print("[red]Server returned non-JSON response[/red]")
             return {}
@@ -245,7 +284,7 @@ class PlexClient:
             return {}
         try:
             return r.json()
-        except requests.exceptions.JSONDecodeError:
+        except ValueError:
             return {}
 
     def delete(self, path: str, **params) -> bool:
@@ -259,6 +298,10 @@ class PlexClient:
             r = self.session.get(url, params=params, headers=headers, timeout=15)
             r.raise_for_status()
             return r.text
+        except requests.exceptions.Timeout:
+            if not silent:
+                console.print(f"[red]Request to {self.base_url} timed out[/red]")
+            return None
         except requests.exceptions.ConnectionError:
             if not silent:
                 console.print(f"[red]Cannot reach {self.base_url}[/red]")
@@ -266,6 +309,10 @@ class PlexClient:
         except requests.exceptions.HTTPError as e:
             if not silent:
                 console.print(f"[red]HTTP {e.response.status_code}:[/red] {path}")
+            return None
+        except requests.exceptions.RequestException:
+            if not silent:
+                console.print(f"[red]Request to {self.base_url} failed[/red]")
             return None
 
     # ── Convenience wrappers ─────────────────────────────────────────────────
@@ -362,10 +409,14 @@ class PlexClient:
                 r = self.session.get(url, params=params, headers=extra_headers, timeout=10)
                 r.raise_for_status()
                 return True
+            except requests.exceptions.Timeout:
+                last_err = f"request timed out at {url}"
             except requests.exceptions.ConnectionError:
                 last_err = f"connection refused at {url}"
             except requests.exceptions.HTTPError as e:
                 last_err = f"HTTP {e.response.status_code} from {url}"
+            except requests.exceptions.RequestException:
+                last_err = f"request failed at {url}"
         console.print(f"[red]Player command failed:[/red] {last_err}")
         return False
 
@@ -523,12 +574,18 @@ class RadarrClient:
             r = self.session.request(method, url, timeout=15, **kwargs)
             r.raise_for_status()
             return r
+        except requests.exceptions.Timeout:
+            if not silent:
+                console.print(f"[red]Radarr request timed out[/red]")
         except requests.exceptions.ConnectionError:
             if not silent:
                 console.print(f"[red]Cannot reach Radarr at {self.base_url}[/red]")
         except requests.exceptions.HTTPError as e:
             if not silent:
                 console.print(f"[red]Radarr HTTP {e.response.status_code}:[/red] {path}")
+        except requests.exceptions.RequestException:
+            if not silent:
+                console.print("[red]Radarr request failed[/red]")
         return None
 
     def get(self, path: str, silent: bool = False, **params):
@@ -597,12 +654,18 @@ class SonarrClient:
             r = self.session.request(method, url, timeout=15, **kwargs)
             r.raise_for_status()
             return r
+        except requests.exceptions.Timeout:
+            if not silent:
+                console.print("[red]Sonarr request timed out[/red]")
         except requests.exceptions.ConnectionError:
             if not silent:
                 console.print(f"[red]Cannot reach Sonarr at {self.base_url}[/red]")
         except requests.exceptions.HTTPError as e:
             if not silent:
                 console.print(f"[red]Sonarr HTTP {e.response.status_code}:[/red] {path}")
+        except requests.exceptions.RequestException:
+            if not silent:
+                console.print("[red]Sonarr request failed[/red]")
         return None
 
     def get(self, path: str, silent: bool = False, **params):
@@ -683,10 +746,16 @@ class TautulliClient:
             )
             r.raise_for_status()
             return r.json().get("response", {})
+        except requests.exceptions.Timeout:
+            console.print("[red]Tautulli request timed out[/red]"); return {}
         except requests.exceptions.ConnectionError:
             console.print(f"[red]Cannot reach Tautulli at {self.base_url}[/red]"); return {}
         except requests.exceptions.HTTPError as e:
             console.print(f"[red]Tautulli HTTP {e.response.status_code}:[/red] {cmd}"); return {}
+        except requests.exceptions.RequestException:
+            console.print("[red]Tautulli request failed[/red]"); return {}
+        except ValueError:
+            console.print("[red]Tautulli returned a non-JSON response[/red]"); return {}
 
     def server_info(self) -> dict:
         return self._cmd("get_server_info").get("data", {})
@@ -720,10 +789,16 @@ class OverseerrClient:
             )
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.Timeout:
+            console.print("[red]Overseerr request timed out[/red]"); return {}
         except requests.exceptions.ConnectionError:
             console.print(f"[red]Cannot reach Overseerr at {self.base_url}[/red]"); return {}
         except requests.exceptions.HTTPError as e:
             console.print(f"[red]Overseerr HTTP {e.response.status_code}[/red]"); return {}
+        except requests.exceptions.RequestException:
+            console.print("[red]Overseerr request failed[/red]"); return {}
+        except ValueError:
+            console.print("[red]Overseerr returned a non-JSON response[/red]"); return {}
 
     def status(self) -> dict:
         return self._get("/status")
@@ -774,10 +849,16 @@ class TMDBClient:
                                  params={"api_key": self.api_key, **params}, timeout=10)
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.Timeout:
+            console.print("[red]TMDB request timed out.[/red]"); return {}
         except requests.exceptions.ConnectionError:
             console.print("[red]Cannot reach TMDB.[/red]"); return {}
         except requests.exceptions.HTTPError as e:
             console.print(f"[red]TMDB HTTP {e.response.status_code}:[/red] {path}"); return {}
+        except requests.exceptions.RequestException:
+            console.print("[red]TMDB request failed.[/red]"); return {}
+        except ValueError:
+            console.print("[red]TMDB returned a non-JSON response.[/red]"); return {}
 
     def list_movies(self, list_id: int) -> list[dict]:
         def _parse(items):
@@ -1007,7 +1088,7 @@ def build_sessions_table(sessions: list) -> Table:
         state = s.get("Player", {}).get("state", "unknown")
         offset = s.get("viewOffset", 0)
         dur = s.get("duration", 0) or 1
-        pct = max(0, min(100, int(offset / dur * 100)))
+        pct = progress_percent(offset, dur)
         bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
         color = {"playing": "green", "paused": "yellow", "buffering": "magenta"}.get(state, "white")
         parent = s.get("grandparentTitle", "")
@@ -2288,7 +2369,7 @@ class PlexShell(cmd.Cmd):
             console.print("[green]On Deck is empty.[/green]"); return
 
         def _label(item: dict) -> str:
-            pct = int(item.get("viewOffset", 0) / (item.get("duration") or 1) * 100)
+            pct = progress_percent(item.get("viewOffset"), item.get("duration"))
             show = item.get("grandparentTitle", "")
             title = item.get("title", "?")
             full = f"{show} — {title}" if show else title
@@ -2373,7 +2454,7 @@ class PlexShell(cmd.Cmd):
                 label  = f"{parent} — {title}" if parent else title
                 yr     = str(item.get("year") or item.get("parentYear") or "")
                 itype  = item.get("type", "")
-                rat    = str(round(float(item["audienceRating"]), 1)) if item.get("audienceRating") else "—"
+                rat    = format_rating_value(item.get("audienceRating"))
                 t.add_row(label, yr, itype, rat)
 
             console.print(t)
@@ -2512,7 +2593,7 @@ class PlexShell(cmd.Cmd):
                 missing = []
                 if not item.get("summary","").strip(): missing.append("summary")
                 if not item.get("thumb") and not item.get("art"): missing.append("poster")
-                if not item.get("rating") and not item.get("audienceRating"): missing.append("rating")
+                if item.get("rating") is None and item.get("audienceRating") is None: missing.append("rating")
                 if not item.get("Genre"): missing.append("genres")
                 if missing:
                     t.add_row(lib_title, item.get("ratingKey",""), item.get("title",""), ", ".join(missing))
@@ -2774,9 +2855,9 @@ class PlexShell(cmd.Cmd):
         with console.status("Fetching ratings..."):
             for lb in libs:
                 for item in self.client.library_contents(lb.get("key",""), sort="rating:desc", includeGuids=1):
-                    r = item.get("rating") or item.get("audienceRating")
-                    if r:
-                        all_items.append((float(r), lb.get("title",""), item))
+                    r = rating_value(item)
+                    if r is not None:
+                        all_items.append((r, lb.get("title",""), item))
         if not all_items:
             console.print("[yellow]No rated items found.[/yellow]"); return
         sorters = {
@@ -2901,9 +2982,9 @@ class PlexShell(cmd.Cmd):
         for item in items:
             if item.get("viewCount"):
                 continue
-            r = item.get("audienceRating") or item.get("rating")
-            if r and float(r) >= MIN_RATING:
-                recs.append((float(r), item))
+            r = rating_value(item, audience_first=True)
+            if r is not None and r >= MIN_RATING:
+                recs.append((r, item))
         if not recs:
             console.print(f"[yellow]No unwatched items with rating ≥ {MIN_RATING}.[/yellow]")
             return
@@ -2999,7 +3080,7 @@ class PlexShell(cmd.Cmd):
         t.add_column("Progress", min_width=24)
         t.add_column("Last Watched", width=17, style="dim")
         for lib_title, show, watched, total in shows:
-            pct  = watched / total * 100 if total else 0
+            pct  = progress_percent(watched, total)
             fill = int(pct / 5)
             bar  = f"[green]{'█' * fill}[/green][dim]{'░' * (20 - fill)}[/dim] {pct:.0f}%"
             t.add_row(lib_title, show.get("title", ""), str(watched), str(total),
@@ -3526,6 +3607,8 @@ class PlexShell(cmd.Cmd):
 
     def do_watch(self, arg: str):
         interval = int(arg.strip()) if arg.strip().isdigit() else 5
+        if interval < 1:
+            interval = 1
         console.print(f"[dim]Refreshing every {interval}s — Ctrl+C to stop[/dim]")
         try:
             with Live(console=console, refresh_per_second=2, screen=False) as live:
@@ -3563,7 +3646,7 @@ class PlexShell(cmd.Cmd):
                                 f"User:   [cyan]{s.get('User',{}).get('title','?')}[/cyan]\n"
                                 f"Title:  [white]{f'{parent} — {title}' if parent else title}[/white]\n"
                                 f"Player: [cyan]{s.get('Player',{}).get('title','?')}[/cyan]\n"
-                                f"Speed:  {ts.get('speed','?')}x  Progress: {int(ts.get('progress') or 0)}%",
+                                f"Speed:  {ts.get('speed','?')}x  Progress: {progress_percent(ts.get('progress'), 100)}%",
                                 title=f"[bold red]Alert — {format_ts(int(time.time()))}[/bold red]",
                                 border_style="red"))
                 known = current
@@ -3659,7 +3742,7 @@ class PlexShell(cmd.Cmd):
         t.add_column("Subtitle", style="dim", min_width=24); t.add_column("Progress", width=22)
         t.add_column("Cancel", width=8)
         for a in activities:
-            pct = max(0, min(100, int(a.get("progress",0))))
+            pct = progress_percent(a.get("progress"), 100)
             t.add_row(a.get("type",""), a.get("title",""), a.get("subtitle",""),
                       f"[cyan]{'█'*(pct//5)}{'░'*(20-pct//5)}[/cyan] {pct}%",
                       "yes" if a.get("cancellable") else "—")
@@ -3866,7 +3949,7 @@ class PlexShell(cmd.Cmd):
             dt = Table(title="On Deck", box=box.ROUNDED)
             dt.add_column("Title", style="bold white", min_width=28); dt.add_column("Progress", justify="right", width=10)
             for item in on_deck[:10]:
-                pct = int(item.get("viewOffset",0) / (item.get("duration",0) or 1) * 100)
+                pct = progress_percent(item.get("viewOffset"), item.get("duration"))
                 p = item.get("grandparentTitle",""); ti = item.get("title","")
                 dt.add_row(f"{p} — {ti}" if p else ti, f"{pct}%")
             target.print(dt)
@@ -4011,7 +4094,7 @@ class PlexShell(cmd.Cmd):
         t.add_column("Watched", justify="right", width=9)
         t.add_column("Progress", min_width=24)
         for i, (name, rec) in enumerate(rows, 1):
-            pct = rec["watched"] / rec["total"] * 100
+            pct = progress_percent(rec["watched"], rec["total"])
             fill = int(pct / 5)
             bar = f"[green]{'█' * fill}[/green][dim]{'░' * (20 - fill)}[/dim] {pct:.0f}%"
             t.add_row(str(i), name, str(rec["total"]), str(rec["watched"]), bar)
@@ -4928,7 +5011,8 @@ class PlexShell(cmd.Cmd):
         """abandoned [threshold%] [--library id] — shows started but not finished (default < 80% watched)"""
         _, flags = parse_search_args(arg)
         section_id = flags.get("library")
-        threshold = next((int(t) / 100 for t in arg.split() if t.isdigit()), 0.80)
+        threshold = max(0.0, min(1.0,
+                        next((int(t) / 100 for t in arg.split() if t.isdigit()), 0.80)))
 
         with console.status("Fetching TV libraries..."):
             tv_libs = [l for l in self.client.libraries() if l.get("type") == "show"]
@@ -4944,7 +5028,8 @@ class PlexShell(cmd.Cmd):
                     total = show.get("leafCount") or 0
                     watched = show.get("viewedLeafCount") or 0
                     if total > 0 and 0 < watched < total * threshold:
-                        abandoned.append((lib.get("title", ""), show, watched, total, watched / total * 100))
+                        abandoned.append((lib.get("title", ""), show, watched, total,
+                                          progress_percent(watched, total)))
 
         if not abandoned:
             console.print(f"[green]No abandoned shows (threshold {threshold*100:.0f}%).[/green]"); return
@@ -5832,7 +5917,7 @@ class PlexShell(cmd.Cmd):
         for r in results[:25]:
             rating = r.get("audienceRating")
             t.add_row(full_title(r), str(r.get("year") or ""),
-                      f"{rating:.1f}" if rating else "—")
+                      format_rating_value(rating))
         if len(results) > 25:
             t.add_row(f"[dim]… and {len(results) - 25} more[/dim]", "", "")
         console.print(t)
@@ -8169,7 +8254,7 @@ class PlexShell(cmd.Cmd):
             row = [
                 str(f["year"]) if f["year"] else "—",
                 f["title"],
-                f"{f['rating']:.1f}" if f.get("rating") else "—",
+                format_rating_value(f.get("rating")),
             ]
             if rt_map:
                 row.append(rt_map.get(f["tmdb_id"], "—"))
@@ -8299,7 +8384,7 @@ class PlexShell(cmd.Cmd):
                 str(f["year"]) if f["year"] else "—",
                 f["title"],
                 f["character"] or "—",
-                f"{f['rating']:.1f}" if f.get("rating") else "—",
+                format_rating_value(f.get("rating")),
             ]
             if rt_map:
                 row.append(rt_map.get(f["tmdb_id"], "—"))
@@ -9035,7 +9120,8 @@ class PlexShell(cmd.Cmd):
         for i, m in enumerate(trending, 1):
             in_r = m["tmdb_id"] in radarr_ids
             in_p = self._in_plex(m["title"], m["year"], plex_set)
-            rating_str = f"[yellow]{m['rating']}[/yellow]" if m["rating"] >= 7 else str(m["rating"]) if m["rating"] else "—"
+            rating_str = (f"[yellow]{m['rating']}[/yellow]" if m["rating"] >= 7
+                          else format_rating_value(m.get("rating")))
             t.add_row(
                 str(i),
                 m["title"],
