@@ -213,6 +213,7 @@ python plex_cli.py <command> [args]
 | `4k_audit` | `[library_id]` | 4K content breakdown by HDR, audio, and codec |
 | `framerate` | `[library_id]` | Content broken down by frame rate |
 | `aspect_ratio` | `[library_id]` | Video aspect ratio distribution |
+| `pan_and_scan` | `[library_id]` | Movies stored in ~4:3, likely pan-and-scan crops of widescreen films |
 | `audio_languages` | `[library_id]` | Audio track language breakdown |
 | `resolution_trend` | `[library_id]` | 4K/1080p/720p/SD share by year added |
 | `container_format` | `[library_id]` | File container format distribution |

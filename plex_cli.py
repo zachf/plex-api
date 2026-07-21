@@ -1407,6 +1407,7 @@ _HELP_SECTIONS = [
         ("4k_audit",          "[library_id]",                    "4K content breakdown by HDR type, audio, and codec"),
         ("framerate",         "[library_id]",                    "Content broken down by frame rate"),
         ("aspect_ratio",      "[library_id]",                    "Video aspect ratio distribution (16:9, 2.35:1, 4:3, etc.)"),
+        ("pan_and_scan",      "[library_id]",                    "Movies stored in ~4:3, likely pan-and-scan crops of widescreen films"),
         ("audio_languages",   "[library_id]",                    "Audio track language breakdown across the library"),
         ("resolution_trend",  "[library_id]",                    "4K/1080p/720p/SD share by year items were added"),
         ("container_format",  "[library_id]",                    "Distribution of file container formats (mkv, mp4, avi, etc.)"),
@@ -5225,6 +5226,58 @@ class PlexShell(cmd.Cmd):
             rows = self.client.media_rows_for(section_id)
         ar_counts: Counter = Counter(_label(r.get("aspectRatio")) for r in rows)
         _distribution_table("Aspect Ratio Distribution", ar_counts)
+
+    def do_pan_and_scan(self, arg: str):
+        """pan_and_scan [library_id] — movies stored in ~4:3, likely pan-and-scan crops of widescreen films"""
+        section_id = arg.strip() or None
+        with console.status("Scanning aspect ratios..."):
+            rows = self.client.media_rows_for(section_id)
+        # 4:3 (1.33) and Academy (1.37) both round near here; treat 1.30–1.42 as fullscreen.
+        flagged = []
+        for r in rows:
+            if r.get("type") != "movie":
+                continue
+            ar = r.get("aspectRatio")
+            if ar is None or not (1.30 <= ar <= 1.42):
+                continue
+            year = r.get("year")
+            # Widescreen became the theatrical norm ~1954; a fullscreen copy of a later
+            # film is almost certainly a pan-and-scan (or letterbox-cropped) transfer.
+            if year and year >= 1954:
+                likely, style = "High", "bold red"
+            elif year and year < 1954:
+                likely, style = "Low (Academy era)", "dim"
+            else:
+                likely, style = "Unknown", "yellow"
+            flagged.append({**r, "_ar": ar, "_likely": likely, "_style": style})
+        if not flagged:
+            console.print("[green]No 4:3 movies found.[/green]")
+            return
+        # High-likelihood first, then newest films (most surprising to be fullscreen).
+        rank = {"High": 0, "Unknown": 1, "Low (Academy era)": 2}
+        flagged.sort(key=lambda r: (rank.get(r["_likely"], 1), -(r.get("year") or 0)))
+        t = Table(title=f"Likely Pan-and-Scan Movies — {len(flagged)} in 4:3",
+                  box=box.ROUNDED)
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Title", style="bold white", min_width=28)
+        t.add_column("Year", justify="right", width=6)
+        t.add_column("Aspect", justify="right", width=8)
+        t.add_column("Res", width=7, justify="right")
+        t.add_column("Library", style="cyan", width=16)
+        t.add_column("Pan & Scan?", width=18)
+        for i, r in enumerate(flagged, 1):
+            t.add_row(
+                str(i),
+                r["title"],
+                str(r.get("year") or "—"),
+                f"{r['_ar']:.2f}",
+                resolution_label(r["videoResolution"]),
+                r["library"],
+                f"[{r['_style']}]{r['_likely']}[/{r['_style']}]",
+            )
+        console.print(t)
+        console.print("[dim]Movies at 1.33–1.37 released after 1954 are flagged 'High' — "
+                      "widescreen was the theatrical norm by then.[/dim]")
 
     def do_audio_languages(self, arg: str):
         """audio_languages [library_id] — breakdown of audio track languages across the library"""
@@ -9467,6 +9520,7 @@ class PlexShell(cmd.Cmd):
     complete_duration_outliers = complete_4k_audit = complete_decade = complete_content_rating = _c_lib_arg
     complete_framerate = complete_director_stats = complete_actor_stats = _c_lib_arg
     complete_show_progress = complete_aspect_ratio = complete_audio_languages = _c_lib_arg
+    complete_pan_and_scan = _c_lib_arg
     complete_zero_duration = complete_added_trend = complete_resolution_trend = _c_lib_arg
     complete_container_format = complete_size_by_codec = complete_channel_dist = _c_lib_arg
     complete_binge_candidates = complete_overdue = complete_watched_by_decade = _c_lib_arg
