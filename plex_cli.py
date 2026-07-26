@@ -208,6 +208,34 @@ def clean_title(title: str) -> str | None:
     cleaned = " ".join(clean).strip()
     return cleaned if cleaned and cleaned != title else None
 
+class TitleYearIndex(set):
+    """A ``set[(lower_title, year)]`` that also carries a year → titles index.
+
+    Fuzzy cross-referencing scans every Plex title for every candidate, which
+    is quadratic. Callers that can restrict by year use ``by_year`` to compare
+    against a handful of titles instead of the whole library. Treat instances
+    as immutable — mutating the set will not update ``by_year``.
+    """
+
+    def __init__(self, pairs=()):
+        super().__init__(pairs)
+        self.by_year: dict[int, list[str]] = defaultdict(list)
+        for title, yr in self:
+            self.by_year[yr].append(title)
+
+def fuzzy_ratio_at_least(matcher: SequenceMatcher, candidate: str, threshold: float) -> bool:
+    """Compare ``matcher``'s first sequence against ``candidate``, cheapest test first.
+
+    ``real_quick_ratio()`` (O(1), length-based) and ``quick_ratio()`` (O(n),
+    character-bag-based) are both upper bounds on ``ratio()``, so failing
+    either rules out a match without paying for the full O(n*m) comparison.
+    The result is identical to calling ``ratio()`` directly, just faster.
+    """
+    matcher.set_seq2(candidate)
+    return (matcher.real_quick_ratio() >= threshold
+            and matcher.quick_ratio() >= threshold
+            and matcher.ratio() >= threshold)
+
 def get_media_rows(item: dict, library: str = "") -> list:
     """Flatten Media/Part elements into analysis-friendly dicts."""
     rows = []
@@ -1262,20 +1290,17 @@ class _LessPager:
 
 _PAGER = _LessPager()
 
-# Commands that use Prompt.ask() mid-output where the user must see the
-# preceding table to make a choice — skip pager for these.
-_INTERACTIVE_COMMANDS = frozenset({
-    "collection_gaps",   # import confirmation
-    "fixtitles",         # apply/edit/cancel after proposals table
-    "play",              # pick active session by number
-    "playlist_build",    # confirmation after preview
-    "radarr_director",   # director match selection + profile/folder prompts
-    "radarr_download",   # movie number entry
-    "radarr_import",     # profile, folder, confirmation prompts
-    "radarr_upgrade",    # confirmation prompt
-    "radarr_upgrade_4k", # search confirmation prompt
-    "sonarr_add",        # show/profile/folder selection prompts
-})
+def interactive(func):
+    """Mark a ``do_*`` command as unpageable.
+
+    The pager buffers everything a command prints until it returns, which
+    breaks two kinds of command: those that prompt mid-output (the user must
+    see the table above the prompt) and those that never return on their own
+    (``watch``, ``alert``). Marking the method keeps the flag next to the code
+    that needs it instead of in a list that silently goes stale.
+    """
+    func.interactive = True
+    return func
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -1539,8 +1564,11 @@ class PlexShell(cmd.Cmd):
         return self.do_quit(_)
 
     def onecmd(self, line: str) -> bool:
-        cmd = line.strip().split()[0] if line.strip() else ""
-        if cmd in _INTERACTIVE_COMMANDS:
+        name = line.strip().split()[0] if line.strip() else ""
+        handler = getattr(self, f"do_{name}", None)
+        # Paging only makes sense on a real terminal; when output is piped or
+        # redirected the pager would capture everything and dump it blindly.
+        if not console.is_terminal or getattr(handler, "interactive", False):
             return super().onecmd(line)
         with console.pager(pager=_PAGER, styles=True):
             return super().onecmd(line)
@@ -1952,8 +1980,8 @@ class PlexShell(cmd.Cmd):
             return None
         return sc
 
-    def _plex_show_set(self) -> set[tuple[str, int]]:
-        result: set[tuple[str, int]] = set()
+    def _plex_show_set(self) -> TitleYearIndex:
+        pairs: list[tuple[str, int]] = []
         for lib in self.client.libraries():
             if lib.get("type") != "show":
                 continue
@@ -1961,13 +1989,16 @@ class PlexShell(cmd.Cmd):
                 t = (item.get("title") or "").lower().strip()
                 y = item.get("year") or 0
                 if t:
-                    result.add((t, y))
-        return result
+                    pairs.append((t, y))
+        return TitleYearIndex(pairs)
 
     def _in_plex_show(self, title: str, plex_show_set: set) -> bool:
+        # No year guard here: Sonarr and Plex routinely disagree on a show's
+        # year (first-aired vs. Plex agent), so every title is a candidate.
         t = title.lower().strip()
+        matcher = SequenceMatcher(None, t)
         for pt, _ in plex_show_set:
-            if t == pt or SequenceMatcher(None, t, pt).ratio() >= 0.88:
+            if t == pt or fuzzy_ratio_at_least(matcher, pt, 0.88):
                 return True
         return False
 
@@ -2020,8 +2051,8 @@ class PlexShell(cmd.Cmd):
             cfg["omdb_api_key"] = key; save_config(cfg)
         return OMDBClient(key)
 
-    def _plex_movie_set(self) -> set[tuple[str, int]]:
-        result: set[tuple[str, int]] = set()
+    def _plex_movie_set(self) -> TitleYearIndex:
+        pairs: list[tuple[str, int]] = []
         for lib in self.client.libraries():
             if lib.get("type") != "movie":
                 continue
@@ -2029,17 +2060,24 @@ class PlexShell(cmd.Cmd):
                 t = (item.get("title") or "").lower().strip()
                 y = item.get("year") or 0
                 if t:
-                    result.add((t, y))
-        return result
+                    pairs.append((t, y))
+        return TitleYearIndex(pairs)
 
     def _in_plex(self, title: str, year: int, plex_set: set) -> bool:
         t = title.lower().strip()
         if (t, year) in plex_set:
             return True
-        for pt, py in plex_set:
-            if abs(py - year) > 1:
-                continue
-            if SequenceMatcher(None, t, pt).ratio() >= 0.90:
+        # A TitleYearIndex narrows the scan to the ±1-year window up front;
+        # a plain set still works, it just has to be filtered while iterating.
+        by_year = getattr(plex_set, "by_year", None)
+        if by_year is None:
+            candidates = (pt for pt, py in plex_set if abs(py - year) <= 1)
+        else:
+            candidates = (pt for y in (year - 1, year, year + 1)
+                          for pt in by_year.get(y, ()))
+        matcher = SequenceMatcher(None, t)
+        for pt in candidates:
+            if fuzzy_ratio_at_least(matcher, pt, 0.90):
                 return True
             # Handle "Star Wars" ↔ "Star Wars: Episode IV - A New Hope"
             shorter, longer = (t, pt) if len(t) <= len(pt) else (pt, t)
@@ -2356,6 +2394,7 @@ class PlexShell(cmd.Cmd):
                       row["reason"])
         console.print(t)
 
+    @interactive
     def do_ondeck_clear(self, _):
         """ondeck_clear — interactively remove items from On Deck (mark watched or reset progress)"""
         try:
@@ -3528,6 +3567,7 @@ class PlexShell(cmd.Cmd):
                     writer.writerow(row)
         console.print(f"[green]Exported {len(items)} items to[/green] [bold]{filename}[/bold]")
 
+    @interactive
     def do_fixtitles(self, arg: str):
         if arg.strip():
             libs = [l for l in self.client.libraries() if l.get("key") == arg.strip()]
@@ -3606,6 +3646,7 @@ class PlexShell(cmd.Cmd):
 
     # ── Monitoring ────────────────────────────────────────────────────────────
 
+    @interactive
     def do_watch(self, arg: str):
         interval = int(arg.strip()) if arg.strip().isdigit() else 5
         if interval < 1:
@@ -3620,6 +3661,7 @@ class PlexShell(cmd.Cmd):
         except KeyboardInterrupt:
             console.print("\n[dim]Watch stopped.[/dim]")
 
+    @interactive
     def do_alert(self, arg: str):
         interval = int(arg.strip()) if arg.strip().isdigit() else 10
         if interval < 1:
@@ -3785,6 +3827,7 @@ class PlexShell(cmd.Cmd):
                       c.get("machineIdentifier",""))
         console.print(t)
 
+    @interactive
     def do_play(self, arg: str):
         if not arg.strip():
             console.print("[yellow]Usage: play <key> [--client <name_or_id>][/yellow]"); return
@@ -5848,6 +5891,7 @@ class PlexShell(cmd.Cmd):
         if ok:
             console.print(f"[green]Item {parts[1]} removed from playlist {parts[0]}.[/green]")
 
+    @interactive
     def do_playlist_build(self, arg: str):
         """playlist_build <name> [filters] — build a Plex playlist from combined filters"""
         try:
@@ -6386,6 +6430,7 @@ class PlexShell(cmd.Cmd):
         console.print(f"[yellow]{missing} titles not in Radarr.[/yellow]  "
                       f"[dim]Run [bold]radarr_import {name}[/bold] to add them.[/dim]")
 
+    @interactive
     def do_radarr_import(self, arg: str):
         """radarr_import <name> [--dry-run] [--profile <id>] [--search] — add missing movies from a named list"""
         try:
@@ -6417,6 +6462,7 @@ class PlexShell(cmd.Cmd):
             console.print("[yellow]No movies returned from TMDB.[/yellow]"); return
         self._radarr_import_workflow(movies, rc, dry_run, profile_id, search)
 
+    @interactive
     def do_radarr_director(self, arg: str):
         """radarr_director <name> [--dry-run] [--profile <id>] [--search] — import a director's filmography"""
         try:
@@ -6475,6 +6521,7 @@ class PlexShell(cmd.Cmd):
         console.print(f"[dim]{len(movies)} directed films found.[/dim]")
         self._radarr_import_workflow(movies, rc, dry_run, profile_id, search)
 
+    @interactive
     def do_radarr_download(self, arg: str):
         """radarr_download <name> [--dry-run] [--profile <id>] — download missing movies from a list"""
         try:
@@ -6685,6 +6732,7 @@ class PlexShell(cmd.Cmd):
 
         console.print("[dim]Radarr is searching in the background.[/dim]")
 
+    @interactive
     def do_radarr_pick(self, arg: str):
         """radarr_pick <name>|--director <name>|--actor <name> [--all] [--profile <id>]"""
         try:
@@ -7045,8 +7093,9 @@ class PlexShell(cmd.Cmd):
         total_size    = 0
         overview_rows = []
 
-        plex_set: set[tuple[str, int]] = set()
-        plex_movie_items: list[dict]   = []
+        movie_pairs: list[tuple[str, int]] = []
+        show_pairs:  list[tuple[str, int]] = []
+        plex_movie_items: list[dict]       = []
 
         for lib_name, d in lib_data.items():
             lib_type = d["info"].get("type", "")
@@ -7055,21 +7104,25 @@ class PlexShell(cmd.Cmd):
             total_size += size
             watched = sum(1 for i in items if (i.get("viewCount") or 0) > 0)
 
-            if lib_type == "show":
-                stale_shows += sum(1 for i in items if (i.get("updatedAt") or 0) < stale_cutoff)
-            elif lib_type == "movie":
-                for item in items:
-                    t = (item.get("title") or "").lower().strip()
-                    y = item.get("year") or 0
-                    if t:
-                        plex_set.add((t, y))
-                plex_movie_items.extend(items)
+            # Collect title/year pairs here rather than calling _plex_show_set()
+            # or _plex_movie_set() later — those refetch libraries we already have.
+            if lib_type in ("show", "movie"):
+                pairs = [(t, item.get("year") or 0) for item in items
+                         if (t := (item.get("title") or "").lower().strip())]
+                if lib_type == "show":
+                    stale_shows += sum(1 for i in items
+                                       if (i.get("updatedAt") or 0) < stale_cutoff)
+                    show_pairs.extend(pairs)
+                else:
+                    movie_pairs.extend(pairs)
+                    plex_movie_items.extend(items)
 
             watch_str = (f"{watched}/{len(items)} ({100 * watched // len(items)}%)"
                          if lib_type == "movie" and items else "—")
             overview_rows.append((lib_name, lib_type, len(items), size, watch_str))
 
         zero_dur = sum(1 for r in media_rows if not r.get("duration"))
+        plex_set = TitleYearIndex(movie_pairs)
 
         # ── Radarr aggregates ─────────────────────────────────────────────────
         radarr_not_plex = plex_not_radarr = upgrade_candidates = 0
@@ -7088,9 +7141,10 @@ class PlexShell(cmd.Cmd):
 
             def _in_radarr(title: str, year: int) -> bool:
                 t = title.lower().strip()
+                matcher = SequenceMatcher(None, t)
                 for y in (year - 1, year, year + 1):
-                    for rt in radarr_by_year.get(y, set()):
-                        if t == rt or SequenceMatcher(None, t, rt).ratio() >= 0.90:
+                    for rt in radarr_by_year.get(y, ()):
+                        if t == rt or fuzzy_ratio_at_least(matcher, rt, 0.90):
                             return True
                 return False
 
@@ -7169,7 +7223,7 @@ class PlexShell(cmd.Cmd):
             lines.append("\n  [red]✗[/red]  [dim]Sonarr: could not connect[/dim]")
         else:
             # Sync: Sonarr has downloaded files but Plex doesn't have the show
-            plex_show_set = self._plex_show_set()
+            plex_show_set = TitleYearIndex(show_pairs)
             sonarr_not_plex = sum(
                 1 for s in sonarr_series
                 if (s.get("statistics") or {}).get("episodeFileCount", 0) > 0
@@ -7309,6 +7363,7 @@ class PlexShell(cmd.Cmd):
         self._render_arr_history("Sonarr", records, self._sonarr_history_title,
                                  count, event_filter)
 
+    @interactive
     def do_sonarr_missing(self, _arg: str):
         """sonarr_missing — shows with monitored but missing episodes; select to trigger search"""
         sc = self._get_sonarr_client()
@@ -7387,6 +7442,7 @@ class PlexShell(cmd.Cmd):
         console.print(f"[green]Search triggered[/green] for {len(selected)} show(s).")
         console.print("[dim]Sonarr is searching for missing episodes in the background.[/dim]")
 
+    @interactive
     def do_sonarr_upgrade(self, _arg: str):
         """sonarr_upgrade — shows with episodes below quality cutoff; select to trigger re-search"""
         sc = self._get_sonarr_client()
@@ -7464,6 +7520,7 @@ class PlexShell(cmd.Cmd):
         console.print(f"[green]Upgrade search triggered[/green] for {len(selected)} show(s).")
         console.print("[dim]Sonarr will replace episodes when better versions are found.[/dim]")
 
+    @interactive
     def do_sonarr_add(self, arg: str):
         """sonarr_add <show name> — search for a TV show and add it to Sonarr"""
         name = arg.strip()
@@ -8021,6 +8078,7 @@ class PlexShell(cmd.Cmd):
         console.print(f"\n[dim]Genres: {', '.join(top_genres[:3])} · "
                       f"min rating {min_rating} · {len(movie_plays)} movies in history[/dim]")
 
+    @interactive
     def do_tmdb_movie(self, arg: str):
         """tmdb_movie <title> — search TMDB for a movie and display full details"""
         query = arg.strip()
@@ -8196,6 +8254,7 @@ class PlexShell(cmd.Cmd):
         if not_in_lib:
             console.print("[dim]Use [bold]radarr_import[/bold] or [bold]radarr_director[/bold] to add any of these.[/dim]")
 
+    @interactive
     def do_director_deep_dive(self, arg: str):
         """director_deep_dive <name> [--sort-rating] — full filmography: owned in Plex, watched, in Radarr, missing"""
         tokens = arg.strip().split()
@@ -8326,6 +8385,7 @@ class PlexShell(cmd.Cmd):
             summary.append(f"[blue]{in_radarr}/{len(films)} in Radarr[/blue]")
         console.print("  ·  ".join(summary))
 
+    @interactive
     def do_actor_deep_dive(self, arg: str):
         """actor_deep_dive <name> [--sort-rating] — filmography as actor: owned in Plex, watched, in Radarr"""
         tokens = arg.strip().split()
@@ -8456,6 +8516,7 @@ class PlexShell(cmd.Cmd):
             summary.append(f"[blue]{in_radarr}/{len(films)} in Radarr[/blue]")
         console.print("  ·  ".join(summary))
 
+    @interactive
     def do_radarr_upgrade_4k(self, arg: str):
         """radarr_upgrade_4k <title> [--search] — switch a movie's quality profile to 4K and optionally trigger a search"""
         tokens = arg.strip().split()
@@ -8558,6 +8619,7 @@ class PlexShell(cmd.Cmd):
         else:
             console.print("[red]Update failed — Radarr returned an unexpected response.[/red]")
 
+    @interactive
     def do_radarr_upgrade(self, arg: str):
         """radarr_upgrade — list downloaded movies below their quality cutoff and trigger re-searches"""
         rc = self._get_radarr_client()
@@ -9128,6 +9190,7 @@ class PlexShell(cmd.Cmd):
         console.print(t)
         console.print(f"[dim]{len(movies)} release(s) found.[/dim]")
 
+    @interactive
     def do_trending_missing(self, arg: str):
         """trending_missing [--window day|week] [--count N] [--import] [--dry-run] [--profile id] [--search]"""
         tokens    = self._tokens(arg)
@@ -9250,6 +9313,7 @@ class PlexShell(cmd.Cmd):
                   f"[bold]{format_size(total_size)}[/bold]")
         console.print(t)
 
+    @interactive
     def do_radarr_collections(self, arg: str):
         """radarr_collections [--import] — TMDB franchise completion; --import adds missing to Radarr"""
         tokens    = arg.strip().split() if arg.strip() else []
@@ -9334,6 +9398,7 @@ class PlexShell(cmd.Cmd):
             else:
                 console.print("[green]Nothing new to import.[/green]")
 
+    @interactive
     def do_collection_gaps(self, arg: str):
         """collection_gaps [--import] [--dry-run] [--limit N] - franchise gaps across Plex and Radarr"""
         tokens = self._tokens(arg)
@@ -9781,6 +9846,25 @@ class PlexShell(cmd.Cmd):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def join_one_shot(argv: list[str]) -> str:
+    """Rebuild a command line from ``sys.argv`` for one-shot invocation.
+
+    The shell strips the user's quotes before we see them, so `--director
+    "Ridley Scott"` arrives as one argv entry but a plain space-join turns it
+    back into two words — commands that parse with ``shlex.split`` then read
+    the director as "Ridley" and treat "Scott" as stray query text.
+
+    Only values that follow a ``--flag`` get re-quoted. Positional words are
+    joined plainly because many commands read the whole remaining line as free
+    text (``tmdb_movie the matrix``, ``settitle 123 Blade Runner 2049``), and
+    quoting those would embed literal quote characters in the title.
+    """
+    parts = []
+    for i, token in enumerate(argv):
+        after_flag = i > 0 and argv[i - 1].startswith("--")
+        parts.append(shlex.quote(token) if after_flag and " " in token else token)
+    return " ".join(parts)
+
 def get_base_url(cfg: dict) -> str:
     if cfg.get("plex_url"):
         return cfg["plex_url"]
@@ -9848,7 +9932,7 @@ def main():
     shell = PlexShell(client)
 
     if one_shot:
-        shell.onecmd(" ".join(one_shot))
+        shell.onecmd(join_one_shot(one_shot))
     else:
         try:
             shell.cmdloop()

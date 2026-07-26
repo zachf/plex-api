@@ -47,14 +47,29 @@ The entire program lives in a single file: `plex_cli.py` (~6,500 lines). The str
 self.base_url = (base_url if "://" in base_url else f"http://{base_url}").rstrip("/")
 ```
 
-**Plex movie fuzzy matching** — `_plex_movie_set()` returns `set[tuple[str, int]]` of `(lower_title, year)`. `_in_plex(title, year, plex_set)` does exact match first, then `SequenceMatcher ratio >= 0.88` with ±1 year tolerance, plus a colon/dash prefix check for subtitle variants. Use these for all Plex cross-references; do not roll your own matching.
+**Plex fuzzy matching** — `_plex_movie_set()` / `_plex_show_set()` return a `TitleYearIndex`, a `set[tuple[str, int]]` subclass of `(lower_title, year)` that also carries a `by_year` dict. Treat instances as immutable: mutating the set does not update `by_year`.
+
+- `_in_plex(title, year, plex_set)` — exact match first, then `SequenceMatcher ratio >= 0.90` within ±1 year, plus a colon/dash prefix check for subtitle variants ("Star Wars" ↔ "Star Wars: Episode IV"). Accepts a plain set too, just without the year-index fast path.
+- `_in_plex_show(title, plex_show_set)` — `ratio >= 0.88`, no year guard (Sonarr and Plex routinely disagree on a show's year).
+
+Both compare through `fuzzy_ratio_at_least(matcher, candidate, threshold)`, which tries `real_quick_ratio()` → `quick_ratio()` → `ratio()`. The first two are cheap upper bounds on the third, so results are identical to calling `ratio()` directly — roughly 6x faster. Reuse one `SequenceMatcher(None, needle)` across a loop and let the helper call `set_seq2`.
+
+Use these for all Plex cross-references; do not roll your own matching.
 
 **`questionary` in VS Code terminal** — the VS Code integrated terminal is not a Windows console, so `questionary.select()` / `questionary.checkbox()` raise `NoConsoleScreenBufferError`. Always wrap questionary calls in `try/except Exception:` with a sensible fallback (e.g. best `SequenceMatcher` match, or first item).
 
 **Arg parsing in `do_*` methods** — most commands use `parse_search_args(arg)` which calls `shlex.split` and separates positional tokens from `--flag value` pairs. For simpler flag parsing (just checking `--dry-run` etc.) use `tokens = arg.strip().split()` and `"--flag" in tokens` directly.
 
+**Output paging** — `PlexShell.onecmd` wraps each command in `console.pager(...)`, which buffers everything the command prints until it returns. Two kinds of command must opt out with the `@interactive` decorator, or they break:
+
+- commands that prompt mid-output (`Prompt.ask` / `questionary`) — the user needs to see the table above the prompt
+- commands that never return on their own (`watch`, `alert`)
+
+The decorator only sets `func.interactive = True`; keeping it on the method is what stops the list from going stale. Note that prompts reached through a *helper* (`_radarr_import_workflow`, `_execute_radarr_download`) still require the calling command to be decorated. Paging is also skipped entirely when `console.is_terminal` is false, so redirected output never hits the pager.
+
 **Adding a new command** checklist:
 1. Add `do_<name>(self, arg: str)` method to `PlexShell`
 2. Add a matching entry to `_HELP_SECTIONS`
 3. Add `complete_<name>` if the command takes completable arguments (library IDs, list names, etc.)
-4. Update `README.md`
+4. Add `@interactive` if the command prompts or loops (see **Output paging** above)
+5. Update `README.md`
