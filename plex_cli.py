@@ -6,6 +6,7 @@
 import cmd
 import csv
 from difflib import SequenceMatcher
+import io
 import json
 import math
 import os
@@ -589,6 +590,53 @@ class PlexClient:
         return result
 
 # ── Radarr client ─────────────────────────────────────────────────────────────
+
+class OpenRouterClient:
+    """Small OpenRouter chat-completions client used by AI-assisted commands."""
+
+    BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def analyze_collection(self, model: str, csv_text: str) -> str:
+        prompt = (
+            "You are helping curate a personal Plex movie collection. Analyze the CSV below. "
+            "Comment on the collection's themes, eras, genres, directors, notable gaps, and "
+            "interesting patterns. Then suggest additional movies to download. Suggestions must "
+            "be specific and include title, release year, and a short reason. Prefer a balanced "
+            "mix of canonical films, overlooked gems, and movies that fit the collection. Do not "
+            "suggest titles already present in the CSV. Clearly separate observations from "
+            "recommendations, and mention uncertainty when the CSV lacks enough information.\n\n"
+            "MOVIE COLLECTION CSV:\n" + csv_text
+        )
+        response = requests.post(
+            self.BASE_URL,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/plex-api-cli",
+                "X-Title": "Plex CLI",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+            },
+            timeout=180,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if not response.ok:
+            detail = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+            raise RuntimeError(f"OpenRouter HTTP {response.status_code}: {detail or response.text[:300]}")
+        try:
+            return data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("OpenRouter returned an unexpected response.") from exc
+
 
 class RadarrClient:
     def __init__(self, base_url: str, api_key: str):
@@ -1397,6 +1445,8 @@ _HELP_SECTIONS = [
         ("analyze",         "<key> | --library <id>",            "Trigger deep media analysis"),
         ("report",          "[--html filename.html]",            "Comprehensive library report"),
         ("changelog",       "[days]",                            "Everything added/updated in last N days"),
+        ("ai_collection",   "[--model MODEL] [--csv FILE] [--save FILE] [--output FILE]", "Usage: ai_collection [--model provider/model] [--csv FILE] [--save FILE] [--output FILE] — analyze all Plex movies or an existing CSV"),
+        ("ai_model",        "[MODEL]",                           "Show or change the OpenRouter model used by ai_collection"),
     ]),
     ("Ratings & Tags", [
         ("setrating",       "<key> <0-10>",                      "Set user rating on an item"),
@@ -1910,6 +1960,21 @@ class PlexShell(cmd.Cmd):
         cfg = load_config()
         key = cfg.get("omdb_api_key", "") or os.environ.get("OMDB_API_KEY", "")
         return OMDBClient(key) if key else None
+
+    def _get_openrouter_client(self) -> "OpenRouterClient | None":
+        cfg = load_config()
+        key = cfg.get("openrouter_api_key", "") or os.environ.get("OPENROUTER_API_KEY", "")
+        if not key:
+            console.print(Panel(
+                "An OpenRouter API key is required for AI collection analysis.\n\n"
+                "Create one at [bold]openrouter.ai/keys[/bold]. It will be saved locally.",
+                title="[yellow]OpenRouter Setup[/yellow]", border_style="yellow"))
+            key = Prompt.ask("[yellow]OpenRouter API Key[/yellow]", password=True)
+            if not key:
+                console.print("[red]OpenRouter API key is required.[/red]"); return None
+            cfg["openrouter_api_key"] = key
+            save_config(cfg)
+        return OpenRouterClient(key)
 
     def _configured_sonarr_client(self) -> "SonarrClient | None":
         cfg = load_config()
@@ -3566,6 +3631,91 @@ class PlexShell(cmd.Cmd):
                     row["addedAt"] = format_ts(item.get("addedAt"))
                     writer.writerow(row)
         console.print(f"[green]Exported {len(items)} items to[/green] [bold]{filename}[/bold]")
+
+    def do_ai_model(self, arg: str):
+        """ai_model [MODEL] — show or change the OpenRouter model for ai_collection"""
+        cfg = load_config()
+        current = cfg.get("openrouter_model") or os.environ.get("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
+        model = arg.strip()
+        if not model:
+            console.print(f"[cyan]OpenRouter model:[/cyan] {current}")
+            console.print("[dim]Example: ai_model anthropic/claude-sonnet-4[/dim]")
+            return
+        if model.startswith("--") or any(ch.isspace() for ch in model):
+            console.print("[yellow]Usage: ai_model <provider/model>[/yellow]"); return
+        cfg["openrouter_model"] = model
+        save_config(cfg)
+        console.print(f"[green]OpenRouter model saved:[/green] {model}")
+
+    def do_ai_collection(self, arg: str):
+        """ai_collection [--model MODEL] [--csv FILE] [--save FILE] [--output FILE] — ask OpenRouter to review the movie collection"""
+        tokens = self._tokens(arg)
+        if self._has_flag(tokens, "--help"):
+            console.print("[yellow]Usage: ai_collection [--model provider/model] [--csv FILE] [--save FILE] [--output FILE][/yellow]")
+            console.print("[dim]Without --csv, all Plex movie libraries are exported in-memory and sent to OpenRouter.[/dim]")
+            return
+        model = self._flag_value(tokens, "--model", "")
+        csv_path = self._flag_value(tokens, "--csv", "")
+        save_path = self._flag_value(tokens, "--save", "")
+        output_path = self._flag_value(tokens, "--output", "")
+        cfg = load_config()
+        model = model or cfg.get("openrouter_model") or os.environ.get("OPENROUTER_MODEL") or "openai/gpt-4o-mini"
+        if not model or model.startswith("--"):
+            console.print("[yellow]Choose a model with --model provider/model or ai_model provider/model.[/yellow]"); return
+
+        if csv_path:
+            path = Path(csv_path).expanduser()
+            if not path.is_file():
+                console.print(f"[red]CSV file not found:[/red] {path}"); return
+            try:
+                csv_text = path.read_text(encoding="utf-8-sig")
+            except OSError as exc:
+                console.print(f"[red]Could not read CSV:[/red] {exc}"); return
+            movie_count = max(0, len(csv_text.splitlines()) - 1)
+        else:
+            fields = ["library", "title", "year", "rating", "audienceRating", "contentRating",
+                      "studio", "summary", "addedAt"]
+            rows = []
+            with console.status("Fetching all Plex movie libraries..."):
+                libraries = [lib for lib in self.client.libraries() if lib.get("type") == "movie"]
+                for lib in libraries:
+                    for item in self.client.library_contents(lib.get("key", "")):
+                        row = {field: item.get(field, "") for field in fields}
+                        row["library"] = lib.get("title", lib.get("key", ""))
+                        row["addedAt"] = format_ts(item.get("addedAt"))
+                        rows.append(row)
+            if not rows:
+                console.print("[yellow]No movies found in Plex movie libraries.[/yellow]"); return
+            buffer = io.StringIO(newline="")
+            writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader(); writer.writerows(rows)
+            csv_text = buffer.getvalue()
+            movie_count = len(rows)
+
+        if save_path:
+            try:
+                Path(save_path).expanduser().write_text(csv_text, encoding="utf-8", newline="")
+                console.print(f"[green]Saved collection CSV to[/green] {Path(save_path).expanduser()}")
+            except OSError as exc:
+                console.print(f"[red]Could not save CSV:[/red] {exc}"); return
+
+        client = self._get_openrouter_client()
+        if not client:
+            return
+        console.print(f"[dim]Sending {movie_count} movie(s) to OpenRouter using {model}...[/dim]")
+        try:
+            with console.status("Waiting for collection analysis..."):
+                answer = client.analyze_collection(model, csv_text)
+        except (requests.exceptions.RequestException, RuntimeError) as exc:
+            console.print(f"[red]OpenRouter analysis failed:[/red] {exc}"); return
+        if output_path:
+            output_file = Path(output_path).expanduser()
+            try:
+                output_file.write_text(answer, encoding="utf-8")
+                console.print(f"[green]Saved AI analysis to[/green] {output_file}")
+            except OSError as exc:
+                console.print(f"[red]Could not save AI analysis:[/red] {exc}")
+        console.print(Panel(answer, title=f"AI Collection Analysis — {model}", border_style="cyan"))
 
     @interactive
     def do_fixtitles(self, arg: str):

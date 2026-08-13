@@ -35,6 +35,8 @@ and saved to the same file.
 
 | Key | Source | Default |
 |---|---|---|
+| `openrouter_api_key` | Prompted or `OPENROUTER_API_KEY` env var | — |
+| `openrouter_model` | Set with `ai_model` or `OPENROUTER_MODEL` env var | `openai/gpt-4o-mini` |
 | `plex_url` | Prompted or `PLEX_URL` env var | `http://localhost:32400` |
 | `plex_token` | Prompted or `PLEX_TOKEN` env var | — |
 | `radarr_url` | Prompted or `RADARR_URL` env var | `http://localhost:7878` |
@@ -237,6 +239,22 @@ Commands that combine Plex, TMDB, Tautulli, and Radarr for richer insights.
 | `tmdb_movie` | `<title>` | Search TMDB by title and display full details: overview, rating, cast, director, studios, budget/revenue, keywords, plus Plex and Radarr status |
 | `director_deep_dive` | `<name>` | Full directed filmography with Plex ownership, Tautulli watch status, and Radarr presence per title |
 | `actor_deep_dive` | `<name>` | Acting credits with character names, Plex ownership, Tautulli watch status, and Radarr presence |
+
+### AI Collection Analysis
+
+`ai_collection` exports all movies from Plex movie libraries as CSV content and sends it to any
+OpenRouter-supported chat model for collection commentary and additional movie suggestions.
+
+```text
+ai_collection
+ai_model anthropic/claude-sonnet-4
+ai_collection --model google/gemini-2.5-flash --save my_movies.csv
+ai_collection --csv my_movies.csv --output analysis.txt
+```
+
+The first run prompts for an OpenRouter key and saves it locally. Use `OPENROUTER_API_KEY` and
+`OPENROUTER_MODEL` instead if you do not want credentials in the config file. Recommendations
+are displayed for review and are not automatically added to Radarr.
 
 ### Item Extras
 
