@@ -33,3 +33,4 @@ plex_export_*.json
 Thumbs.db
 .claude/settings.json
 .claude/settings.local.json
+Microsoft/Windows/PowerShell/ModuleAnalysisCache
