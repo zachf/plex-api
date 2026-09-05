@@ -65,6 +65,40 @@ python plex_cli.py <command> [args]
 
 **Tab completion** is available for all commands, library names, list names, and flags.
 
+### Finding commands
+
+`help` shows a compact group overview. Help works without credentials or a running server.
+
+```text
+python plex_cli.py help storage
+python plex_cli.py help watch_next
+python plex_cli.py help --search subtitles
+python plex_cli.py help --all
+python plex_cli.py radarr status --help
+```
+
+Use `help <topic>` to search command names, descriptions, and section names; multiple
+search words must all match. `help <command>` shows its usage and aliases.
+Section names take precedence when they also name a command: `help storage`
+lists storage commands; `help library storage` describes the disk-usage command.
+Unknown commands and unmatched help searches suggest similar names.
+
+Commands also have grouped aliases, available in both the shell and single-command mode:
+
+```text
+library search Alien
+radarr status
+sonarr missing
+watch next --runtime 120
+watch monitor 5
+```
+
+Groups are `library`, `watch`, `radarr`, `sonarr`, `tautulli`, and `overseerr`.
+Use `help <group>` to list its subcommands. A bare service group or `library` also
+shows its help. Existing command names still work, including `watch [seconds]`
+for live monitoring. Tab completion supports groups, subcommands, their arguments,
+and help topics. Suggestions never execute a command automatically.
+
 ---
 
 ## Commands

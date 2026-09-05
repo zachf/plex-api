@@ -5,7 +5,7 @@
 
 import cmd
 import csv
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, get_close_matches
 import io
 import json
 import math
@@ -26,6 +26,7 @@ try:
     from rich.table import Table
     from rich.panel import Panel
     from rich.prompt import Prompt
+    from rich.markup import escape
 except ImportError as _e:
     print(f"Missing dependency: {_e}")
     print("Run:  py -m pip install -r requirements.txt")
@@ -1571,6 +1572,28 @@ _HELP_SECTIONS = [
     ]),
 ]
 
+def command_groups() -> dict[str, dict[str, str]]:
+    """Derive aliases from the same catalog used by help."""
+    groups = {name: {} for name in ("library", "watch", "radarr", "sonarr", "tautulli", "overseerr")}
+    library_sections = {"Basic", "Library health", "Storage", "Collection tools",
+                        "Ratings & Tags", "Deeper analysis", "Playlists & Collections"}
+    for section, commands in _HELP_SECTIONS:
+        for name, _, _ in commands:
+            for service in ("radarr", "sonarr", "tautulli", "overseerr"):
+                if name.startswith(service + "_"):
+                    groups[service][name[len(service) + 1:]] = name
+            if section in library_sections:
+                groups["library"][name] = name
+            if section == "Watch statistics":
+                groups["watch"][name] = name
+    groups["watch"].update(next="watch_next", ondeck="ondeck", recent="recent",
+                            recommendations="recommendations", monitor="watch")
+    return groups
+
+
+_COMMAND_GROUPS = command_groups()
+
+
 class PlexShell(cmd.Cmd):
     intro = ""
     prompt = "[plex]> "
@@ -1591,17 +1614,80 @@ class PlexShell(cmd.Cmd):
 
     def emptyline(self): pass
     def default(self, line: str):
-        console.print(f"[red]Unknown command:[/red] {line}  (type [yellow]help[/yellow])")
+        name = line.split()[0] if line.split() else line
+        console.print(f"[red]Unknown command:[/red] {escape(name)}")
+        self._suggest(name, [n[3:] for n in self.get_names() if n.startswith("do_")]
+                      + list(_COMMAND_GROUPS))
 
-    def do_help(self, _):
+    def _suggest(self, query: str, choices):
+        matches = get_close_matches(query, sorted(set(choices)), n=3, cutoff=0.55)
+        if matches:
+            console.print("Did you mean: " + escape(", ".join(matches)) + "?")
+        console.print("[dim]Use help <command>, help <group>, or help --search <words>.[/dim]")
+
+    def do_help(self, arg: str):
+        """help [command | group | topic | --search words | --all]"""
+        query = arg.strip()
+        entries = {name: (args, desc) for _, commands in _HELP_SECTIONS
+                   for name, args, desc in commands}
+        if not query:
+            t = Table(title="Command groups", box=None)
+            t.add_column("Group", style="cyan")
+            t.add_column("Commands")
+            for group, aliases in _COMMAND_GROUPS.items():
+                t.add_row(group, str(len(aliases)))
+            console.print(t)
+            console.print("Use [yellow]help <group>[/yellow] or [yellow]help <command>[/yellow].\n"
+                          "Search: [yellow]help --search subtitles[/yellow]  |  "
+                          "Full catalog: [yellow]help --all[/yellow]\n"
+                          "Examples: [yellow]library search Alien[/yellow], "
+                          "[yellow]radarr status[/yellow], [yellow]watch next[/yellow]\n"
+                          "[dim]Original command names still work. Bare watch starts the live monitor.[/dim]")
+            return
+        parts = query.split()
+        topic_sections = [(section, commands) for section, commands in _HELP_SECTIONS
+                          if section.lower() == query.lower()]
+        if len(parts) == 2 and parts[0] in _COMMAND_GROUPS:
+            query = _COMMAND_GROUPS[parts[0]].get(parts[1], query)
+        if query in entries and not topic_sections and (query not in _COMMAND_GROUPS or len(parts) == 2):
+            args, desc = entries[query]
+            console.print("Usage: " + escape(f"{query} {args}".rstrip()))
+            console.print(escape(desc))
+            aliases = [f"{group} {alias}" for group, names in _COMMAND_GROUPS.items()
+                       for alias, name in names.items() if name == query]
+            if aliases:
+                console.print("Aliases: " + escape(", ".join(aliases)))
+            return
+        if query in _COMMAND_GROUPS:
+            sections = [(query, [(f"{query} {alias}", *entries[name])
+                                 for alias, name in _COMMAND_GROUPS[query].items()])]
+        elif topic_sections:
+            sections = topic_sections
+        elif query in ("--all", "all"):
+            sections = _HELP_SECTIONS
+        else:
+            search = query.removeprefix("--search").strip().lower()
+            if not search:
+                console.print("Usage: help --search <words>")
+                return
+            words = search.split()
+            sections = [(section, [(name, args, desc) for name, args, desc in commands
+                                   if all(word in f"{section} {name} {desc}".lower() for word in words)])
+                        for section, commands in _HELP_SECTIONS]
+            sections = [(section, commands) for section, commands in sections if commands]
+            if not sections:
+                console.print("No help matches: " + escape(search))
+                self._suggest(search, list(entries) + list(_COMMAND_GROUPS)
+                              + [section.lower() for section, _ in _HELP_SECTIONS])
+                return
         t = Table(box=None, show_header=False, padding=(0, 2), expand=False)
         t.add_column(style="yellow", no_wrap=True, min_width=16)
         t.add_column(style="dim", min_width=14)
         t.add_column(min_width=20)
-        for section, commands in _HELP_SECTIONS:
+        for section, commands in sections:
             t.add_row(f"[bold cyan]{section}[/bold cyan]", "", "")
             for cmd_name, args, desc in commands:
-                t.add_row(cmd_name, args, desc)
+                t.add_row(escape(cmd_name), escape(args), escape(desc))
             t.add_row("", "", "")
         console.print(t)
 
@@ -1614,6 +1700,26 @@ class PlexShell(cmd.Cmd):
         return self.do_quit(_)
 
     def onecmd(self, line: str) -> bool:
+        line = line.strip()
+        parts = line.split(None, 2)
+        if parts and parts[0] in _COMMAND_GROUPS:
+            group = parts[0]
+            if len(parts) == 1 and group != "watch":
+                line = f"help {group}"
+            elif len(parts) > 1:
+                sub = parts[1]
+                if sub in ("help", "--help", "-h"):
+                    line = "help " + (f"{group} {parts[2]}" if len(parts) > 2 else group)
+                elif sub in _COMMAND_GROUPS[group]:
+                    line = _COMMAND_GROUPS[group][sub] + (" " + parts[2] if len(parts) > 2 else "")
+                elif group != "watch" or not sub.isdigit():
+                    console.print("[red]Unknown subcommand:[/red] " + escape(f"{group} {sub}"))
+                    self._suggest(sub, _COMMAND_GROUPS[group])
+                    return False
+        tokens = line.split()
+        if tokens and (tokens[0] in ("--help", "-h") or
+                       (len(tokens) == 2 and tokens[1] in ("--help", "-h"))):
+            line = "help" if tokens[0] in ("--help", "-h") else "help " + tokens[0]
         name = line.strip().split()[0] if line.strip() else ""
         handler = getattr(self, f"do_{name}", None)
         # Paging only makes sense on a real terminal; when output is piped or
@@ -1622,6 +1728,42 @@ class PlexShell(cmd.Cmd):
             return super().onecmd(line)
         with console.pager(pager=_PAGER, styles=True):
             return super().onecmd(line)
+
+    def completenames(self, text, *ignored):
+        return sorted(set(super().completenames(text, *ignored)) |
+                      {name for name in _COMMAND_GROUPS if name.startswith(text)})
+
+    def complete_help(self, text, line, begidx, endidx):
+        before = line[:begidx].split()
+        if len(before) == 2 and before[1] in _COMMAND_GROUPS:
+            choices = _COMMAND_GROUPS[before[1]]
+        else:
+            choices = (list(_COMMAND_GROUPS) + ["--all", "--search"]
+                       + [name for _, commands in _HELP_SECTIONS for name, _, _ in commands]
+                       + [section.lower() for section, _ in _HELP_SECTIONS])
+        return sorted({choice for choice in choices if choice.startswith(text)})
+
+    def _complete_group(self, text, line, begidx, endidx):
+        prefix = line[:begidx].split()
+        group = prefix[0]
+        if len(prefix) <= 1:
+            return sorted(name for name in _COMMAND_GROUPS[group] if name.startswith(text))
+        canonical = _COMMAND_GROUPS[group].get(prefix[1])
+        if canonical:
+            completer = getattr(self, "complete_" + canonical, None)
+            if completer and canonical != group:
+                match = re.match(r"\S+\s+\S+", line)
+                rewritten = canonical + line[match.end():]
+                offset = len(canonical) - match.end()
+                return completer(text, rewritten, begidx + offset, endidx + offset)
+        return []
+
+    complete_library = _complete_group
+    complete_watch = _complete_group
+    complete_radarr = _complete_group
+    complete_sonarr = _complete_group
+    complete_tautulli = _complete_group
+    complete_overseerr = _complete_group
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -10053,6 +10195,19 @@ def get_token(cfg: dict) -> str:
 
 def main():
     one_shot = sys.argv[1:]   # command + args passed on the CLI, if any
+
+    # Help and group discovery must work before credentials or network setup.
+    if one_shot and (
+        one_shot[0] in ("help", "--help", "-h")
+        or (len(one_shot) == 2 and one_shot[-1] in ("--help", "-h"))
+        or (one_shot[0] in _COMMAND_GROUPS and (
+            (len(one_shot) == 1 and one_shot[0] != "watch")
+            or (len(one_shot) > 1 and one_shot[1] in ("help", "--help", "-h"))
+            or (len(one_shot) == 3 and one_shot[-1] in ("--help", "-h"))
+        ))
+    ):
+        PlexShell(None).onecmd(join_one_shot(one_shot))
+        return
 
     cfg      = load_config()
     base_url = get_base_url(cfg)
